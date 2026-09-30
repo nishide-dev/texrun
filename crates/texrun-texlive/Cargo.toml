@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Opening files TeX / BibTeX wrote or read with `O_NOFOLLOW | O_NONBLOCK`.
+rustix.workspace = true
 tempfile.workspace = true
 texrun-core.workspace = true
 texrun-latex-log.workspace = true
