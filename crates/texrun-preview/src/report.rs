@@ -117,9 +117,12 @@ pub enum PreviewStatus {
     Rendered,
     /// Some selected pages were rendered, others were not (see the notices).
     Partial,
-    /// No page was rendered (tool missing, unreadable PDF, metadata only, ...;
-    /// see the notices).
+    /// No page was rendered (tool missing, unreadable PDF, limits, ...; see
+    /// the notices).
     Skipped,
+    /// Metadata only ([`Previewer::inspect`](crate::Previewer::inspect)):
+    /// [`PreviewReport::pdf`] was read and nothing was meant to be rendered.
+    Inspected,
 }
 
 /// Why a [`PreviewNotice`] was issued. Consumers must treat unknown values

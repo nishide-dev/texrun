@@ -85,12 +85,27 @@ impl<'a> Backend<'a> {
     /// Renders `page` at `dpi` to `out_name` (a bare file name ending in
     /// `.png`, resolved against the tool's working directory).
     ///
+    /// `max_px` bounds the long edge. `dpi` is already lowered for the parsed
+    /// page size; `mutool draw` additionally gets `-w`/`-h`, which shrink the
+    /// image to fit that box (and never enlarge it) whatever the page size
+    /// really is. `pdftoppm` has no option that bounds the size without also
+    /// enlarging small pages, so its output is only checked afterwards (as
+    /// every image is, see `render.rs`).
+    ///
     /// The output is named relative to the working directory because
     /// `mutool draw` expands `%d` in the output path, and the host path of
     /// the output root may contain `%`.
-    pub(crate) fn render(self, pdf: &Path, page: u32, dpi: u32, out_name: &str) -> Invocation<'a> {
+    pub(crate) fn render(
+        self,
+        pdf: &Path,
+        page: u32,
+        dpi: u32,
+        max_px: u32,
+        out_name: &str,
+    ) -> Invocation<'a> {
         let page = page.to_string();
         let dpi = dpi.to_string();
+        let max_px = max_px.to_string();
         match self {
             Self::Poppler { pdftoppm, .. } => {
                 // `-singlefile` writes `<prefix>.png` without a page suffix.
@@ -114,7 +129,8 @@ impl<'a> Backend<'a> {
             Self::Mupdf { mutool } => Invocation {
                 program: mutool,
                 args: args([
-                    &"draw", &"-q", &"-r", &dpi, &"-F", &"png", &"-o", &out_name, &pdf, &page,
+                    &"draw", &"-q", &"-r", &dpi, &"-w", &max_px, &"-h", &max_px, &"-F", &"png",
+                    &"-o", &out_name, &pdf, &page,
                 ]),
             },
         }
@@ -184,16 +200,20 @@ fn parse_pdfinfo_sizes(stdout: &str) -> BTreeMap<u32, PageInfo> {
 /// <MediaBox l="0" b="0" r="200" t="100" />
 /// <CropBox l="0" b="0" r="200" t="100" />
 /// <Rotate v="90" />
+/// <UserUnit v="2" />
 /// </page>
 /// ```
 ///
-/// The crop box (what the renderer draws) is used when present.
+/// The crop box (what the renderer draws) is used when present. `mutool draw`
+/// honors `UserUnit` (the size of one unit in points), so the reported size
+/// is the box multiplied by it, and the range check applies to the product.
 fn parse_mutool_pages(stdout: &str) -> BTreeMap<u32, PageInfo> {
     #[derive(Default)]
     struct Entry {
         media: Option<(f64, f64)>,
         crop: Option<(f64, f64)>,
         rotation: u16,
+        user_unit: Option<f64>,
     }
     let mut out = BTreeMap::new();
     let mut current: Option<(u32, Entry)> = None;
@@ -206,7 +226,10 @@ fn parse_mutool_pages(stdout: &str) -> BTreeMap<u32, PageInfo> {
             if let Some((page, e)) = current.take()
                 && let Some((w, h)) = e.crop.or(e.media)
             {
-                out.insert(page, PageInfo::new(page, w, h, e.rotation));
+                let unit = e.user_unit.unwrap_or(1.0);
+                if let (Some(w), Some(h)) = (check_dimension(w * unit), check_dimension(h * unit)) {
+                    out.insert(page, PageInfo::new(page, w, h, e.rotation));
+                }
             }
         } else if let Some((_, entry)) = current.as_mut() {
             if line.starts_with("<MediaBox ") {
@@ -215,6 +238,15 @@ fn parse_mutool_pages(stdout: &str) -> BTreeMap<u32, PageInfo> {
                 entry.crop = parse_box(line);
             } else if line.starts_with("<Rotate ") {
                 entry.rotation = attr(line, "v").and_then(parse_rotation).unwrap_or(0);
+            } else if line.starts_with("<UserUnit ") {
+                // An unusable value makes the size unknown (NaN fails the
+                // range check): the page is dropped rather than sized wrongly.
+                entry.user_unit = Some(
+                    attr(line, "v")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|u| u.is_finite() && *u > 0.0)
+                        .unwrap_or(f64::NAN),
+                );
             }
         }
     }
@@ -361,9 +393,36 @@ PDF version:     1.7
     }
 
     #[test]
+    fn mutool_sizes_include_the_user_unit() {
+        let out = r#"x.pdf:
+<page pagenum="1">
+<MediaBox l="0" b="0" r="100" t="50" />
+<UserUnit v="10" />
+</page>
+<page pagenum="2">
+<MediaBox l="0" b="0" r="100" t="50" />
+<UserUnit v="0" />
+</page>
+<page pagenum="3">
+<MediaBox l="0" b="0" r="100" t="50" />
+<UserUnit v="1e9" />
+</page>
+<page pagenum="4">
+<MediaBox l="0" b="0" r="100" t="50" />
+<UserUnit v="2.5" />
+</page>
+"#;
+        assert_eq!(
+            sizes(&mupdf().parse_page_sizes(out, 1, 4)),
+            // Unusable (2) and out-of-range (3) results are dropped.
+            vec![(1, 1000.0, 500.0, 0), (4, 250.0, 125.0, 0)]
+        );
+    }
+
+    #[test]
     fn render_arguments() {
         let pdf = Path::new("/out/main.pdf");
-        let inv = poppler().render(pdf, 3, 144, "page.png");
+        let inv = poppler().render(pdf, 3, 144, 4096, "page.png");
         assert_eq!(inv.program, Path::new("/bin/pdftoppm"));
         assert_eq!(
             inv.args,
@@ -381,7 +440,7 @@ PDF version:     1.7
             ]
             .map(OsString::from)
         );
-        let inv = mupdf().render(pdf, 3, 144, "page.png");
+        let inv = mupdf().render(pdf, 3, 144, 4096, "page.png");
         assert_eq!(
             inv.args,
             [
@@ -389,6 +448,10 @@ PDF version:     1.7
                 "-q",
                 "-r",
                 "144",
+                "-w",
+                "4096",
+                "-h",
+                "4096",
                 "-F",
                 "png",
                 "-o",

@@ -1,9 +1,5 @@
 //! Minimal PNG header check.
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 
 /// Width and height from the `IHDR` chunk, or `None` if `bytes` does not start
@@ -16,13 +12,6 @@ pub(crate) fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let be = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().expect("4 bytes"));
     let (w, h) = (be(16), be(20));
     (w > 0 && h > 0).then_some((w, h))
-}
-
-/// [`dimensions`] of the file at `path`.
-pub(crate) fn file_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let mut header = [0u8; 24];
-    File::open(path).ok()?.read_exact(&mut header).ok()?;
-    dimensions(&header)
 }
 
 #[cfg(test)]

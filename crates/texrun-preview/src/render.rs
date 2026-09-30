@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use texrun_core::{Artifact, ArtifactKind, WorkspacePath};
 
 use crate::backend::Invocation;
 use crate::error::PreviewError;
+use crate::fsops;
 use crate::options::PreviewOptions;
 use crate::png;
 use crate::process::{self, Limits, RunEnd, RunOutput, ToolEnv};
@@ -22,6 +24,16 @@ use crate::tools::{Backend, Toolset};
 const DETAIL_CHARS: usize = 2000;
 /// File name the tool renders to, inside the private working directory.
 const RENDER_NAME: &str = "page.png";
+/// Pixels an image may exceed `max_long_edge_px` by (rounding in the tools).
+const PIXEL_SLACK: u32 = 2;
+
+/// Where a tool runs and writes: its environment and the descriptor of its
+/// working directory (where it writes [`RENDER_NAME`]).
+#[derive(Clone, Copy)]
+struct Dirs<'a> {
+    env: &'a ToolEnv,
+    work: &'a OwnedFd,
+}
 
 /// Generates page previews and reads PDF metadata with the external tools of
 /// a [`Toolset`].
@@ -47,8 +59,11 @@ impl Previewer {
     }
 
     /// Reads the page count and the sizes of the selected pages of `pdf`
-    /// without rendering anything. The report's status is always
-    /// [`PreviewStatus::Skipped`] and [`PreviewReport::pdf`] is set on success.
+    /// without rendering anything. On success the status is
+    /// [`PreviewStatus::Inspected`] and [`PreviewReport::pdf`] is set; if the
+    /// metadata cannot be read it is [`PreviewStatus::Skipped`] with notices.
+    /// A selection outside the document (e.g. a range after the last page)
+    /// still counts as inspected, with the page count and no page sizes.
     pub fn inspect(
         &self,
         pdf: &Path,
@@ -100,6 +115,7 @@ impl Previewer {
             deadline: Instant::now() + options.timeout,
             report,
             selected: 0,
+            inspected: false,
         };
         run.execute(pdf, output_root, self.tools.search_path());
         Ok(run.finish())
@@ -112,6 +128,8 @@ struct Run<'a> {
     deadline: Instant,
     report: PreviewReport,
     selected: u32,
+    /// Metadata-only run that read the metadata successfully.
+    inspected: bool,
 }
 
 impl Run<'_> {
@@ -123,6 +141,16 @@ impl Run<'_> {
     ) {
         let Some(pdf) = self.check_pdf(pdf) else {
             return;
+        };
+        let root_fd = match output_root.map(fsops::open_dir).transpose() {
+            Ok(fd) => fd,
+            Err(e) => {
+                self.notice(PreviewNotice::warning(
+                    NoticeKind::OutputError,
+                    format!("cannot open the output directory: {e}"),
+                ));
+                return;
+            }
         };
         // Private scratch space: `HOME` for the tools and their working
         // directory. For rendering it lives in the output root so that
@@ -136,9 +164,10 @@ impl Run<'_> {
         let scratch = match scratch.and_then(|dir| {
             fs::create_dir(dir.path().join("home"))?;
             fs::create_dir(dir.path().join("work"))?;
-            Ok(dir)
+            let work_fd = fsops::open_dir(&dir.path().join("work"))?;
+            Ok((dir, work_fd))
         }) {
-            Ok(dir) => dir,
+            Ok(scratch) => scratch,
             Err(e) => {
                 self.notice(PreviewNotice::warning(
                     NoticeKind::OutputError,
@@ -147,6 +176,7 @@ impl Run<'_> {
                 return;
             }
         };
+        let (scratch, work_fd) = scratch;
         let env = ToolEnv {
             path: search_path.map(std::ffi::OsStr::to_os_string),
             home: scratch.path().join("home"),
@@ -162,6 +192,7 @@ impl Run<'_> {
         });
         let Some((first, last)) = select_pages(count, self.options, &mut self.report.notices)
         else {
+            self.inspected = root_fd.is_none();
             return;
         };
         let Some(pages) = self.page_sizes(&pdf, &env, first, last) else {
@@ -170,15 +201,24 @@ impl Run<'_> {
         if let Some(info) = self.report.pdf.as_mut() {
             info.pages.clone_from(&pages);
         }
-        if let Some(root) = output_root {
-            self.selected = last - first + 1;
-            self.render_pages(&pdf, root, &env, first, last, &pages);
+        match root_fd {
+            Some(root_fd) => {
+                self.selected = last - first + 1;
+                let dirs = Dirs {
+                    env: &env,
+                    work: &work_fd,
+                };
+                self.render_pages(&pdf, &root_fd, dirs, first, last, &pages);
+            }
+            None => self.inspected = true,
         }
     }
 
     fn finish(mut self) -> PreviewReport {
         let rendered = u32::try_from(self.report.pages.len()).unwrap_or(u32::MAX);
-        self.report.status = if rendered == 0 {
+        self.report.status = if self.inspected {
+            PreviewStatus::Inspected
+        } else if rendered == 0 {
             PreviewStatus::Skipped
         } else if rendered == self.selected {
             PreviewStatus::Rendered
@@ -327,13 +367,13 @@ impl Run<'_> {
     fn render_pages(
         &mut self,
         pdf: &Path,
-        output_root: &Path,
-        env: &ToolEnv,
+        root_fd: &OwnedFd,
+        dirs: Dirs<'_>,
         first: u32,
         last: u32,
         pages: &[PageInfo],
     ) {
-        let dir = match prepare_dir(output_root, &self.options.output_subdir) {
+        let dir = match fsops::ensure_subdir(root_fd, &self.options.output_subdir) {
             Ok(dir) => dir,
             Err(e) => {
                 self.notice(PreviewNotice::warning(
@@ -359,7 +399,7 @@ impl Run<'_> {
                 continue;
             };
             if self
-                .render_page(pdf, env, &dir, info, &mut total)
+                .render_page(pdf, dirs, &dir, info, &mut total)
                 .is_break()
             {
                 break;
@@ -367,17 +407,9 @@ impl Run<'_> {
         }
     }
 
-    /// Renders one page into `dir`. `Break` stops the whole run (timeout,
-    /// cancellation, size limit, output error); a failure of this page only
-    /// is reported and returns `Continue`.
-    fn render_page(
-        &mut self,
-        pdf: &Path,
-        env: &ToolEnv,
-        dir: &Path,
-        info: &PageInfo,
-        total: &mut u64,
-    ) -> ControlFlow<()> {
+    /// The DPI for `info` (see [`effective_dpi`]), with a notice when it is
+    /// lowered, or `None` (and a warning) if the page cannot be rendered.
+    fn page_dpi(&mut self, info: &PageInfo) -> Option<u32> {
         let page = info.page;
         let Some(dpi) = effective_dpi(self.options, info) else {
             self.notice(
@@ -390,7 +422,7 @@ impl Run<'_> {
                 )
                 .with_page(page),
             );
-            return ControlFlow::Continue(());
+            return None;
         };
         if dpi < self.options.dpi {
             self.notice(
@@ -404,27 +436,39 @@ impl Run<'_> {
                 .with_page(page),
             );
         }
+        Some(dpi)
+    }
 
-        let tmp = env.cwd.join(RENDER_NAME);
+    /// Renders one page into the preview directory `dir`. `Break` stops the
+    /// whole run (timeout, cancellation, size limit, output error); a failure
+    /// of this page only is reported and returns `Continue`.
+    fn render_page(
+        &mut self,
+        pdf: &Path,
+        dirs: Dirs<'_>,
+        dir: &OwnedFd,
+        info: &PageInfo,
+        total: &mut u64,
+    ) -> ControlFlow<()> {
+        let page = info.page;
+        let max_px = self.options.max_long_edge_px;
+        let Some(dpi) = self.page_dpi(info) else {
+            return ControlFlow::Continue(());
+        };
+        let tmp = dirs.env.cwd.join(RENDER_NAME);
         let budget = self.options.max_total_bytes.saturating_sub(*total);
-        let _ = fs::remove_file(&tmp);
-        let inv = self.backend.render(pdf, page, dpi, RENDER_NAME);
-        let out = self.invoke(&inv, env, Some((&tmp, budget)));
+        fsops::remove(dirs.work, RENDER_NAME);
+        let inv = self.backend.render(pdf, page, dpi, max_px, RENDER_NAME);
+        let out = self.invoke(&inv, dirs.env, Some((&tmp, budget)));
         if self.stopped(&inv, &out, Some(page)) {
+            fsops::remove(dirs.work, RENDER_NAME);
             return ControlFlow::Break(());
         }
-        if !out.succeeded() {
-            self.render_failed(page, &format!("{} failed", program_name(&inv)), &out);
-            return ControlFlow::Continue(());
-        }
-        let size = match fs::symlink_metadata(&tmp) {
-            Ok(meta) if meta.is_file() => meta.len(),
-            _ => {
-                self.render_failed(page, "no image was written", &out);
-                return ControlFlow::Continue(());
-            }
-        };
-        if size > budget {
+        let size = fsops::regular_file_len(dirs.work, RENDER_NAME);
+        // Checked before the exit status: on Linux a tool that reaches
+        // `RLIMIT_FSIZE` is killed by `SIGXFSZ`.
+        if size.is_some_and(|size| size > budget) {
+            fsops::remove(dirs.work, RENDER_NAME);
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::SizeLimit,
@@ -437,13 +481,38 @@ impl Run<'_> {
             );
             return ControlFlow::Break(());
         }
-        let Some((width_px, height_px)) = png::file_dimensions(&tmp) else {
+        if !out.succeeded() {
+            fsops::remove(dirs.work, RENDER_NAME);
+            self.render_failed(page, &format!("{} failed", program_name(&inv)), &out);
+            return ControlFlow::Continue(());
+        }
+        let Some(size) = size else {
+            self.render_failed(page, "no image was written", &out);
+            return ControlFlow::Continue(());
+        };
+        let Some((width_px, height_px)) =
+            fsops::read_header::<24>(dirs.work, RENDER_NAME).and_then(|h| png::dimensions(&h))
+        else {
+            fsops::remove(dirs.work, RENDER_NAME);
             self.render_failed(page, "the output is not a PNG image", &out);
             return ControlFlow::Continue(());
         };
+        // Last line of defense for the pixel limit, whatever the tool made of
+        // the page size (allowing for rounding).
+        if width_px.max(height_px) > max_px.saturating_add(PIXEL_SLACK) {
+            fsops::remove(dirs.work, RENDER_NAME);
+            self.render_failed(
+                page,
+                &format!(
+                    "the image ({width_px} x {height_px} px) exceeds the limit of {max_px} px"
+                ),
+                &out,
+            );
+            return ControlFlow::Continue(());
+        }
         let name = WorkspacePath::new(&format!("page-{page:03}.png"))
             .expect("generated file name is a valid path");
-        if let Err(e) = fs::rename(&tmp, dir.join(name.as_str())) {
+        if let Err(e) = fsops::rename(dirs.work, RENDER_NAME, dir, name.as_str()) {
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::OutputError,
@@ -553,28 +622,6 @@ pub(crate) fn effective_dpi(options: &PreviewOptions, page: &PageInfo) -> Option
     Some(options.dpi.min(max))
 }
 
-/// Creates `<root>/<subdir>` component by component, refusing anything that
-/// is not a real directory (for example a symlink placed in the output root
-/// by the engine).
-fn prepare_dir(root: &Path, subdir: &WorkspacePath) -> io::Result<PathBuf> {
-    let mut dir = root.to_path_buf();
-    for part in subdir.as_str().split('/') {
-        dir.push(part);
-        match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "a file or symlink with that name exists",
-                ));
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&dir)?,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(dir)
-}
-
 #[cfg(test)]
 mod tests {
     use texrun_core::Severity;
@@ -659,24 +706,5 @@ mod tests {
         // Tiny pages keep the requested DPI.
         let tiny = PageInfo::new(1, 0.001, 0.001, 0);
         assert_eq!(effective_dpi(&o, &tiny), Some(144));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prepare_dir_refuses_symlinks_and_files() {
-        let root = tempfile::tempdir().unwrap();
-        let sub = WorkspacePath::new("a/b").unwrap();
-        let dir = prepare_dir(root.path(), &sub).unwrap();
-        assert!(dir.is_dir());
-        assert!(prepare_dir(root.path(), &sub).is_ok(), "idempotent");
-
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let err = prepare_dir(root.path(), &WorkspacePath::new("link/x").unwrap()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        assert!(!outside.path().join("x").exists());
-
-        fs::write(root.path().join("file"), "").unwrap();
-        assert!(prepare_dir(root.path(), &WorkspacePath::new("file").unwrap()).is_err());
     }
 }

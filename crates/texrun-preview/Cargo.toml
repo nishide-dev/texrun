@@ -12,9 +12,7 @@ serde.workspace = true
 tempfile.workspace = true
 texrun-core.workspace = true
 thiserror.workspace = true
-
-# Unix only: process groups are killed with `killpg`.
-[target.'cfg(unix)'.dependencies]
+# Unix only: descriptor-based file operations, `killpg` and `prlimit`.
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]

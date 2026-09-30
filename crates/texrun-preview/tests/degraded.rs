@@ -286,6 +286,141 @@ fn cancellation_stops_the_run() {
 }
 
 #[test]
+fn cancelling_a_running_tool_stops_its_process_group() {
+    // Like the timeout test, but the run is stopped by cancelling the token
+    // from another thread while the tool (and its background job) runs.
+    let dir = tempfile::tempdir().unwrap();
+    let heart = dir.path().join("heartbeat");
+    let script = format!(
+        "#!/bin/sh\nheart='{}'\n(while :; do echo x >> \"$heart\"; sleep 0.05; done) &\nsleep 30\n",
+        heart.display()
+    );
+    let f = fake(&script, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let canceller = {
+        let cancel = cancel.clone();
+        let heart = heart.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while !heart.exists() && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.cancel();
+        })
+    };
+    let started = Instant::now();
+    let report = Previewer::new(f.tools)
+        .render(
+            &fixture("sizes.pdf"),
+            out.path(),
+            &opts().with_cancel(cancel),
+        )
+        .unwrap();
+    canceller.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(kinds(&report), vec![NoticeKind::Cancelled]);
+    assert_eq!(report.status, PreviewStatus::Skipped);
+
+    let size = || fs::metadata(&heart).map_or(0, |m| m.len());
+    let before = size();
+    assert!(before > 0, "the background job never ran");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(size(), before, "a descendant survived the cancellation");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tools_run_with_resource_limits_on_linux() {
+    // The fake records its limits (inherited by `cat`) next to the output
+    // root, then renders as usual.
+    let script = PDFTOPPM.replace(
+        "env > \"$HOME/../env.txt\"",
+        "cat /proc/self/limits > \"$HOME/../../limits.txt\"",
+    );
+    let f = fake(PDFINFO, &script);
+    let out = tempfile::tempdir().unwrap();
+    let report = Previewer::new(f.tools)
+        .render(
+            &fixture("sizes.pdf"),
+            out.path(),
+            &opts().with_pages("1".parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(report.status, PreviewStatus::Rendered);
+    let limits = fs::read_to_string(out.path().join("limits.txt")).unwrap();
+    let limit = |name: &str| {
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} missing in {limits}"));
+        line.split_whitespace().rev().nth(1).unwrap().to_owned()
+    };
+    // Columns: name, soft, hard, units; take the hard limit.
+    assert_eq!(
+        limit("Max address space"),
+        (2u64 << 30).to_string(),
+        "{limits}"
+    );
+    // The whole 128 MiB budget is left for page 1 (one byte more, so that
+    // exceeding the budget is detectable).
+    assert_eq!(
+        limit("Max file size"),
+        ((128u64 << 20) + 1).to_string(),
+        "{limits}"
+    );
+    assert_eq!(limit("Max core file size"), "0", "{limits}");
+}
+
+#[test]
+fn an_image_over_the_pixel_limit_is_discarded() {
+    // The fake claims a 5000 x 10 px image, whatever the requested DPI: the
+    // check after rendering must catch it.
+    let big = "#!/bin/sh\nfor a; do last=$a; done\n\
+               printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\023\\210\\000\\000\\000\\012' \
+               > \"$last.png\"\n";
+    let f = fake(PDFINFO, big);
+    let out = tempfile::tempdir().unwrap();
+    let report = Previewer::new(f.tools)
+        .render(
+            &fixture("sizes.pdf"),
+            out.path(),
+            &opts().with_pages("1".parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(report.status, PreviewStatus::Skipped);
+    assert_eq!(kinds(&report), vec![NoticeKind::RenderFailed]);
+    assert!(
+        report.notices[0].message.contains("5000 x 10"),
+        "{:?}",
+        report.notices
+    );
+    assert!(entries(&out.path().join("preview")).is_empty());
+}
+
+#[test]
+fn an_existing_symlink_at_the_image_name_is_replaced_not_followed() {
+    let f = fake(PDFINFO, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let victim = elsewhere.path().join("victim");
+    fs::write(&victim, "keep").unwrap();
+    fs::create_dir(out.path().join("preview")).unwrap();
+    std::os::unix::fs::symlink(&victim, out.path().join("preview/page-001.png")).unwrap();
+    let report = Previewer::new(f.tools)
+        .render(
+            &fixture("sizes.pdf"),
+            out.path(),
+            &opts().with_pages("1".parse().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(report.status, PreviewStatus::Rendered);
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    let image = out.path().join("preview/page-001.png");
+    assert!(fs::symlink_metadata(&image).unwrap().is_file());
+}
+
+#[test]
 fn a_symlinked_preview_directory_is_refused() {
     let f = fake(PDFINFO, PDFTOPPM);
     let out = tempfile::tempdir().unwrap();

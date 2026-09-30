@@ -47,13 +47,32 @@ fn backends() -> Vec<(Previewer, PreviewOptions)> {
         } else if std::env::var_os(REQUIRE_ENV).is_some_and(|v| v == "1") {
             panic!("{} is not installed but {REQUIRE_ENV}=1", kind.name());
         } else {
-            eprintln!(
-                "SKIPPED: {} is not installed (set {REQUIRE_ENV}=1 to fail instead)",
-                kind.name()
-            );
+            report_skip(kind);
         }
     }
     found
+}
+
+/// Tells that `kind` is skipped, once per test binary. Written to the
+/// process's stderr directly: `eprintln!` would be captured by the libtest
+/// harness and never shown for a passing test. (cargo-nextest captures the
+/// whole process output; use `--no-capture` there to see it.)
+fn report_skip(kind: BackendKind) {
+    use std::io::Write;
+    use std::sync::Mutex;
+    static REPORTED: Mutex<Vec<BackendKind>> = Mutex::new(Vec::new());
+    let mut reported = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !reported.contains(&kind) {
+        reported.push(kind);
+        let _ = writeln!(
+            std::io::stderr(),
+            "texrun-preview real_tools: SKIPPED all {} checks: not installed \
+             (set {REQUIRE_ENV}=1 to fail instead)",
+            kind.name()
+        );
+    }
 }
 
 fn kinds(report: &PreviewReport) -> Vec<NoticeKind> {
@@ -79,7 +98,8 @@ fn reads_page_count_sizes_and_rotation() {
     for (previewer, options) in backends() {
         let report = previewer.inspect(&fixture("sizes.pdf"), &options).unwrap();
         let name = report.backend.unwrap().name();
-        assert_eq!(report.status, PreviewStatus::Skipped, "{name}");
+        assert_eq!(report.status, PreviewStatus::Inspected, "{name}");
+        assert!(report.pages.is_empty(), "{name}");
         assert!(report.notices.is_empty(), "{name}: {:?}", report.notices);
         let pdf = report.pdf.unwrap();
         assert_eq!(pdf.page_count, 3, "{name}");
@@ -354,5 +374,47 @@ fn auto_prefers_mupdf() {
     assert_eq!(report.backend, tools.available().first().copied());
     if tools.has(BackendKind::Mupdf) {
         assert_eq!(report.backend, Some(BackendKind::Mupdf));
+    }
+}
+
+#[test]
+fn a_page_scale_factor_does_not_break_the_pixel_limit() {
+    // `user-unit.pdf` declares a 100 x 50 unit page with /UserUnit 10.
+    // `mutool` renders it 10 times larger; Poppler ignores the factor. Either
+    // way the image must stay within the long edge limit, and the reported
+    // size must match what the backend renders.
+    for (previewer, options) in backends() {
+        for max_px in [500, 4096] {
+            let out = tempfile::tempdir().unwrap();
+            let options = options.clone().with_max_long_edge_px(max_px);
+            let report = previewer
+                .render(&fixture("user-unit.pdf"), out.path(), &options)
+                .unwrap();
+            let kind = report.backend.unwrap();
+            let name = kind.name();
+            assert_eq!(report.status, PreviewStatus::Rendered, "{name}: {report:?}");
+            let p = &report.pages[0];
+            assert!(
+                p.width_px.max(p.height_px) <= max_px + 2,
+                "{name}: {p:?} exceeds {max_px} px"
+            );
+
+            let page = report.pdf.as_ref().unwrap().pages[0];
+            let (scale, px_per_pt) = match kind {
+                BackendKind::Mupdf => (10.0, f64::from(p.dpi) / 72.0),
+                _ => (1.0, f64::from(p.dpi) / 72.0),
+            };
+            assert_eq!(
+                (page.width_pt, page.height_pt),
+                (100.0 * scale, 50.0 * scale),
+                "{name}"
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let expected = (
+                (page.width_pt * px_per_pt).round() as u32,
+                (page.height_pt * px_per_pt).round() as u32,
+            );
+            assert_close((p.width_px, p.height_px), expected, name);
+        }
     }
 }

@@ -61,8 +61,12 @@ CI と同じ条件で確認したい場合は `cargo check` / `cargo clippy` / `
 CI で使っている `cargo-deny` / `cargo-nextest` は image に含めていない。`cargo deny check` や `cargo nextest run` は host で実行する（test 自体はコンテナ内の `cargo test --workspace` で同じものを実行できる）。
 host に Rust toolchain がある場合は host で直接実行してもよい。コンテナ経由の実行は TeX Live を必要とする作業や、CI と同じ Linux 環境で確認したい場合に使う。
 
-`crates/texrun-preview` の実ツールを使う test（`tests/real_tools.rs`）は、`mutool` / `pdftoppm` が見つからない backend を stderr に `SKIPPED` と出して skip する。
-両方がそろっているコンテナでは、skip を失敗にして確実に実行させる:
+`crates/texrun-preview` の実ツールを使う test（`tests/real_tools.rs`）は、`mutool` / `pdftoppm` が見つからない backend を skip する。
+- skip した backend は、test binary ごとに 1 回だけ stderr に `SKIPPED` と表示する。
+  - libtest の出力 capture を通さずに書くので、`cargo test` では `--nocapture` を付けなくても表示される。
+  - `cargo nextest run` は process の出力全体を capture するため、`--no-capture` を付けた場合にだけ表示される。
+- test 自体は pass 扱いになる。CI の ubuntu / macos runner には tool が無いので、現状の CI では実ツールの test は実行されていない。
+- 両方がそろっているコンテナや、将来の integration job（#10 / #11）では、skip を失敗にして確実に実行させる:
 
 ```bash
 docker compose run --rm -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 dev cargo test -p texrun-preview

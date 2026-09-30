@@ -95,7 +95,18 @@ texrun compile --json main.tex
 - **TeX Live + latexmk:** required to compile documents. For development, the
   Docker-based environment (see below) is recommended instead of installing
   TeX Live on the host.
-- **Preview tool:** `mutool` (MuPDF) or `pdftoppm` (Poppler), for page previews.
+- **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
+  page previews. MuPDF is used when both are installed; without either,
+  compiling still works and the result says that previews were skipped.
+  - Licensing: MuPDF is AGPL and Poppler is GPL. texrun only starts an
+    installed binary as a separate process; it neither links nor ships them.
+    To avoid MuPDF entirely, select the Poppler backend
+    (`BackendChoice::Poppler`; a CLI option follows with #6) or do not install
+    `mutool`.
+  - The development Docker image below contains `mupdf-tools` and
+    `poppler-utils`. If that image is ever distributed, the AGPL / GPL terms
+    for distributing those packages apply to the image and must be checked
+    separately.
 
 ## Local development
 

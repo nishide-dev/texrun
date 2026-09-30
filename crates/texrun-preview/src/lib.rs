@@ -51,19 +51,37 @@
 //! | pages without a range | first [`DEFAULT_PAGE_LIMIT`] (20) |
 //! | pages with a range | at most [`MAX_PAGE_LIMIT`] (200) |
 //! | total image size | [`DEFAULT_MAX_TOTAL_BYTES`] (128 MiB); rendering stops before the page that would exceed it |
-//! | long edge of one image | [`DEFAULT_MAX_LONG_EDGE_PX`] (4096 px); larger pages get a lower DPI |
+//! | long edge of one image | [`DEFAULT_MAX_LONG_EDGE_PX`] (4096 px); see below |
 //! | wall clock, all pages | [`DEFAULT_TIMEOUT`] (30 s) |
 //!
+//! The long edge limit is enforced in layers, so that it does not depend on
+//! parsing the (untrusted) page size correctly: the DPI is lowered for large
+//! pages (including the `UserUnit` scale that `mutool` honors), `mutool draw`
+//! also gets the limit as a bounding box (`-w`/`-h`), and every image is
+//! checked after rendering and discarded (`render_failed`) if it is larger.
+//!
 //! Tools are started by absolute path with an argv array (no shell), with a
-//! cleared environment (`PATH`, `LC_ALL=C` and a private empty `HOME`
-//! only), in their own process group that is killed with `SIGKILL` on
-//! timeout, cancellation or when an image outgrows the remaining size
-//! budget. Tool output is parsed defensively, and the images are written to a
-//! private scratch directory and moved into place only after they were
-//! checked to be PNG files within the budget.
+//! cleared environment (`PATH` with only its absolute entries, `LC_ALL=C` and
+//! a private empty `HOME`), in their own process group that is killed with
+//! `SIGKILL` on timeout, cancellation or when an image outgrows the remaining
+//! size budget. On Linux, `RLIMIT_AS` (2 GiB) and `RLIMIT_FSIZE` are set on
+//! each tool with `prlimit(2)` right after it is spawned; macOS has no
+//! `prlimit`, so there only the limits above apply and a tool's memory use is
+//! not capped. Tool output is parsed defensively. Images are written to a
+//! private scratch directory, checked (regular file, PNG header, size and
+//! pixel budget) and moved into place with `renameat` between directory
+//! descriptors; the preview directory is created and opened with
+//! `mkdirat` / `openat(O_NOFOLLOW)`, so a symlink swapped into the output
+//! root cannot redirect the images.
+//!
+//! Unix only (Linux, macOS), like the workspace crate.
+
+#[cfg(not(unix))]
+compile_error!("texrun-preview supports Unix hosts only");
 
 mod backend;
 mod error;
+mod fsops;
 mod options;
 mod png;
 mod process;

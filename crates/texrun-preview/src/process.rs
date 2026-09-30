@@ -4,9 +4,14 @@
 //! - `env_clear()` plus an allowlist (`PATH`, `HOME`, `LC_ALL`);
 //! - in its own process group, killed as a group (`SIGKILL`) on timeout,
 //!   cancellation or when the watched output file grows past its budget, and
-//!   once more after a normal exit to reap stray descendants;
+//!   once more after a normal exit to reap stray descendants; a guard does
+//!   the same if the caller unwinds;
+//! - on Linux, `RLIMIT_AS` and `RLIMIT_FSIZE` are set on the tool with
+//!   `prlimit(2)` right after it is spawned (see [`TOOL_ADDRESS_SPACE`]);
 //! - stdout / stderr are drained completely by reader threads, keeping only a
 //!   bounded prefix.
+//!
+//! The TeX Live engine has a similar runner; sharing one is tracked in #32.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -29,10 +34,25 @@ pub(crate) const STDOUT_LIMIT: usize = 1024 * 1024;
 /// Kept prefix of stderr.
 pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
 
+/// Address space limit of one tool process on Linux (`RLIMIT_AS`): 2 GiB.
+/// A 4096 x 4096 px page needs about 64 MiB of pixels; the rest is room for
+/// decoding embedded images. The limit is set right after spawning (there is
+/// no `pre_exec` without `unsafe`), so the tool's first instructions run
+/// unlimited; the tools do not allocate much before opening the PDF.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const TOOL_ADDRESS_SPACE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Smallest `RLIMIT_FSIZE` given to a tool on Linux: 16 MiB. The tools may
+/// write caches (e.g. fontconfig) into their private `HOME`, and hitting the
+/// limit kills them with `SIGXFSZ`, so it is never set below this even when
+/// the remaining image budget is smaller; the poll loop enforces the budget.
+pub(crate) const MIN_FILE_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
+
 /// The environment of a tool process.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolEnv {
-    /// Host `PATH` (as used for detection).
+    /// `PATH` for the tool: the absolute entries of the search path used for
+    /// detection.
     pub(crate) path: Option<OsString>,
     /// A private, empty directory (the tools may write caches there).
     pub(crate) home: PathBuf,
@@ -70,7 +90,7 @@ pub(crate) enum RunEnd {
     TimedOut,
     Cancelled,
     OutputTooLarge,
-    /// Spawning or waiting failed.
+    /// Spawning, limiting or waiting failed.
     Failed(io::Error),
 }
 
@@ -82,8 +102,43 @@ pub(crate) struct RunOutput {
 }
 
 impl RunOutput {
+    fn empty(end: RunEnd) -> Self {
+        Self {
+            end,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
     pub(crate) fn succeeded(&self) -> bool {
         matches!(&self.end, RunEnd::Exited(status) if status.success())
+    }
+}
+
+/// Owns a spawned tool. Dropping it without [`Guard::finish`] (e.g. while
+/// unwinding) still kills the process group and reaps the leader.
+struct Guard {
+    child: Child,
+    reaped: bool,
+}
+
+impl Guard {
+    /// Kills whatever is left of the group and reaps the leader.
+    fn finish(&mut self) {
+        // Also after a normal exit, so that no descendant outlives the tool.
+        // A process group ID is not reused while the group has members, so
+        // this cannot reach an unrelated process (docs/security.md §3.6).
+        kill_group(&self.child);
+        if !self.reaped {
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -95,24 +150,11 @@ pub(crate) fn run(
     capture_stdout: bool,
     limits: Limits<'_>,
 ) -> RunOutput {
-    let failed = |e| RunOutput {
-        end: RunEnd::Failed(e),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
     if limits.cancel.is_cancelled() {
-        return RunOutput {
-            end: RunEnd::Cancelled,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
+        return RunOutput::empty(RunEnd::Cancelled);
     }
     if Instant::now() >= limits.deadline {
-        return RunOutput {
-            end: RunEnd::TimedOut,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        };
+        return RunOutput::empty(RunEnd::TimedOut);
     }
 
     let mut cmd = Command::new(program);
@@ -127,24 +169,28 @@ pub(crate) fn run(
             Stdio::null()
         })
         .stderr(Stdio::piped());
-    #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => return failed(e),
+    let mut guard = match cmd.spawn() {
+        Ok(child) => Guard {
+            child,
+            reaped: false,
+        },
+        Err(e) => return RunOutput::empty(RunEnd::Failed(e)),
     };
-    let stdout = child.stdout.take().map(|s| drain(s, STDOUT_LIMIT));
-    let stderr = child.stderr.take().map(|s| drain(s, STDERR_LIMIT));
-
-    let end = wait(&mut child, limits);
-    // Also after a normal exit, so that no descendant outlives the tool. A
-    // process group ID is not reused while the group has members, so this
-    // cannot reach an unrelated process (docs/security.md §3.6).
-    kill_group(&mut child);
-    if !matches!(end, RunEnd::Exited(_)) {
-        let _ = child.wait();
+    let file_size = limits
+        .watch
+        .map_or(0, |(_, budget)| budget.saturating_add(1))
+        .max(MIN_FILE_SIZE_LIMIT);
+    if let Err(e) = apply_rlimits(&guard.child, file_size) {
+        guard.finish();
+        return RunOutput::empty(RunEnd::Failed(e));
     }
+    let stdout = guard.child.stdout.take().map(|s| drain(s, STDOUT_LIMIT));
+    let stderr = guard.child.stderr.take().map(|s| drain(s, STDERR_LIMIT));
+
+    let end = wait(&mut guard, limits);
+    guard.finish();
 
     let deadline = Instant::now() + READER_GRACE;
     let collect = |rx: Option<mpsc::Receiver<Vec<u8>>>| {
@@ -161,15 +207,15 @@ pub(crate) fn run(
     }
 }
 
-fn wait(child: &mut Child, limits: Limits<'_>) -> RunEnd {
+fn wait(guard: &mut Guard, limits: Limits<'_>) -> RunEnd {
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return RunEnd::Exited(status),
-            Ok(None) => {}
-            Err(e) => {
-                kill_group(child);
-                return RunEnd::Failed(e);
+        match guard.child.try_wait() {
+            Ok(Some(status)) => {
+                guard.reaped = true;
+                return RunEnd::Exited(status);
             }
+            Ok(None) => {}
+            Err(e) => return RunEnd::Failed(e),
         }
         let stop = if limits.cancel.is_cancelled() {
             Some(RunEnd::Cancelled)
@@ -184,23 +230,57 @@ fn wait(child: &mut Child, limits: Limits<'_>) -> RunEnd {
             None
         };
         if let Some(end) = stop {
-            kill_group(child);
+            kill_group(&guard.child);
             return end;
         }
         thread::sleep(POLL_INTERVAL);
     }
 }
 
-#[cfg(unix)]
-fn kill_group(child: &mut Child) {
+fn kill_group(child: &Child) {
     use rustix::process::{Pid, Signal, kill_process_group};
     // `ESRCH` (group already gone) is expected and ignored.
     let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
 }
 
-#[cfg(not(unix))]
-fn kill_group(child: &mut Child) {
-    let _ = child.kill();
+/// Sets `RLIMIT_AS` ([`TOOL_ADDRESS_SPACE`]) and `RLIMIT_FSIZE`
+/// (`file_size`) on the freshly spawned tool. An already exited tool
+/// (`ESRCH`) is not an error.
+#[cfg(target_os = "linux")]
+fn apply_rlimits(child: &Child, file_size: u64) -> io::Result<()> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Resource, Rlimit, getrlimit, prlimit};
+    let pid = Pid::from_child(child);
+    for (resource, value) in [
+        (Resource::As, TOOL_ADDRESS_SPACE),
+        (Resource::Fsize, file_size),
+        // `SIGXFSZ` dumps core by default; like the TeX engine, never
+        // leave core files behind.
+        (Resource::Core, 0),
+    ] {
+        // Only ever lower a limit: never above texrun's own hard limit
+        // (which the child inherited), so no privilege is needed.
+        let value = getrlimit(resource)
+            .maximum
+            .map_or(value, |hard| hard.min(value));
+        let limit = Rlimit {
+            current: Some(value),
+            maximum: Some(value),
+        };
+        match prlimit(Some(pid), resource, limit) {
+            Ok(_) | Err(Errno::SRCH) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// macOS has no `prlimit(2)`; the limits are enforced by the poll loop and
+/// the pixel limit only.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_rlimits(_child: &Child, _file_size: u64) -> io::Result<()> {
+    Ok(())
 }
 
 /// Reads `source` to the end on a thread, keeping at most `limit` bytes.
@@ -211,11 +291,13 @@ fn drain(mut source: impl Read + Send + 'static, limit: usize) -> mpsc::Receiver
         let mut buf = [0u8; 8192];
         loop {
             match source.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     let room = limit.saturating_sub(kept.len());
                     kept.extend_from_slice(&buf[..n.min(room)]);
                 }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
         }
         let _ = tx.send(kept);

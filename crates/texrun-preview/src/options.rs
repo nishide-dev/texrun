@@ -48,6 +48,10 @@ pub const DEFAULT_MAX_LONG_EDGE_PX: u32 = 4096;
 #[non_exhaustive]
 pub enum BackendChoice {
     /// `MuPDF` if installed, otherwise Poppler.
+    ///
+    /// The choice depends only on which tools are installed. If the chosen
+    /// tool fails on a PDF (`pdf_unreadable`, `render_failed`), the other one
+    /// is not tried; select it explicitly to compare.
     #[default]
     Auto,
     /// Poppler (`pdfinfo` + `pdftoppm`) only.

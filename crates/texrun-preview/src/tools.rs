@@ -55,12 +55,17 @@ impl Toolset {
         Self::from_search_path(env::var_os("PATH").as_deref())
     }
 
-    /// Looks the tools up in `search_path` (a `PATH`-style list). The same
-    /// value is passed to the tools as their `PATH`.
+    /// Looks the tools up in `search_path` (a `PATH`-style list). Its
+    /// absolute entries, in order, are also passed to the tools as their
+    /// `PATH` (the tools do not start other programs; relative entries would
+    /// be resolved against their working directory).
     pub fn from_search_path(search_path: Option<&OsStr>) -> Self {
-        let find = |name| search_path.and_then(|p| find_executable(p, name));
+        let absolute = search_path.and_then(|p| {
+            env::join_paths(env::split_paths(p).filter(|dir| dir.is_absolute())).ok()
+        });
+        let find = |name| absolute.as_deref().and_then(|p| find_executable(p, name));
         Self {
-            search_path: search_path.map(OsStr::to_os_string),
+            search_path: absolute.clone(),
             pdftoppm: find(PDFTOPPM),
             pdfinfo: find(PDFINFO),
             mutool: find(MUTOOL),
@@ -194,6 +199,15 @@ mod tests {
         // Relative entries would be resolved against the current directory.
         let rel = OsString::from(".:relative/bin:");
         assert_eq!(find_executable(&rel, MUTOOL), None);
+
+        // They are not passed on to the tools either.
+        let mut mixed = OsString::from(".:");
+        mixed.push(dir.path());
+        mixed.push(":relative/bin::/usr/bin");
+        let tools = Toolset::from_search_path(Some(&mixed));
+        let expected = join(&[dir.path(), Path::new("/usr/bin")]);
+        assert_eq!(tools.search_path(), Some(expected.as_os_str()));
+        assert!(tools.has(BackendKind::Mupdf));
     }
 
     #[test]
