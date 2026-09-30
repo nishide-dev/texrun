@@ -39,9 +39,11 @@
 //!
 //! # Name matching
 //!
-//! Excluded names are matched on a folded form (Unicode NFKC + lowercase),
-//! and, as a second layer, the workspace filesystem is asked after each
-//! entry is created whether it is also reachable under a protected name
+//! Excluded names and the components of excluded paths
+//! ([`WorkspaceConfig::excluded_paths`], the output directory) are matched
+//! on a folded form (Unicode NFKC + lowercase), and, as a second layer, the
+//! workspace filesystem is asked after each entry is created whether it is
+//! also reachable under a protected name
 //! (case- or normalization-insensitive filesystems such as default APFS).
 //! Such entries are removed and reported.
 //!

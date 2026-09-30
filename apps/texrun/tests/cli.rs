@@ -832,22 +832,72 @@ fn parent_directory_input_gets_a_note() {
 }
 
 #[test]
-fn nested_output_inside_the_project_is_warned_about() {
+fn nested_output_inside_the_project_is_not_copied_on_the_next_run() {
     let env = Env::new(FAKE_SUCCEED);
     env.file("proj/main.tex", MINIMAL);
-    fs::create_dir_all(env.path("proj/build/pdf")).unwrap();
-    let out = env.run(&["compile", "--json", "-o", "build/pdf", "main.tex"]);
+    env.file("proj/build/notes.tex", "sibling of the output directory");
+    env.file("proj/build/figures/plot.pdf", "sibling below the ancestor");
+    let args = [
+        "compile",
+        "--json",
+        "--keep-workspace",
+        "-o",
+        "build/pdf/out",
+        "main.tex",
+    ];
+
+    // First run: the output directory does not exist yet.
+    let out = env.run(&args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(env.path("proj/build/pdf/out/main.pdf").is_file());
+    let doc = json(&out);
+    fs::remove_dir_all(doc["workspace"]["kept_path"].as_str().unwrap()).unwrap();
+
+    // Second run: the earlier output is left out of the workspace and
+    // reported, without a warning; its ancestors and siblings are copied.
+    let out = env.run(&args);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let doc = json(&out);
+    let excluded = doc["workspace"]["excluded"].as_array().unwrap();
     assert!(
-        doc["notes"]
-            .as_array()
-            .unwrap()
+        excluded
             .iter()
-            .any(|n| n["kind"] == "output_inside_project"),
+            .any(|e| e["path"] == "build/pdf/out" && e["reason"] == "excluded_path"),
+        "{excluded:?}"
+    );
+    assert!(
+        doc.get("notes")
+            .is_none_or(|n| n.as_array().unwrap().is_empty()),
         "{doc:#}"
     );
-    assert!(stderr(&out).contains("warning: the output directory build/pdf"));
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+    let kept = PathBuf::from(doc["workspace"]["kept_path"].as_str().unwrap());
+    assert!(fs::symlink_metadata(kept.join("build/pdf/out")).is_err());
+    assert!(kept.join("build/pdf").is_dir());
+    assert!(kept.join("build/notes.tex").is_file());
+    assert!(kept.join("build/figures/plot.pdf").is_file());
+    fs::remove_dir_all(kept).unwrap();
+}
+
+#[test]
+fn output_directory_containing_the_entrypoint_is_still_copied() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.file("proj/src/doc.tex", MINIMAL);
+    let args = [
+        "compile",
+        "--json",
+        "--root",
+        ".",
+        "-o",
+        "src",
+        "src/doc.tex",
+    ];
+    assert_eq!(code(&env.run(&args)), 0);
+    let out = env.run(&args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json(&out);
+    let excluded = doc["workspace"]["excluded"].as_array().unwrap();
+    assert!(!excluded.iter().any(|e| e["path"] == "src"), "{excluded:?}");
 }
 
 #[test]

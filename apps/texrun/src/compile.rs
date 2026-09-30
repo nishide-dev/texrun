@@ -22,7 +22,7 @@ use std::time::Duration;
 use texrun_core::schema::Versioned;
 use texrun_core::{
     Artifact, CancelToken, CompileOptions, CompileOutcome, CompileResult, DiagnosticKind, Severity,
-    TypesetEngine,
+    TypesetEngine, WorkspacePath,
 };
 use texrun_preview::{PreviewOptions, PreviewReport, Previewer};
 use texrun_texlive::{LatexmkConfig, LatexmkEngine};
@@ -135,21 +135,7 @@ fn execute(
     let output = output_dir(args);
     let existing_output =
         output::walk(&output, input.root(), false).map_err(|e| output_error(&output, e))?;
-    if let Some(dir) = &existing_output
-        && output::is_nested_in(dir, input.root())
-        && dir.file_name() != Some(DEFAULT_OUTPUT_DIR_NAME.as_ref())
-    {
-        report.notes.push(warn_now(
-            "output_inside_project",
-            format!(
-                "the output directory {} is inside the project below its top level, so its \
-                 contents are copied into the workspace on the next run; put it directly in the \
-                 project root or outside the project",
-                human::show(&output)
-            ),
-        ));
-    }
-    let config = workspace_config(args, input.root(), &output);
+    let config = workspace_config(args, &input, existing_output.as_deref());
 
     let engine =
         LatexmkEngine::new(LatexmkConfig::default().with_source_date_epoch(args.source_date_epoch));
@@ -436,33 +422,42 @@ fn check_root(root: &Path, explicit: bool) -> Result<Option<Note>, ErrorInfo> {
 }
 
 /// Workspace settings: `--keep-workspace`, and earlier outputs are not
-/// copied back in: `texrun-out` anywhere, and the `--output` directory when
-/// it is directly in the project root.
-fn workspace_config(args: &CompileArgs, root: &Path, output: &Path) -> WorkspaceConfig {
+/// copied back in: `texrun-out` anywhere, and the output directory
+/// (`existing_output`, its canonical path if it already exists) at any depth
+/// when it is inside the project root.
+fn workspace_config(
+    args: &CompileArgs,
+    input: &ProjectInput,
+    existing_output: Option<&Path>,
+) -> WorkspaceConfig {
     let mut config = WorkspaceConfig::default().with_keep(args.keep_workspace);
     config
         .excluded_names
         .push(DEFAULT_OUTPUT_DIR_NAME.to_owned());
-    if let Some(name) = child_of(root, output) {
-        config.excluded_root_names.push(name);
+    if let Some(rel) = existing_output
+        .and_then(|dir| output_path_to_exclude(dir, input.root(), input.entrypoint()))
+    {
+        config.excluded_paths.push(rel);
     }
     config
 }
 
-/// The name of `path` if it is (or would be) a direct child of `root`.
-fn child_of(root: &Path, path: &Path) -> Option<String> {
-    let resolved = fs::canonicalize(path).ok().or_else(|| {
-        let parent = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        Some(fs::canonicalize(parent).ok()?.join(path.file_name()?))
-    })?;
-    if resolved.parent() == Some(root) {
-        resolved.file_name()?.to_str().map(str::to_owned)
-    } else {
-        None
-    }
+/// The output directory `dir` (canonical) relative to the project `root`
+/// (canonical), if it is inside the root and does not contain the
+/// entrypoint.
+///
+/// Both paths are canonical, so `dir` is spelled as stored on disk; the
+/// workspace layer also matches other spellings of it (case, Unicode
+/// normalization). A directory that does not exist yet has nothing to
+/// copy. An output directory that contains the entrypoint (e.g. `-o .`)
+/// holds the sources too and cannot be left out.
+fn output_path_to_exclude(
+    dir: &Path,
+    root: &Path,
+    entrypoint: &WorkspacePath,
+) -> Option<WorkspacePath> {
+    let rel = WorkspacePath::from_path(dir.strip_prefix(root).ok()?).ok()?;
+    (!entrypoint.starts_with(&rel)).then_some(rel)
 }
 
 /// What [`copy_artifacts`] did.
@@ -547,19 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn output_directly_in_root_is_detected() {
-        let project = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(project.path()).unwrap();
-        assert_eq!(
-            child_of(&root, &root.join("build")),
-            Some("build".to_owned())
-        );
-        fs::create_dir(root.join("build")).unwrap();
-        assert_eq!(
-            child_of(&root, &root.join("build")),
-            Some("build".to_owned())
-        );
-        assert_eq!(child_of(&root, &root.join("build/pdf")), None);
-        assert_eq!(child_of(&root, &root), None);
+    fn output_inside_the_root_is_excluded_by_path() {
+        let root = Path::new("/p");
+        let entry = WorkspacePath::new("src/main.tex").unwrap();
+        let rel = |dir: &str| output_path_to_exclude(Path::new(dir), root, &entry);
+        let wp = |s: &str| Some(WorkspacePath::new(s).unwrap());
+        assert_eq!(rel("/p/build"), wp("build"));
+        assert_eq!(rel("/p/build/pdf"), wp("build/pdf"));
+        assert_eq!(rel("/p/src/texrun-out/a/b"), wp("src/texrun-out/a/b"));
+        assert_eq!(rel("/p/srcs"), wp("srcs"));
+        // Outside the root, the root itself, or containing the entrypoint.
+        assert_eq!(rel("/q/build"), None);
+        assert_eq!(rel("/pp/build"), None);
+        assert_eq!(rel("/p"), None);
+        assert_eq!(rel("/p/src"), None);
     }
 }

@@ -194,6 +194,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
   - VCS のディレクトリ: `.git`、`.hg`、`.svn`
   - `.texrun/`（output root と衝突させないため）
   - root 直下の `target`
+  - `WorkspaceConfig::excluded_paths` の root 相対パス（CLI は project 内の出力先を深さによらずここに加える。入力上限を前回の出力で消費させないため）。名前と同じく component ごとに folding と workspace FS での別名チェックを行う
   - special file（FIFO / socket 等）
   - `*.fmt` / `*.base` / `*.mem`: workspace 内の format を読み込ませないため。§3.5 の `-no-parse-first-line` と合わせた二重の対策
   - `biber.conf` / `.biber.conf`: 将来 biber を使う場合に、入力から設定を持ち込ませないため
