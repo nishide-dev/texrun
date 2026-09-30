@@ -1,0 +1,18 @@
+[package]
+name = "texrun-latex-log"
+description = "Parser that turns TeX / LaTeX engine logs into texrun diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+texrun-core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
