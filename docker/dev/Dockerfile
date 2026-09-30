@@ -5,11 +5,12 @@
 # - Preview tools: MuPDF (`mutool`) and Poppler (`pdftoppm` / `pdfinfo`) for #8.
 #
 # Usage: see docs/development.md (`docker compose run --rm dev <command>`).
+# CI builds the same image for the TeX Live integration job (ci.yml).
 
-ARG RUST_VERSION=1.98.1
-ARG DEBIAN_RELEASE=trixie
-
-FROM rust:${RUST_VERSION}-slim-${DEBIAN_RELEASE}
+# The base image is pinned by digest (multi-arch index) so that CI and local
+# builds start from the same image. Dependabot (docker ecosystem) updates the
+# digest; bump the tag by hand together with `rust-toolchain.toml`.
+FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
 
 # Keep documentation, man pages and non-English locales out of the image.
 # TeX Live doc packages are large; this also strips docs shipped inside

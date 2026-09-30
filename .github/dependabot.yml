@@ -24,3 +24,20 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # Base image of the dev / CI image (docker/dev/Dockerfile), pinned by
+  # digest. Only digest updates of the pinned tag are wanted: the Rust
+  # version in the tag must move together with rust-toolchain.toml, so it is
+  # bumped by hand.
+  - package-ecosystem: docker
+    directory: /docker/dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
