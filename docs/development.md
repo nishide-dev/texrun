@@ -3,7 +3,7 @@
 texrun は TeX Live / latexmk / PDF preview tool を外部コマンドとして呼び出す。
 host に TeX Live を直接インストールしなくても開発・integration test ができるよう、
 Rust toolchain と軽量な TeX Live を含む Docker 環境を用意している。
-CI（#11）でも同じ構成を使い、TeX distribution の差異による fixture（#10）の揺れを抑えることを目的とする。
+TeX Live が必要な CI の integration job（#11 の後続、#10 の fixture が揃った段階で追加）でも同じ構成を使い、TeX distribution の差異による fixture の揺れを抑えることを目的とする。現在の CI（fmt / check / clippy / test / deny）は TeX Live を必要としないため、この image は使わず runner 上で直接実行している。
 
 ## 構成
 
@@ -57,6 +57,8 @@ docker compose run --rm dev
 ```
 
 品質ゲートの定義は [CONTRIBUTING.md](../CONTRIBUTING.md#ローカル品質ゲート) が正であり、変更された場合はこちらも合わせて更新する。
+CI と同じ条件で確認したい場合は `cargo check` / `cargo clippy` / `cargo test` に `--locked` を付ける。
+CI で使っている `cargo-deny` / `cargo-nextest` は image に含めていない。`cargo deny check` や `cargo nextest run` は host で実行する（test 自体はコンテナ内の `cargo test --workspace` で同じものを実行できる）。
 host に Rust toolchain がある場合は host で直接実行してもよい。コンテナ経由の実行は TeX Live を必要とする作業や、CI と同じ Linux 環境で確認したい場合に使う。
 
 ## Cache
