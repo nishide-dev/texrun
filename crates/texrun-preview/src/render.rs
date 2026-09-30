@@ -149,9 +149,14 @@ impl Run<'_> {
         // finished images can be renamed into place. It is created and
         // opened through descriptors (`mkdirat` / `openat(O_NOFOLLOW)`), and
         // the tools run in, and write to, the held `work` directory.
-        let scratch = match output_root {
-            Some(root) => fsops::ScratchDir::create(root, ".texrun-preview-"),
-            None => fsops::ScratchDir::create(&std::env::temp_dir(), "texrun-preview-"),
+        let scratch = if let (Some(root), Some(fd)) = (output_root, &root_fd) {
+            // The same (held) output root the images are moved into.
+            fd.try_clone()
+                .and_then(|fd| fsops::ScratchDir::create(fd, root, ".texrun-preview-"))
+        } else {
+            let tmp = std::env::temp_dir();
+            fsops::open_dir(&tmp)
+                .and_then(|fd| fsops::ScratchDir::create(fd, &tmp, "texrun-preview-"))
         };
         let scratch = match scratch.and_then(|dir| {
             dir.subdir("home")?;

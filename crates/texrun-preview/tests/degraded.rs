@@ -332,11 +332,18 @@ fn cancelling_a_running_tool_stops_its_process_group() {
 #[cfg(target_os = "linux")]
 #[test]
 fn tools_run_with_resource_limits_on_linux() {
-    // The fake records its limits (inherited by `cat`) next to the output
-    // root, then renders as usual.
+    // The fake records its own limits next to the output root, then renders
+    // as usual. The limits are set with `prlimit` after the tool started
+    // (`StartMode::Immediate`), so it waits (up to 5 s) until they have
+    // arrived at itself, and reads its own entry rather than one inherited
+    // by a child (a child started before the limits would not have them).
     let script = PDFTOPPM.replace(
         "env > \"$HOME/../env.txt\"",
-        "cat /proc/self/limits > \"$HOME/../../limits.txt\"",
+        "i=0; while [ $i -lt 500 ]; do \
+           grep -q '^Max address space *2147483648 ' /proc/$$/limits && break; \
+           i=$((i+1)); sleep 0.01; \
+         done; \
+         cat /proc/$$/limits > \"$HOME/../../limits.txt\"",
     );
     let f = fake(PDFINFO, &script);
     let out = tempfile::tempdir().unwrap();

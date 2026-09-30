@@ -17,6 +17,17 @@ pub enum RunError {
         /// The error of the spawn.
         source: io::Error,
     },
+    /// The [`Spec`](crate::Spec) cannot be run as given (checked before
+    /// spawning), e.g. a [`StartMode::StdinGate`](crate::StartMode::StdinGate)
+    /// token longer than [`StartMode::MAX_TOKEN_LEN`](crate::StartMode::MAX_TOKEN_LEN).
+    #[error("invalid process spec: {0}")]
+    InvalidSpec(String),
+    /// Something the [`Spec`](crate::Spec) requires is not available on
+    /// this platform (checked before spawning), e.g.
+    /// [`Spec::require_rlimits`](crate::Spec::require_rlimits) without
+    /// `prlimit(2)`.
+    #[error("unsupported on this platform: {0}")]
+    Unsupported(String),
     /// Another operation on the child failed (preparing its working
     /// directory, setting a limit, waiting for it).
     #[error("{context}: {source}")]

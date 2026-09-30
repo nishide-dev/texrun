@@ -21,7 +21,9 @@ pub enum Resource {
     Core,
     /// `RLIMIT_AS`: address space, in bytes.
     AddressSpace,
-    /// `RLIMIT_CPU`: CPU time, in seconds (#25).
+    /// `RLIMIT_CPU`: CPU time, in seconds (#25). Exceeding it raises
+    /// `SIGXCPU`, whose default action dumps core, so combine it with
+    /// [`Resource::Core`] = 0.
     Cpu,
     /// `RLIMIT_NPROC`: number of processes. Counted per *user*, not per
     /// process tree, so a value must leave room for everything else the

@@ -48,19 +48,47 @@ pub enum Capture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartMode {
-    /// stdin is `/dev/null`; the limits are set right after spawning, while
-    /// the child already runs. Only for programs that do nothing that needs
-    /// the limits in their first instructions.
+    /// stdin is `/dev/null`; the limits are set with `prlimit(2)` from the
+    /// parent after `spawn()` returned, i.e. after the child has already
+    /// `exec`ed and runs as the program.
+    ///
+    /// What this does and does not guarantee:
+    ///
+    /// - The gap until the limits are set is **not bounded in time**: it
+    ///   depends on the parent's scheduling and can be long under load.
+    /// - Memory allocated and files written during the gap are not undone
+    ///   when the limits arrive.
+    /// - Descendants started during the gap do not inherit the limits and
+    ///   stay unlimited.
+    /// - The leader itself gets the limits eventually (as long as it runs).
+    ///
+    /// So use it only for a single-process program that starts no children,
+    /// and treat the limits as a best-effort layer: the primary bounds must
+    /// come from elsewhere (e.g. the caller's check hook and input limits).
+    /// A gate for programs that cannot wait on stdin themselves (a texrun
+    /// helper that waits for the token, sets the limits on itself with
+    /// `setrlimit` and then `exec`s the program) is tracked in #41.
     Immediate,
     /// stdin is a pipe. The limits are set while the child waits for `token`
     /// on stdin (the program, or a wrapper such as the latexmk rc, must
     /// implement the gate), then `token` is written and stdin closed. A
     /// child that sees EOF without the token must exit without doing
     /// anything.
+    ///
+    /// The token is written before the poll loop starts, so it must fit
+    /// into the pipe buffer without blocking: at most
+    /// [`StartMode::MAX_TOKEN_LEN`] bytes ([`run`](crate::run) refuses a
+    /// longer one).
     StdinGate {
         /// Bytes written to stdin once the limits are in place.
         token: Vec<u8>,
     },
+}
+
+impl StartMode {
+    /// Longest [`StartMode::StdinGate`] token: 512 bytes, POSIX's minimum
+    /// `PIPE_BUF`, so writing it to an empty pipe never blocks.
+    pub const MAX_TOKEN_LEN: usize = 512;
 }
 
 /// A program to run under supervision.
@@ -83,8 +111,17 @@ pub struct Spec<'a> {
     pub stdout: Capture,
     /// stderr handling. Default: `Keep(1 MiB)`.
     pub stderr: Capture,
-    /// Resource limits (Linux only, see [`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED)).
+    /// Resource limits.
+    ///
+    /// Only applied where `prlimit(2)` exists
+    /// ([`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED), Linux). Elsewhere
+    /// they are skipped, and [`Finished::rlimits_applied`](crate::Finished::rlimits_applied)
+    /// is `false`, unless [`Spec::require_rlimits`] is set.
     pub rlimits: Rlimits,
+    /// Fail with [`RunError::Unsupported`] (before spawning) instead of
+    /// running without the [`Spec::rlimits`] where they cannot be applied.
+    /// Default: `false` (best effort).
+    pub require_rlimits: bool,
     /// How the child is started.
     pub start: StartMode,
 }
@@ -104,6 +141,7 @@ impl<'a> Spec<'a> {
             stdout: Capture::Keep(Self::DEFAULT_CAPTURE),
             stderr: Capture::Keep(Self::DEFAULT_CAPTURE),
             rlimits: Rlimits::new(),
+            require_rlimits: false,
             start: StartMode::Immediate,
         }
     }
@@ -147,6 +185,13 @@ impl<'a> Spec<'a> {
         self
     }
 
+    /// Sets [`Spec::require_rlimits`].
+    #[must_use]
+    pub fn with_require_rlimits(mut self, required: bool) -> Self {
+        self.require_rlimits = required;
+        self
+    }
+
     /// Sets [`Spec::start`].
     #[must_use]
     pub fn with_start(mut self, start: StartMode) -> Self {
@@ -167,7 +212,13 @@ impl<'a> Spec<'a> {
 /// `process_group(0)` itself, spawns, calls [`Launcher::on_spawn`], applies
 /// [`Spec::rlimits`] (if [`Launcher::apply_rlimits`]) and releases the start
 /// gate. Every time it kills the process group it also calls
-/// [`Launcher::on_kill`].
+/// [`Launcher::on_kill`], and after reaping the leader
+/// [`Launcher::on_reaped`].
+///
+/// The hooks receive the leader's PID so that one launcher can serve
+/// several runs at once. Their exact shape (e.g. a per-run handle returned
+/// by `on_spawn`) will be revisited with the first real implementations
+/// (#25 cgroups, #26 containers).
 pub trait Launcher {
     /// The command for `spec`: program, arguments, environment (after
     /// `env_clear()`) and working directory. Stdio and the process group are
@@ -184,13 +235,28 @@ pub trait Launcher {
     /// Called right after spawning, before the limits are set and the start
     /// gate is released (e.g. to move the child into a cgroup). An error
     /// kills the child and fails the run.
+    ///
+    /// With [`StartMode::Immediate`] the child already runs when this is
+    /// called, so descendants it starts before this hook finishes are not
+    /// covered (e.g. they stay outside the cgroup). To include every
+    /// descendant, combine it with [`StartMode::StdinGate`] (or the exec
+    /// gate of #41).
     fn on_spawn(&self, _pid: u32) -> io::Result<()> {
         Ok(())
     }
 
-    /// Called whenever the process group is killed, after `killpg` (e.g. to
-    /// kill a whole cgroup, including processes that left the group).
-    fn on_kill(&self) {}
+    /// Called whenever the process group of leader `pid` is killed, after
+    /// `killpg` and before the leader is reaped (e.g. to kill a whole
+    /// cgroup, including processes that left the group).
+    ///
+    /// Also called from a drop guard while unwinding, so it must not panic
+    /// (a panic there aborts the process).
+    fn on_kill(&self, _pid: u32) {}
+
+    /// Called once after the leader `pid` has been reaped (e.g. to remove a
+    /// cgroup). Not called when spawning failed. Must not panic, like
+    /// [`Launcher::on_kill`].
+    fn on_reaped(&self, _pid: u32) {}
 }
 
 /// Runs the [`Spec`] directly on the host.
@@ -217,10 +283,13 @@ pub(crate) fn resolve_cwd(cwd: Cwd<'_>) -> Result<PathBuf, RunError> {
             {
                 use std::os::fd::AsRawFd;
                 // Resolved by the child, where the (close-on-exec)
-                // descriptor is still open until `exec`.
+                // descriptor is still open until `exec`. Not for 0..=2:
+                // the child may have replaced those by its stdio already
+                // when it changes directory.
+                let raw = fd.as_raw_fd();
                 let proc_fd = Path::new("/proc/self/fd");
-                if proc_fd.is_dir() {
-                    return Ok(proc_fd.join(fd.as_raw_fd().to_string()));
+                if raw > 2 && proc_fd.is_dir() {
+                    return Ok(proc_fd.join(raw.to_string()));
                 }
             }
             check_same_dir(fd, path)?;

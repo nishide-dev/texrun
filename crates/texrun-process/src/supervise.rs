@@ -137,6 +137,11 @@ pub struct Finished<S = ()> {
     pub stdout: CapturedOutput,
     /// Captured stderr (empty for [`Capture::Discard`]).
     pub stderr: CapturedOutput,
+    /// Whether the supervisor set [`Spec::rlimits`] on the child with
+    /// `prlimit(2)`. `false` if there were none, if the platform has no
+    /// `prlimit` ([`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED)) or if the
+    /// launcher applies them itself ([`Launcher::apply_rlimits`]).
+    pub rlimits_applied: bool,
 }
 
 /// Runs `spec` on the host ([`HostLauncher`]) and supervises it until it
@@ -151,11 +156,8 @@ pub fn run_with<S>(
     spec: &Spec<'_>,
     mut watch: Watch<'_, S>,
 ) -> Result<Finished<S>, RunError> {
+    let (gate, apply_rlimits) = check_spec(launcher, spec)?;
     let mut cmd = launcher.command(spec)?;
-    let gate = match &spec.start {
-        StartMode::Immediate => None,
-        StartMode::StdinGate { token } => Some(token.as_slice()),
-    };
     cmd.stdin(if gate.is_some() {
         Stdio::piped()
     } else {
@@ -174,6 +176,7 @@ pub fn run_with<S>(
     let pgid = Pid::from_child(&child);
     let mut group = Group {
         child,
+        pid: leader_pid,
         pgid,
         launcher,
         reaped: false,
@@ -186,7 +189,8 @@ pub fn run_with<S>(
     launcher
         .on_spawn(leader_pid)
         .map_err(RunError::io(format!("preparing {program}")))?;
-    if launcher.apply_rlimits() && !spec.rlimits.is_empty() {
+    let rlimits_applied = apply_rlimits && rlimit::PRLIMIT_SUPPORTED;
+    if rlimits_applied {
         // `pgid` is the child's PID (it leads its own group).
         rlimit::apply(pgid, &spec.rlimits).map_err(RunError::io(format!(
             "setting resource limits on {program}"
@@ -240,6 +244,7 @@ pub fn run_with<S>(
         .wait()
         .map_err(RunError::io(format!("waiting for {program}")))?;
     group.reaped = true;
+    launcher.on_reaped(leader_pid);
 
     let readers_deadline = Instant::now() + READER_GRACE;
     Ok(Finished {
@@ -249,7 +254,36 @@ pub fn run_with<S>(
         elapsed,
         stdout: stdout.finish(readers_deadline),
         stderr: stderr.finish(readers_deadline),
+        rlimits_applied,
     })
+}
+
+/// Checks `spec` before anything is started. Returns the start gate token
+/// (if any) and whether the supervisor applies the rlimits.
+fn check_spec<'s>(
+    launcher: &dyn Launcher,
+    spec: &'s Spec<'_>,
+) -> Result<(Option<&'s [u8]>, bool), RunError> {
+    let gate = match &spec.start {
+        StartMode::Immediate => None,
+        StartMode::StdinGate { token } => {
+            if token.len() > StartMode::MAX_TOKEN_LEN {
+                return Err(RunError::InvalidSpec(format!(
+                    "the start gate token has {} bytes; at most {} are allowed",
+                    token.len(),
+                    StartMode::MAX_TOKEN_LEN
+                )));
+            }
+            Some(token.as_slice())
+        }
+    };
+    let apply_rlimits = launcher.apply_rlimits() && !spec.rlimits.is_empty();
+    if apply_rlimits && !rlimit::PRLIMIT_SUPPORTED && spec.require_rlimits {
+        return Err(RunError::Unsupported(
+            "resource limits for a child process require prlimit(2) (Linux)".to_owned(),
+        ));
+    }
+    Ok((gate, apply_rlimits))
 }
 
 fn stdio(capture: Capture) -> Stdio {
@@ -270,6 +304,7 @@ fn reader<R: io::Read + Send + 'static>(pipe: Option<R>, capture: Capture) -> Re
 /// early return (or panic) can leave it running.
 struct Group<'l> {
     child: Child,
+    pid: u32,
     pgid: Pid,
     launcher: &'l dyn Launcher,
     reaped: bool,
@@ -285,7 +320,7 @@ impl Group<'_> {
     fn kill(&self) {
         debug_assert!(!self.reaped);
         let _ = kill_process_group(self.pgid, Signal::KILL);
-        self.launcher.on_kill();
+        self.launcher.on_kill(self.pid);
     }
 }
 
@@ -293,7 +328,9 @@ impl Drop for Group<'_> {
     fn drop(&mut self) {
         if !self.reaped {
             self.kill();
-            let _ = self.child.wait();
+            if self.child.wait().is_ok() {
+                self.launcher.on_reaped(self.pid);
+            }
         }
     }
 }

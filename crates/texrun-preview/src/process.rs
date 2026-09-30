@@ -30,9 +30,16 @@ pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
 
 /// Address space limit of one tool process on Linux (`RLIMIT_AS`): 2 GiB.
 /// A 4096 x 4096 px page needs about 64 MiB of pixels; the rest is room for
-/// decoding embedded images. The limit is set right after spawning (there is
-/// no `pre_exec` without `unsafe`), so the tool's first instructions run
-/// unlimited; the tools do not allocate much before opening the PDF.
+/// decoding embedded images.
+///
+/// Best effort only: the limits are set with `prlimit(2)` after the tool was
+/// spawned ([`StartMode::Immediate`](texrun_process::StartMode::Immediate);
+/// there is no `pre_exec` without `unsafe`, and the tools cannot wait for a
+/// start signal). The gap until then is not bounded in time, what the tool
+/// allocates or writes in it is not undone, and a descendant started in it
+/// would stay unlimited (the tools start none). The primary bounds are the
+/// long-edge limit and the size polling; an exec gate that sets the limits
+/// before the tool starts is #41.
 pub(crate) const TOOL_ADDRESS_SPACE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Smallest `RLIMIT_FSIZE` given to a tool on Linux: 16 MiB. The tools may
@@ -175,6 +182,10 @@ pub(crate) fn run(
             stdout: done.stdout.bytes,
             stderr: done.stderr.bytes,
         },
+        // The notice names the program already.
+        Err(texrun_process::RunError::Spawn { source, .. }) => {
+            RunOutput::empty(RunEnd::Failed(source))
+        }
         Err(e) => RunOutput::empty(RunEnd::Failed(io::Error::other(e))),
     }
 }

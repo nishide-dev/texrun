@@ -118,12 +118,11 @@ pub(crate) struct ScratchDir {
 }
 
 impl ScratchDir {
-    /// Creates `<parent_path>/<prefix><random>` (mode 0700). `parent_path`
-    /// is opened like [`open_dir`]; everything below it is created and
-    /// opened through descriptors. A name that exists already (whatever it
-    /// is) is never reused.
-    pub(crate) fn create(parent_path: &Path, prefix: &str) -> io::Result<Self> {
-        let parent = open_dir(parent_path)?;
+    /// Creates `<parent>/<prefix><random>` (mode 0700) through the held
+    /// directory `parent`, whose path is `parent_path` (only used to build
+    /// [`ScratchDir::path`]). A name that exists already (whatever it is) is
+    /// never reused.
+    pub(crate) fn create(parent: OwnedFd, parent_path: &Path, prefix: &str) -> io::Result<Self> {
         for _ in 0..64 {
             let name = format!("{prefix}{:016x}", random_u64());
             match rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(0o700)) {
@@ -264,8 +263,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("keep"), b"x").unwrap();
-        let a = ScratchDir::create(root.path(), ".s-").unwrap();
-        let b = ScratchDir::create(root.path(), ".s-").unwrap();
+        let a = ScratchDir::create(open_dir(root.path()).unwrap(), root.path(), ".s-").unwrap();
+        let b = ScratchDir::create(open_dir(root.path()).unwrap(), root.path(), ".s-").unwrap();
         assert_ne!(a.path(), b.path());
         assert!(
             a.path()
@@ -296,7 +295,8 @@ mod tests {
     #[test]
     fn a_moved_scratch_dir_is_still_removed() {
         let root = tempfile::tempdir().unwrap();
-        let scratch = ScratchDir::create(root.path(), ".s-").unwrap();
+        let scratch =
+            ScratchDir::create(open_dir(root.path()).unwrap(), root.path(), ".s-").unwrap();
         let work = scratch.subdir("work").unwrap();
         // Something replaces the work directory by a symlink: the held
         // descriptor still names the real one.

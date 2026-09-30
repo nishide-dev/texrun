@@ -9,9 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use texrun_core::CancelToken;
-use texrun_process::{Capture, Cwd, EnvAllowlist, RunError, Spec, StartMode, Stop, Watch, run};
-#[cfg(target_os = "linux")]
-use texrun_process::{Resource, Rlimits};
+use texrun_process::{
+    Capture, Cwd, EnvAllowlist, HostLauncher, Launcher, PRLIMIT_SUPPORTED, Resource, Rlimits,
+    RunError, Spec, StartMode, Stop, Watch, run, run_with,
+};
 
 /// `/bin/sh -c <script>` in `cwd`, with a minimal environment.
 fn sh<'a>(cwd: &'a Path, script: &str) -> Spec<'a> {
@@ -257,43 +258,165 @@ fn stdin_is_empty_unless_gated() {
     assert_eq!(done.stdout.bytes, b"got go\n");
 }
 
+/// Runs `pwd -P` in the held directory `fd` (named `path`).
+fn pwd_in(fd: &fs::File, path: &Path) -> Result<Vec<u8>, RunError> {
+    use std::os::fd::AsFd;
+    let spec = Spec::new(
+        "/bin/sh",
+        Cwd::Dir {
+            fd: fd.as_fd(),
+            path,
+        },
+    )
+    .with_args(["-c", "pwd -P"])
+    .with_env(EnvAllowlist::new().with("PATH", "/usr/bin:/bin"));
+    run(&spec, Watch::<()>::new()).map(|done| done.stdout.bytes)
+}
+
 #[test]
 fn a_held_directory_is_the_working_directory() {
-    use std::os::fd::AsFd;
-
     let root = tempfile::tempdir().unwrap();
     let root_path = fs::canonicalize(root.path()).unwrap();
     let dir = root_path.join("work");
     fs::create_dir(&dir).unwrap();
     let fd = fs::File::open(&dir).unwrap();
-    let spec = |path| {
-        Spec::new(
-            "/bin/sh",
-            Cwd::Dir {
-                fd: fd.as_fd(),
-                path,
-            },
-        )
-        .with_args(["-c", "pwd -P"])
-        .with_env(EnvAllowlist::new().with("PATH", "/usr/bin:/bin"))
-    };
-    let done = run(&spec(&dir), Watch::<()>::new()).unwrap();
-    assert_eq!(done.stdout.bytes, format!("{}\n", dir.display()).as_bytes());
+    assert_eq!(
+        pwd_in(&fd, &dir).unwrap(),
+        format!("{}\n", dir.display()).as_bytes()
+    );
 
     // The directory is moved away and its name reused: the child must not
     // run in the new directory of that name.
     let moved = root_path.join("moved");
     fs::rename(&dir, &moved).unwrap();
     fs::create_dir(&dir).unwrap();
-    match run(&spec(&dir), Watch::<()>::new()) {
-        // Linux: the descriptor itself.
-        Ok(done) => assert_eq!(
-            done.stdout.bytes,
-            format!("{}\n", moved.display()).as_bytes()
-        ),
+    let result = pwd_in(&fd, &dir);
+    if cfg!(target_os = "linux") {
+        // The child changes into the descriptor itself.
+        assert_eq!(result.unwrap(), format!("{}\n", moved.display()).as_bytes());
+    } else {
         // Without `/proc`: the path is checked and refused.
-        Err(RunError::Io { .. }) => {}
-        Err(e) => panic!("{e:?}"),
+        assert!(matches!(result, Err(RunError::Io { .. })), "{result:?}");
+    }
+}
+
+#[test]
+fn a_long_gate_token_is_refused_before_spawning() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let spec = sh(dir.path(), "touch ran").with_start(StartMode::StdinGate {
+        token: vec![b'x'; StartMode::MAX_TOKEN_LEN + 1],
+    });
+    let err = run(&spec, Watch::<()>::new()).unwrap_err();
+    assert!(matches!(err, RunError::InvalidSpec(_)), "{err:?}");
+    assert!(!marker.exists());
+}
+
+/// Records the hook calls of a [`HostLauncher`].
+#[derive(Default)]
+struct Recording {
+    fail_on_spawn: bool,
+    apply_rlimits: bool,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl Recording {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl Launcher for Recording {
+    fn command(&self, spec: &Spec<'_>) -> Result<Command, RunError> {
+        self.calls.lock().unwrap().push("command".to_owned());
+        HostLauncher.command(spec)
+    }
+    fn apply_rlimits(&self) -> bool {
+        self.apply_rlimits
+    }
+    fn on_spawn(&self, pid: u32) -> std::io::Result<()> {
+        self.calls.lock().unwrap().push(format!("spawn {pid}"));
+        if self.fail_on_spawn {
+            Err(std::io::Error::other("attach failed"))
+        } else {
+            Ok(())
+        }
+    }
+    fn on_kill(&self, pid: u32) {
+        self.calls.lock().unwrap().push(format!("kill {pid}"));
+    }
+    fn on_reaped(&self, pid: u32) {
+        self.calls.lock().unwrap().push(format!("reaped {pid}"));
+    }
+}
+
+#[test]
+fn launcher_hooks_are_called_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = Recording::default();
+    let done = run_with(&launcher, &sh(dir.path(), "exit 0"), Watch::<()>::new()).unwrap();
+    let pid = done.pid;
+    assert_eq!(
+        launcher.calls(),
+        [
+            "command".to_owned(),
+            format!("spawn {pid}"),
+            format!("kill {pid}"),
+            format!("reaped {pid}"),
+        ]
+    );
+}
+
+#[test]
+fn a_failing_on_spawn_kills_and_reaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = Recording {
+        fail_on_spawn: true,
+        ..Recording::default()
+    };
+    let err = run_with(
+        &launcher,
+        &sh(dir.path(), "sleep 30 & wait"),
+        Watch::<()>::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, RunError::Io { .. }), "{err:?}");
+    let calls = launcher.calls();
+    let pid: u32 = calls[1].strip_prefix("spawn ").unwrap().parse().unwrap();
+    assert_eq!(calls[2..], [format!("kill {pid}"), format!("reaped {pid}")]);
+    assert!(!group_alive(pid));
+    assert!(!is_unreaped_child(pid));
+}
+
+#[test]
+fn rlimits_are_reported_as_applied_or_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let limited = sh(dir.path(), "exit 0").with_rlimits(Rlimits::new().with(Resource::Core, 0));
+    let done = run(&limited, Watch::<()>::new()).unwrap();
+    assert_eq!(done.rlimits_applied, PRLIMIT_SUPPORTED);
+
+    // A launcher that applies them itself.
+    let launcher = Recording::default();
+    let done = run_with(&launcher, &limited, Watch::<()>::new()).unwrap();
+    assert!(!done.rlimits_applied);
+
+    let done = run(&sh(dir.path(), "exit 0"), Watch::<()>::new()).unwrap();
+    assert!(!done.rlimits_applied, "none requested");
+}
+
+#[cfg(not(target_os = "linux"))]
+mod without_prlimit {
+    use super::*;
+
+    #[test]
+    fn required_rlimits_are_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = sh(dir.path(), "touch ran")
+            .with_rlimits(Rlimits::new().with(Resource::FileSize, 1000))
+            .with_require_rlimits(true);
+        let err = run(&spec, Watch::<()>::new()).unwrap_err();
+        assert!(matches!(err, RunError::Unsupported(_)), "{err:?}");
+        assert!(!dir.path().join("ran").exists(), "nothing was started");
     }
 }
 
@@ -301,7 +424,8 @@ fn a_held_directory_is_the_working_directory() {
 mod linux {
     use super::*;
 
-    /// The (soft) limit called `name` in `/proc/<pid>/limits` output.
+    /// The limit called `name` in `/proc/<pid>/limits` output (soft and
+    /// hard must be equal).
     fn limit(limits: &str, name: &str) -> String {
         let line = limits
             .lines()
@@ -316,22 +440,25 @@ mod linux {
         cols[0].to_owned()
     }
 
+    fn gated(spec: Spec<'_>) -> Spec<'_> {
+        spec.with_start(StartMode::StdinGate {
+            token: b"go\n".to_vec(),
+        })
+    }
+
     #[test]
     fn rlimits_are_set_before_a_gated_child_starts() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = sh(dir.path(), "read t && cat /proc/$$/limits")
-            .with_rlimits(
-                Rlimits::new()
-                    .with(Resource::FileSize, 123_456)
-                    .with(Resource::Core, 0)
-                    .with(Resource::AddressSpace, 3 << 30)
-                    .with(Resource::Cpu, 600),
-            )
-            .with_start(StartMode::StdinGate {
-                token: b"go\n".to_vec(),
-            });
+        let spec = gated(sh(dir.path(), "read t && cat /proc/$$/limits")).with_rlimits(
+            Rlimits::new()
+                .with(Resource::FileSize, 123_456)
+                .with(Resource::Core, 0)
+                .with(Resource::AddressSpace, 3 << 30)
+                .with(Resource::Cpu, 600),
+        );
         let done = run(&spec, Watch::<()>::new()).unwrap();
         assert!(done.status.success());
+        assert!(done.rlimits_applied);
         let limits = String::from_utf8(done.stdout.bytes).unwrap();
         assert_eq!(limit(&limits, "Max file size"), "123456", "{limits}");
         assert_eq!(limit(&limits, "Max core file size"), "0", "{limits}");
@@ -343,36 +470,93 @@ mod linux {
         assert_eq!(limit(&limits, "Max cpu time"), "600", "{limits}");
     }
 
+    /// With `Immediate`, the leader itself gets the limits, only later than
+    /// its start: it polls its own limits (not those of a child, which may
+    /// have been started before the limits arrived).
+    #[test]
+    fn rlimits_reach_an_immediate_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "i=0; while [ $i -lt 500 ]; do \
+                        grep -q '^Max file size *123456 ' /proc/$$/limits && break; \
+                        i=$((i+1)); sleep 0.01; \
+                      done; cat /proc/$$/limits";
+        let spec = sh(dir.path(), script).with_rlimits(
+            Rlimits::new()
+                .with(Resource::FileSize, 123_456)
+                .with(Resource::Core, 0),
+        );
+        let done = run(
+            &spec,
+            Watch::<()>::new().with_timeout(Duration::from_secs(20)),
+        )
+        .unwrap();
+        assert!(done.status.success());
+        let limits = String::from_utf8(done.stdout.bytes).unwrap();
+        assert_eq!(limit(&limits, "Max file size"), "123456", "{limits}");
+        assert_eq!(limit(&limits, "Max core file size"), "0", "{limits}");
+    }
+
     #[test]
     fn rlimits_are_capped_at_our_hard_limit() {
-        use rustix::process::{Resource as R, getrlimit};
-        let hard = getrlimit(R::Core).maximum;
+        use rustix::process::{Resource as R, Rlimit, getrlimit, setrlimit};
+        // Lower this process's own hard limit to a finite value, so that
+        // the cap is checked even where it is unlimited. Only `RLIMIT_CORE`
+        // is touched, which the other tests set to 0 anyway.
+        let own = getrlimit(R::Core);
+        let hard = own.maximum.map_or(1 << 20, |h| h.min(1 << 20));
+        setrlimit(
+            R::Core,
+            Rlimit {
+                current: Some(own.current.map_or(hard, |c| c.min(hard))),
+                maximum: Some(hard),
+            },
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
-        let spec = sh(dir.path(), "read t && cat /proc/$$/limits")
-            .with_rlimits(Rlimits::new().with(Resource::Core, u64::MAX - 1))
-            .with_start(StartMode::StdinGate {
-                token: b"go\n".to_vec(),
-            });
+        let spec = gated(sh(dir.path(), "read t && cat /proc/$$/limits"))
+            .with_rlimits(Rlimits::new().with(Resource::Core, u64::MAX - 1));
         let done = run(&spec, Watch::<()>::new()).unwrap();
         assert!(done.status.success(), "no privilege is needed");
         let limits = String::from_utf8(done.stdout.bytes).unwrap();
-        let expected = hard.map_or_else(|| (u64::MAX - 1).to_string(), |h| h.to_string());
-        let got = limit(&limits, "Max core file size");
-        assert!(got == expected || got == "unlimited", "{got} vs {expected}");
+        assert_eq!(
+            limit(&limits, "Max core file size"),
+            hard.to_string(),
+            "{limits}"
+        );
+    }
+
+    #[test]
+    fn a_launcher_can_take_over_the_rlimits() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = gated(sh(dir.path(), "read t && cat /proc/$$/limits"))
+            .with_rlimits(Rlimits::new().with(Resource::FileSize, 123_456));
+        let launcher = Recording::default(); // `apply_rlimits() == false`
+        let done = run_with(&launcher, &spec, Watch::<()>::new()).unwrap();
+        let limits = String::from_utf8(done.stdout.bytes).unwrap();
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max file size"))
+            .unwrap();
+        assert!(!line.contains("123456"), "{line}");
+
+        let launcher = Recording {
+            apply_rlimits: true,
+            ..Recording::default()
+        };
+        let done = run_with(&launcher, &spec, Watch::<()>::new()).unwrap();
+        let limits = String::from_utf8(done.stdout.bytes).unwrap();
+        assert_eq!(limit(&limits, "Max file size"), "123456", "{limits}");
     }
 
     #[test]
     fn the_file_size_limit_stops_the_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = sh(dir.path(), "read t && head -c 100000 /dev/zero > big")
-            .with_rlimits(
-                Rlimits::new()
-                    .with(Resource::FileSize, 1000)
-                    .with(Resource::Core, 0),
-            )
-            .with_start(StartMode::StdinGate {
-                token: b"go\n".to_vec(),
-            });
+        let spec = gated(sh(dir.path(), "read t && head -c 100000 /dev/zero > big")).with_rlimits(
+            Rlimits::new()
+                .with(Resource::FileSize, 1000)
+                .with(Resource::Core, 0),
+        );
         let done = run(
             &spec,
             Watch::<()>::new().with_timeout(Duration::from_secs(20)),
@@ -381,5 +565,14 @@ mod linux {
         assert!(!done.status.success());
         assert_eq!(fs::metadata(dir.path().join("big")).unwrap().len(), 1000);
         assert!(!dir.path().join("core").exists());
+    }
+
+    #[test]
+    fn required_rlimits_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = sh(dir.path(), "exit 0")
+            .with_rlimits(Rlimits::new().with(Resource::Core, 0))
+            .with_require_rlimits(true);
+        assert!(run(&spec, Watch::<()>::new()).unwrap().rlimits_applied);
     }
 }

@@ -174,7 +174,13 @@ CI の `integration` job で毎回実行する（[development.md](development.md
     - `RLIMIT_FSIZE`: 残りの画像予算 + 1 byte。ただし 16 MiB 未満にはしない（`HOME` に fontconfig の cache などを書くため）
     - `RLIMIT_CORE`: 0
     - 設定値は、latexmk と同じく texrun 自身の hard limit を超えない
-    - 起動してから設定するまでの間は制限されない。tool はこの間に大きな確保をしない。
+    - **この方式の保証範囲**: limit は tool が exec して動き出した後に、親から設定される。
+      - 設定までの間隔は、時間では抑えられない（親の scheduling による。負荷時には長くなりうる）。
+      - その間に確保された memory や書き込まれた file は、後から limit を設定しても取り消されない。
+      - その間に起動された子孫は limit を継承せず、制限されないまま残る。
+      - leader 自身には、動いている限りいずれ設定される。
+    - このため `Immediate` は、子を起動しない単一プロセスの program（mutool / pdftoppm）にだけ使い、rlimit は best effort の層として扱う。主な上限は、長辺の上限と出力サイズの poll が担う。
+    - exec 前に limit を設定する gate（texrun 自身の helper subcommand が合図を待ち、自分に `setrlimit` してから tool を exec する。`unsafe` も shell も要らず、macOS でも効く）は #41 で実装する。
   - macOS: `prlimit` が無いので、上限は長辺の上限と出力サイズの poll だけで強制する。tool のメモリ使用量は制限しない。
 - preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。
   - scratch dir（`.texrun-preview-*`、mode 0700）とその下の `home/`・`work/` は、output root の fd から `mkdirat` で作り、`openat(O_NOFOLLOW)` で開く。後片付けも、開いた fd から `unlinkat` で行い、symlink は辿らない。
@@ -354,7 +360,10 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
   - 重い check は、呼び出し側が間隔を指定する（latexmk の output dir の集計は 500 ms ごと、preview の画像 1 枚の `fstatat` は毎回）。
 - stdout / stderr の reader thread は、process group を kill した後に最大 500 ms（`texrun_process::READER_GRACE`）だけ待つ。group から抜けたプロセスが pipe を開いたままでも、compile や preview は終わる（それまでに読めた分を返す）。全ての書き手が kill された後の pipe はすぐ EOF になるので、通常は待たない。
 - `EINTR` は `waitid` と pipe の read で retry する。
-- 将来の拡張（#25 の CPU / プロセス数 / cgroup、#26 の container runtime）は、`texrun_process::Launcher`（起動方法、spawn 直後と kill 時の hook）と `Resource`（`RLIMIT_CPU` / `RLIMIT_NPROC` を含む）に足す。
+- 将来の拡張（#25 の CPU / プロセス数 / cgroup、#26 の container runtime）は、`texrun_process::Launcher`（起動方法、spawn 直後・kill 時・reap 後の hook。どれも leader の PID を受け取る）と `Resource`（`RLIMIT_CPU` / `RLIMIT_NPROC` を含む）を拡張して行う。hook の形は #25 / #26 で見直す。
+  - `StartMode::Immediate` と組み合わせた場合、spawn 直後の hook（cgroup への attach など）より前に起動された子孫は、その対象から漏れる（上記 §3.2 と同じ gap）。全ての子孫を含めるには、stdin gate か #41 の gate と組み合わせる。
+- Linux 以外では `prlimit` が無いので、rlimit は既定では適用せずに実行し、結果（`Finished::rlimits_applied`）に記録する。呼び出し側は `Spec::require_rlimits` で、適用できない場合に実行せず `RunError::Unsupported` にすることを選べる（latexmk の stdin gate はこれを指定する）。
+- stdin gate の合図は poll ループの前に同期的に書くので、長さを 512 byte（POSIX の最小 `PIPE_BUF`）までに制限する。
 
 ### 3.7 kpathsea 設定（#5）
 

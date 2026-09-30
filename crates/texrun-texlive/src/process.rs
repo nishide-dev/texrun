@@ -138,6 +138,9 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, EngineError> {
                     // outside the size checks.
                     .with(Resource::Core, 0),
             )
+            // The gate is only used where the limits can be applied; never
+            // release it without them.
+            .with_require_rlimits(true)
             .with_start(StartMode::StdinGate {
                 token: crate::rc::START_TOKEN.to_vec(),
             });

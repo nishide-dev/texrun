@@ -28,7 +28,10 @@
 //!   Setting them in the child before `exec` would need `pre_exec`, i.e.
 //!   `unsafe`, which the workspace forbids. When the program must not run
 //!   before the limits are in place, [`StartMode::StdinGate`] holds it at a
-//!   caller-defined start gate on stdin until they are.
+//!   caller-defined start gate on stdin until they are. Without a gate
+//!   ([`StartMode::Immediate`]) the limits are best effort: see its
+//!   documentation for what the gap after the spawn leaves open (#41 adds
+//!   an exec gate for programs that cannot wait themselves).
 //!
 //! `EINTR` is retried everywhere (`waitid`, pipe reads).
 //!
@@ -40,12 +43,15 @@
 //!   runs it directly on the host; a container backend (#26) can turn the
 //!   same spec into a runtime invocation, and a cgroup-based limiter (#25)
 //!   can attach the child on spawn ([`Launcher::on_spawn`]) and kill the
-//!   whole cgroup together with the group ([`Launcher::on_kill`]).
+//!   whole cgroup together with the group ([`Launcher::on_kill`]) and
+//!   clean up after the reap ([`Launcher::on_reaped`]).
 //!
 //! # Platform support
 //!
 //! Unix only. `prlimit(2)` exists on Linux only ([`PRLIMIT_SUPPORTED`]); on
-//! other Unix systems (macOS) [`Rlimits`] are not applied and callers rely
+//! other Unix systems (macOS) [`Rlimits`] are not applied (recorded in
+//! [`Finished::rlimits_applied`]; [`Spec::require_rlimits`] turns this into
+//! [`RunError::Unsupported`]) and callers rely
 //! on their check hooks.
 
 #[cfg(not(unix))]
