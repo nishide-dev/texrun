@@ -173,7 +173,7 @@ CI と同じ基準をローカルで確認するため、PR 前に以下を実�
 cargo check --workspace --all-targets --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo test --workspace --all-features
 ```
 
 フォーマット違反は `cargo fmt --all` で自動修正できます。
@@ -186,7 +186,7 @@ CI は `cargo check` / `cargo clippy` / test を `--locked` 付きで実行し�
 cargo deny check
 ```
 
-CI では test を [cargo-nextest](https://nexte.st/) で実行します（`cargo nextest run --workspace --all-features --locked` と、doctest 用の `cargo test --workspace --all-features --locked --doc`）。ローカルでは `cargo test --workspace` で同じ test を実行できます。`cargo-deny` と `cargo-nextest` は `cargo install --locked cargo-deny cargo-nextest` で導入できます。
+CI では test を [cargo-nextest](https://nexte.st/) で実行します（`cargo nextest run --workspace --all-features --locked` と、doctest 用の `cargo test --workspace --all-features --locked --doc`）。ローカルでは `cargo test --workspace --all-features` で同じ test を実行できます。`cargo-deny` と `cargo-nextest` は `cargo install --locked cargo-deny cargo-nextest` で導入できます。
 
 - 上記は #2 / #11 で定義し、`.github/workflows/ci.yml` で実行している品質ゲートと同一です。CI 側のチェックが変わった場合は、このドキュメントも合わせて更新してください。
 
@@ -194,7 +194,7 @@ CI では test を [cargo-nextest](https://nexte.st/) で実行します（`carg
 
 ### TeX Live integration test
 
-TeX Live（latexmk）や preview tool（`mutool` / `pdftoppm`）を使う test は、tool が見つからなければ `SKIPPED` と表示して skip します。そのため、上記の `cargo test --workspace` は TeX Live が無い環境でも通ります。
+TeX Live（latexmk）や preview tool（`mutool` / `pdftoppm`）を使う test は、tool が見つからなければ `SKIPPED` と表示して skip します。そのため、上記の `cargo test --workspace --all-features` は TeX Live が無い環境でも通ります。
 TeX Live を使う compile の経路（engine・fixture・security）や diagnostics parser を変更した場合は、TeX Live を含む Docker 開発環境で skip を失敗に変えて全件を実行してください。CI の `integration` job と同じ条件です。
 
 ```bash

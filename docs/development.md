@@ -47,7 +47,7 @@ repo root で `docker compose run --rm dev <command>` を実行する。repo は
 docker compose run --rm dev cargo check --workspace --all-targets --all-features
 docker compose run --rm dev cargo fmt --all -- --check
 docker compose run --rm dev cargo clippy --workspace --all-targets --all-features -- -D warnings
-docker compose run --rm dev cargo test --workspace
+docker compose run --rm dev cargo test --workspace --all-features
 
 # TeX Live / preview tool の確認
 docker compose run --rm dev latexmk -v
@@ -60,7 +60,7 @@ docker compose run --rm dev
 
 品質ゲートの定義は [CONTRIBUTING.md](../CONTRIBUTING.md#ローカル品質ゲート) が正であり、変更された場合はこちらも合わせて更新する。
 CI と同じ条件で確認したい場合は `cargo check` / `cargo clippy` / `cargo test` に `--locked` を付ける。
-CI で使っている `cargo-deny` / `cargo-nextest` は image に含めていない。`cargo deny check` や `cargo nextest run` は host で実行する（test 自体はコンテナ内の `cargo test --workspace` で同じものを実行できる）。
+CI で使っている `cargo-deny` / `cargo-nextest` は image に含めていない。`cargo deny check` や `cargo nextest run` は host で実行する（test 自体はコンテナ内の `cargo test --workspace --all-features` で同じものを実行できる）。
 host に Rust toolchain がある場合は host で直接実行してもよい。コンテナ経由の実行は TeX Live を必要とする作業や、CI と同じ Linux 環境で確認したい場合に使う。
 
 `crates/texrun-preview` の実ツールを使う test（`tests/real_tools.rs`）は、`mutool` / `pdftoppm` が見つからない backend を skip する。
@@ -108,7 +108,7 @@ docker compose down --volumes
 | `TEXRUN_REQUIRE_TEXLIVE` | `crates/texrun-texlive` の TeX Live を使う test（`latexmk` を検出） | skip | 失敗 |
 | `TEXRUN_REQUIRE_PREVIEW_TOOLS` | `crates/texrun-preview` の実ツール test、`crates/texrun-texlive` の PDF ページ数と preview の確認 | skip | 失敗 |
 
-- tool があれば、環境変数が無くても test は実行される。host に TeX Live がある場合、`cargo test --workspace` で host の TeX Live を使って実行される（version の違いで失敗した場合は、コンテナ内の結果を正とする）。
+- tool があれば、環境変数が無くても test は実行される。host に TeX Live がある場合、`cargo test --workspace --all-features` で host の TeX Live を使って実行される（version の違いで失敗した場合は、コンテナ内の結果を正とする）。
 - skip したときは、test binary ごとに 1 回だけ stderr に `SKIPPED ... (set TEXRUN_REQUIRE_...=1 to fail instead)` と表示する。libtest の capture を通さずに書くので `cargo test` でそのまま見える。`cargo nextest run`（CI の `test (linux)` / `test (macos)`）では、`.config/nextest.toml` の設定で成功した test の出力も実行の最後に表示されるので、そこに `SKIPPED` 行が出る。nextest は test ごとに process を分けるため、この場合は binary ごとではなく test ごとに 1 行出る。nextest の集計の `skipped` は 0 のままである（test としては pass 扱い）。
 - `=1` 以外の値は未設定と同じ扱いになる。
 - CI の `integration` job は両方を `1` にしてコンテナ内で全 test を実行するので、tool が無いことで黙って成功することはない。
