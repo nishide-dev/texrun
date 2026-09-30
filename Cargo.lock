@@ -469,6 +469,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "texrun-core",
+ "texrun-process",
+ "thiserror",
+]
+
+[[package]]
+name = "texrun-process"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "texrun-core",
  "thiserror",
 ]
 
@@ -481,6 +492,7 @@ dependencies = [
  "texrun-core",
  "texrun-latex-log",
  "texrun-preview",
+ "texrun-process",
  "texrun-workspace",
 ]
 

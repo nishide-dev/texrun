@@ -56,6 +56,11 @@ pub struct PdfInfo {
     pub page_count: u32,
     /// Sizes of the *selected* pages (the ones a preview was attempted for),
     /// in page order. Not every page of a long document is listed.
+    ///
+    /// The point values depend on the backend for pages with a `UserUnit`
+    /// (a scale factor for the page's units): `MuPDF` reports the size with
+    /// the factor applied (the size it renders at), Poppler (`pdfinfo`)
+    /// reports the unscaled page box. For all other pages both agree.
     #[serde(default)]
     pub pages: Vec<PageInfo>,
 }

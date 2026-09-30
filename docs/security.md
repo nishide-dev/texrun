@@ -6,6 +6,7 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
 
 > **現状:** この文書は方針と検証結果である。
 > #5 の担当分（§3.1 の timeout、§3.2 の出力上限、§3.4〜3.7）は `crates/texrun-texlive` で実装した。§3.3 は `crates/texrun-workspace`（#21）で実装した。
+> 外部プロセスの制限付き実行（§3.2 の rlimit、§3.4 の env allowlist、§3.6 の停止）は、latexmk と preview tool で共通の `crates/texrun-process`（#32）にまとめてある。
 > それ以外の実装の進み具合は各 Issue を参照する。
 > 公開リポジトリのため、攻撃の再現手順や具体的な入力は書かず、「どの保証をどの層で担保するか」だけを書く。
 > 境界を破る方法を見つけた場合は [SECURITY.md](../SECURITY.md) の手順で非公開で報告してほしい。
@@ -91,6 +92,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 | `\input` / `\openin` / `\openout` で、絶対パスと `..` を含むパスが拒否される | `security.rs`: `input_*` / `openin_*` / `openout_*`（対照: `reading_inside_the_workspace_works` / `writing_inside_the_output_directory_works`） |
 | root 外を指す symlink で workspace を作れない | `security.rs`: `symlink_outside_the_root_is_rejected_before_compiling` |
 | timeout / cancel で子孫プロセスを残さない | `scenarios.rs`: `timeout`、`latexmk.rs`: `cancel_stops_the_whole_process_tree` |
+| process group の kill・timeout・cancel・rlimit・leader の reap（TeX を使わない fake script） | `crates/texrun-process/tests/supervise.rs` |
 | 出力の上限 | `latexmk.rs`: `output_directory_limit_stops_the_compile` / `per_file_limit_stops_the_compile` |
 
 画像・bibtex の database・pdfTeX のファイル情報系 primitive の経路は、§6 の実験で確認したもので、fixture にはまだ含めていない。
@@ -156,6 +158,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 - `RLIMIT_FSIZE` の設定方法:
   - 子プロセスの `exec` 前に `setrlimit` する `pre_exec` は `unsafe` で、この workspace は `unsafe_code = "forbid"` なので使わない。
   - 代わりに Linux では、spawn 直後に親から `prlimit(2)` で latexmk に設定する。latexmk が設定前にファイルを書いたり子プロセスを起動したりしないよう、texrun 管理 rc（§3.5）の先頭で stdin から開始の合図を待たせる。親は `prlimit` の後に合図を送る。合図が来ずに stdin が閉じた場合、rc は何もせずに終了する（終了コード 125）。
+  - `prlimit` の適用と開始の合図の送信は `texrun-process` が行う（`Rlimits` と `StartMode::StdinGate`）。合図の内容と、合図を待つ rc は engine（`texrun-texlive`）側に置く。
   - macOS には `prlimit` が無い。1 ファイルの上限は poll（目安 500 ms ごと）でのみ強制するので、検出までの間は上限を超えて書かれうる（ログを出し続ける文書で約 16 MB）。
 - `RLIMIT_FSIZE` で書き込みが止まった場合も、終了後の集計で上限に達したファイルを検出し、同じ diagnostic を付ける。
 - 設定する値は、texrun 自身の hard limit（子プロセスが継承する値）と上限値の小さい方とする。上限を強める方向にだけ働くので、権限は要らない。
@@ -166,14 +169,23 @@ CI の `integration` job で毎回実行する（[development.md](development.md
   2. `mutool draw` には、上限を bounding box（`-w` / `-h`）としても渡す。縮小だけに効き、小さいページは拡大しない。`pdftoppm` には拡大を伴わずに上限を渡す option が無いので、この段は無い。
   3. 描画後に PNG の IHDR の寸法を確認し、上限（丸め分 2 px を許容）を超えた画像は捨てて `render_failed` にする。
 - preview tool の資源制限は OS によって異なる。
-  - Linux: spawn 直後に `prlimit(2)` で設定する。
+  - Linux: spawn 直後に `prlimit(2)` で設定する（`texrun-process` の `StartMode::Immediate`。tool は開始の合図を待てない）。
     - `RLIMIT_AS`: 2 GiB
     - `RLIMIT_FSIZE`: 残りの画像予算 + 1 byte。ただし 16 MiB 未満にはしない（`HOME` に fontconfig の cache などを書くため）
     - `RLIMIT_CORE`: 0
     - 設定値は、latexmk と同じく texrun 自身の hard limit を超えない
-    - 起動してから設定するまでの間は制限されない。tool はこの間に大きな確保をしない。
+    - **この方式の保証範囲**: limit は tool が exec して動き出した後に、親から設定される。
+      - 設定までの間隔は、時間では抑えられない（親の scheduling による。負荷時には長くなりうる）。
+      - その間に確保された memory や書き込まれた file は、後から limit を設定しても取り消されない。
+      - その間に起動された子孫は limit を継承せず、制限されないまま残る。
+      - leader 自身には、動いている限りいずれ設定される。
+    - このため `Immediate` は、子を起動しない単一プロセスの program（mutool / pdftoppm）にだけ使い、rlimit は best effort の層として扱う。主な上限は、長辺の上限と出力サイズの poll が担う。
+    - exec 前に limit を設定する gate（texrun 自身の helper subcommand が合図を待ち、自分に `setrlimit` してから tool を exec する。`unsafe` も shell も要らず、macOS でも効く）は #41 で実装する。
   - macOS: `prlimit` が無いので、上限は長辺の上限と出力サイズの poll だけで強制する。tool のメモリ使用量は制限しない。
 - preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。
+  - scratch dir（`.texrun-preview-*`、mode 0700）とその下の `home/`・`work/` は、output root の fd から `mkdirat` で作り、`openat(O_NOFOLLOW)` で開く。後片付けも、開いた fd から `unlinkat` で行い、symlink は辿らない。
+  - tool の cwd は、開いた `work/` の fd を使う（Linux では `/proc/self/fd` 経由で、子プロセスがその fd 自体に `chdir` する）。`/proc` が無い環境（macOS）では、path が同じ directory（dev / inode）を指すことを確認してから path で起動する。この確認と `chdir` の間は atomic ではない。
+  - tool は `work/` 内の相対名に書き出し、texrun はそれを `work/` の fd から検査・移動する。`HOME` だけは環境変数なので path で渡す（cache の置き場で、texrun は中身を読まない）。
   - 移動は `renameat` で、directory の fd 間で行う。
   - `preview/` は `mkdirat` で作り、`openat(O_NOFOLLOW)` で 1 component ずつ開く。
   - 同じ名前の既存 file や symlink は置き換える。symlink の先には書き込まない。
@@ -222,6 +234,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 - 再現可能なビルド用の変数（`SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE`）は §3.9 で扱う。
 - latexmk の実行ファイルを明示的に指定した場合（`LatexmkConfig::latexmk`、#6 の option 候補）も、起動前に絶対パスに解決する（相対パスは texrun の cwd を基準に解決し、symlink も解決する）。相対パスのまま起動すると、子プロセスの cwd（workspace 内）を基準に解決されうる。これは `PATH` の相対 entry を除くのと同じ理由である。
 - trade-off: `HOME` を差し替えるので、user が `~/texmf` に入れたパッケージは使えない。必要になったら、明示的な option（例: 追加の読み取り専用 texmf ツリー）として設計する。
+- allowlist の適用（`env_clear()` の後に設定）と `PATH` の相対 entry の除去は、`texrun-process` の `EnvAllowlist` / `sanitize_path` で行う。値は engine / preview がそれぞれ決める。
 - preview tool（`mutool` / `pdfinfo` / `pdftoppm`、#8）には `PATH`・`LC_ALL=C`・`HOME`（preview ごとに作る空の一時ディレクトリ）だけを渡す。kpathsea の変数は不要なので渡さない。tool は検出時に解決した絶対パスで起動する。`PATH` の相対 entry（`.` など）は、検出に使わず、tool に渡す `PATH` からも除く。
 
 ### 3.5 latexmk の起動（#5）
@@ -332,15 +345,25 @@ latexmk はログの特定の行を見てサブディレクトリを作る機能
 
 ### 3.6 プロセスの停止（#5、preview tool は #8）
 
+latexmk と preview tool は、どちらも `crates/texrun-process` の supervisor（`texrun_process::run`）で起動・停止する（#32）。以下はその共通の動作である。
+
 - spawn 時に新しい process group を作る（`CommandExt::process_group(0)`）。
 - timeout / cancel（`CancelToken`）/ 出力上限の超過時は、**process group に `SIGKILL` を送る**（`killpg`）。
   - latexmk だけに `SIGTERM` を送ると、その子プロセスが親 PID 1 のまま走り続けることを確認した。
   - TeX に graceful shutdown は不要で、途中までの log はファイルに残る。そのため `SIGTERM` による猶予は設けない。
-- latexmk が正常終了した後も `killpg(SIGKILL)` を 1 回送り、残った子孫を掃除する（`ESRCH` は無視する）。
+- 子プロセスが正常終了した後も `killpg(SIGKILL)` を 1 回送り、残った子孫を掃除する（`ESRCH` は無視する）。
   - **leader を reap する前に `killpg` する。** leader の終了は `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` で検知し、reap しない。leader の zombie が PID と PGID を確保しているので、`killpg` が無関係な process group に届くことは無い。
   - `killpg` の後で leader を reap する。timeout / cancel / 上限超過の場合も同じ順序で行う。
-- `ctx.cancel.is_cancelled()`、timeout、出力サイズは、同じ poll ループで確認する（#20 からの申し送りどおり）。
-- stdout / stderr の reader thread は、process group を kill した後に最大 2 秒だけ待つ。group から抜けたプロセスが pipe を開いたままでも、compile は終わる（それまでに読めた分を返す）。
+  - 途中で error や panic が起きた場合も、guard（`Drop`）が同じ順序で kill と reap を行う。
+- cancel、timeout / deadline、出力サイズ（呼び出し側の check hook）は、同じ poll ループで確認する（#20 からの申し送りどおり）。
+  - poll 間隔は全 program 共通で 10 ms（`texrun_process::POLL_INTERVAL`）。`waitid` は軽く、preview は短い tool を最大数百回起動するので、短い方に揃えた。
+  - 重い check は、呼び出し側が間隔を指定する（latexmk の output dir の集計は 500 ms ごと、preview の画像 1 枚の `fstatat` は毎回）。
+- stdout / stderr の reader thread は、process group を kill した後に最大 500 ms（`texrun_process::READER_GRACE`）だけ待つ。group から抜けたプロセスが pipe を開いたままでも、compile や preview は終わる（それまでに読めた分を返す）。全ての書き手が kill された後の pipe はすぐ EOF になるので、通常は待たない。
+- `EINTR` は `waitid` と pipe の read で retry する。
+- 将来の拡張（#25 の CPU / プロセス数 / cgroup、#26 の container runtime）は、`texrun_process::Launcher`（起動方法、spawn 直後・kill 時・reap 後の hook。どれも leader の PID を受け取る）と `Resource`（`RLIMIT_CPU` / `RLIMIT_NPROC` を含む）を拡張して行う。hook の形は #25 / #26 で見直す。
+  - `StartMode::Immediate` と組み合わせた場合、spawn 直後の hook（cgroup への attach など）より前に起動された子孫は、その対象から漏れる（上記 §3.2 と同じ gap）。全ての子孫を含めるには、stdin gate か #41 の gate と組み合わせる。
+- Linux 以外では `prlimit` が無いので、rlimit は既定では適用せずに実行し、結果（`Finished::rlimits_applied`）に記録する。呼び出し側は `Spec::require_rlimits` で、適用できない場合に実行せず `RunError::Unsupported` にすることを選べる（latexmk の stdin gate はこれを指定する）。
+- stdin gate の合図は poll ループの前に同期的に書くので、長さを 512 byte（POSIX の最小 `PIPE_BUF`）までに制限する。
 
 ### 3.7 kpathsea 設定（#5）
 

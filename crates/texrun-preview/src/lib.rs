@@ -60,7 +60,8 @@
 //! also gets the limit as a bounding box (`-w`/`-h`), and every image is
 //! checked after rendering and discarded (`render_failed`) if it is larger.
 //!
-//! Tools are started by absolute path with an argv array (no shell), with a
+//! Tools are run by the shared supervisor of `texrun-process`: started by
+//! absolute path with an argv array (no shell), with a
 //! cleared environment (`PATH` with only its absolute entries, `LC_ALL=C` and
 //! a private empty `HOME`), in their own process group that is killed with
 //! `SIGKILL` on timeout, cancellation or when an image outgrows the remaining
@@ -68,7 +69,9 @@
 //! each tool with `prlimit(2)` right after it is spawned; macOS has no
 //! `prlimit`, so there only the limits above apply and a tool's memory use is
 //! not capped. Tool output is parsed defensively. Images are written to a
-//! private scratch directory, checked (regular file, PNG header, size and
+//! private scratch directory (created with `mkdirat` below the output root
+//! and held open; the tools run in its held `work` directory), checked
+//! (regular file, PNG header, size and
 //! pixel budget) and moved into place with `renameat` between directory
 //! descriptors; the preview directory is created and opened with
 //! `mkdirat` / `openat(O_NOFOLLOW)`, so a symlink swapped into the output

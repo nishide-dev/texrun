@@ -4,6 +4,12 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use texrun_process::EnvAllowlist;
+/// The host `PATH` with empty and relative entries removed: latexmk (and the
+/// texrun rc) look up `pdflatex` / `bibtex` in `PATH`, and their working
+/// directory is inside the workspace (§3.4).
+pub(crate) use texrun_process::sanitize_path;
+
 /// `max_print_line` passed to TeX (and to the log parser).
 pub(crate) const MAX_PRINT_LINE: usize = 10_000;
 
@@ -31,44 +37,27 @@ pub(crate) fn latexmk_args(rc: &Path, output_dir: &Path, entry_arg: &str) -> Vec
     ]
 }
 
-/// The complete child environment: [`std::process::Command::env_clear`] is
-/// applied first, then exactly these variables are set.
+/// The complete child environment: the supervisor applies `env_clear()`
+/// first, then sets exactly these variables.
 ///
-/// `source_date_epoch` adds `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` for
-/// reproducible PDFs (§3.9).
-pub(crate) fn child_env(
-    path: &OsStr,
-    home: &Path,
-    source_date_epoch: Option<i64>,
-) -> Vec<(OsString, OsString)> {
-    let mut vars: Vec<(OsString, OsString)> = vec![
-        ("PATH".into(), path.to_owned()),
-        ("HOME".into(), home.as_os_str().to_owned()),
-        ("openin_any".into(), "p".into()),
-        ("openout_any".into(), "p".into()),
-        ("max_print_line".into(), MAX_PRINT_LINE.to_string().into()),
-        ("LC_ALL".into(), "C".into()),
-    ];
+/// `path` is sanitized again ([`sanitize_path`]). `source_date_epoch` adds
+/// `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` for reproducible PDFs (§3.9).
+pub(crate) fn child_env(path: &OsStr, home: &Path, source_date_epoch: Option<i64>) -> EnvAllowlist {
+    let mut env = EnvAllowlist::new()
+        .with_path(path)
+        .with("HOME", home)
+        .with("openin_any", "p")
+        .with("openout_any", "p")
+        .with("max_print_line", MAX_PRINT_LINE.to_string())
+        .with("LC_ALL", "C");
     for name in ["MKTEXTFM", "MKTEXPK", "MKTEXMF", "MKTEXTEX", "MKTEXFMT"] {
-        vars.push((name.into(), "0".into()));
+        env.set(name, "0");
     }
     if let Some(epoch) = source_date_epoch {
-        vars.push(("SOURCE_DATE_EPOCH".into(), epoch.to_string().into()));
-        vars.push(("FORCE_SOURCE_DATE".into(), "1".into()));
+        env.set("SOURCE_DATE_EPOCH", epoch.to_string());
+        env.set("FORCE_SOURCE_DATE", "1");
     }
-    vars
-}
-
-/// The host `PATH` with empty and relative entries removed.
-///
-/// latexmk (and the texrun rc) look up `pdflatex` / `bibtex` in `PATH`, and
-/// their working directory is inside the workspace. An empty or relative
-/// entry (`.`, `bin`) would let a file from the input project be run in
-/// place of a TeX program.
-pub(crate) fn sanitize_path(path: &OsStr) -> OsString {
-    let kept: Vec<PathBuf> = env::split_paths(path).filter(|p| p.is_absolute()).collect();
-    // Entries come from `split_paths`, so they contain no separator.
-    env::join_paths(kept).unwrap_or_default()
+    env
 }
 
 /// Finds an executable file called `name` in the (already sanitized) `path`.
@@ -131,14 +120,20 @@ mod tests {
 
     #[test]
     fn env_is_exactly_the_allowlist() {
-        let env: BTreeMap<String, String> = child_env(
+        let env = child_env(
             OsStr::new("/usr/bin:/bin"),
             Path::new("/tmp/ws/.texrun/home"),
             None,
-        )
-        .into_iter()
-        .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
-        .collect();
+        );
+        let env: BTreeMap<String, String> = env
+            .vars()
+            .map(|(k, v)| {
+                (
+                    k.to_str().unwrap().to_owned(),
+                    v.to_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
         let expected: BTreeMap<String, String> = [
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/tmp/ws/.texrun/home"),
@@ -170,15 +165,8 @@ mod tests {
     #[test]
     fn source_date_epoch_is_opt_in() {
         let env = child_env(OsStr::new("/bin"), Path::new("/h"), Some(0));
-        assert!(env.contains(&("SOURCE_DATE_EPOCH".into(), "0".into())));
-        assert!(env.contains(&("FORCE_SOURCE_DATE".into(), "1".into())));
-    }
-
-    #[test]
-    fn path_drops_relative_and_empty_entries() {
-        let sanitized = sanitize_path(OsStr::new("/usr/bin::.:bin:/opt/tex/bin:./x"));
-        assert_eq!(sanitized, "/usr/bin:/opt/tex/bin");
-        assert_eq!(sanitize_path(OsStr::new("")), "");
+        assert_eq!(env.get("SOURCE_DATE_EPOCH"), Some(OsStr::new("0")));
+        assert_eq!(env.get("FORCE_SOURCE_DATE"), Some(OsStr::new("1")));
     }
 
     #[test]
