@@ -7,7 +7,8 @@
 //!    directory containing the entrypoint) and the entrypoint inside it;
 //! 2. [`Workspace::create`] copies the root into a fresh temporary directory
 //!    (the *workspace*), leaving out VCS metadata, texrun's own output
-//!    directory, `latexmkrc` files and anything configured in
+//!    directory, tool configuration files such as `latexmkrc`
+//!    ([`TOOL_CONFIG_NAMES`]), precompiled formats and anything configured in
 //!    [`WorkspaceConfig`], and enforcing [`WorkspaceLimits`];
 //! 3. the engine is handed [`Workspace::context`] and [`Workspace::request`]
 //!    ([`texrun_core::CompileContext`] / [`texrun_core::CompileRequest`]) and
@@ -27,18 +28,49 @@
 //! host project. Symlinks to excluded locations and dangling symlinks are
 //! left out and reported in the [`MaterializeReport`].
 //!
+//! # Concurrent modification of the project
+//!
+//! The project is walked with directory file descriptors and `O_NOFOLLOW`
+//! opens, and each opened object is checked against the `(dev, ino)` seen
+//! when it was listed. Replacing a file or directory with a symlink while
+//! the copy runs is detected ([`WorkspaceError::InputChanged`]) and cannot
+//! make the walk leave the project root. The root itself is re-checked
+//! against the identity recorded by [`ProjectInput`].
+//!
+//! # Name matching
+//!
+//! Excluded names are matched on a folded form (Unicode NFKC + lowercase),
+//! and, as a second layer, the workspace filesystem is asked after each
+//! entry is created whether it is also reachable under a protected name
+//! (case- or normalization-insensitive filesystems such as default APFS).
+//! Such entries are removed and reported.
+//!
 //! # What this does not protect against
 //!
-//! The workspace is a boundary for *input files*. It does not stop the TeX
-//! engine from reading absolute host paths (`\input{/etc/passwd}`); that is
-//! the job of the engine configuration and sandboxing (#5, #9).
+//! - The workspace is a boundary for *input files*. It does not stop the TeX
+//!   engine from reading absolute host paths (`\input{/etc/passwd}`); that
+//!   is the job of the engine configuration and sandboxing (#5, #9).
+//! - A regular file inside the root that is a **hard link** to a file
+//!   elsewhere is copied like any other file (its content is readable by
+//!   the user anyway, and hard links cannot be told apart from the
+//!   original). Files with more than one link are listed in
+//!   [`MaterializeReport::hardlinked`] for information.
+//!
+//! # Platform support
+//!
+//! Unix only (Linux, macOS): the implementation relies on `openat`-style
+//! file descriptor APIs (via `rustix`, without `unsafe` code).
 //!
 //! This crate is separate from `texrun-core` because it touches the
 //! filesystem, while the core only defines filesystem-independent types.
 
+#[cfg(not(unix))]
+compile_error!("texrun-workspace supports Unix hosts only");
+
 mod collect;
 mod config;
 mod error;
+mod fsutil;
 mod input;
 mod materialize;
 
@@ -51,10 +83,13 @@ use texrun_core::{Artifact, CompileContext, CompileOptions, CompileRequest, Work
 
 pub use collect::OverwritePolicy;
 pub use config::{WorkspaceConfig, WorkspaceLimits};
-pub use error::{Limit, WorkspaceError};
+pub use error::{Limit, WorkspaceError, WorkspaceErrorKind};
 pub use input::ProjectInput;
-pub use materialize::{ExcludedEntry, ExclusionReason, LATEXMK_RC_NAMES, MaterializeReport};
+pub use materialize::{
+    ExcludedEntry, ExclusionReason, MAX_RECORDED_ENTRIES, MaterializeReport, TOOL_CONFIG_NAMES,
+};
 
+use fsutil::{DIR_FLAGS, FileId, fstat};
 use materialize::{Exclusions, Materializer};
 
 /// Prefix of workspace directory names.
@@ -83,7 +118,9 @@ impl Workspace {
     /// Fails before copying anything if the request is invalid
     /// ([`CompileRequest::validate`], e.g. the entrypoint is inside
     /// `options.output_dir`) or the entrypoint lies in an excluded location.
-    /// On any error the partially created directory is removed.
+    /// On a later error the partially created directory is removed, unless
+    /// [`WorkspaceConfig::keep`] is set: then it is kept and the error is
+    /// wrapped in [`WorkspaceError::KeptAfterFailure`] with its path.
     ///
     /// The output directory (`options.output_dir`) is never copied from the
     /// project; it is created empty in the workspace.
@@ -114,15 +151,17 @@ impl Workspace {
             fs::canonicalize(dir.path()).map_err(WorkspaceError::io("resolving", dir.path()))?;
         let root = WorkspaceRoot::new(path).expect("canonical paths are absolute");
 
-        let report = Materializer::new(config, &exclusions, input.root(), root.path()).run()?;
-
-        let out = root.output_dir(&request.options);
-        fs::create_dir_all(&out).map_err(WorkspaceError::io("creating directory", &out))?;
-        // The entrypoint was checked on the host; make sure the copy is
-        // usable too (e.g. it was not a symlink to an excluded file).
-        if !root.resolve(&request.entrypoint).is_file() {
-            return Err(WorkspaceError::EntrypointExcluded(request.entrypoint));
-        }
+        let report = match materialize(input, &request, &exclusions, config, &root) {
+            Ok(report) => report,
+            Err(source) if config.keep => {
+                let _ = dir.keep();
+                return Err(WorkspaceError::KeptAfterFailure {
+                    path: root.path().to_path_buf(),
+                    source: Box::new(source),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(Self {
             dir: Some(dir),
@@ -184,12 +223,18 @@ impl Workspace {
     /// (created if missing), preserving relative paths, so the returned
     /// artifacts' paths are valid relative to `dest`. Sizes are filled in.
     ///
-    /// Only listed artifacts are copied (duplicates once); stale files of the
-    /// same name in the *input* project are never involved, since the output
-    /// directory is not copied from it. An existing file at the destination
-    /// is handled per `policy`; symlinks or directories in the way are always
-    /// an error. Artifacts that are missing or not regular files inside the
-    /// output directory are errors.
+    /// - Only listed artifacts are copied. Stale files of the same name in
+    ///   the *input* project are never involved, since the output directory
+    ///   is not copied from it.
+    /// - Duplicates are detected by path only: a second artifact with an
+    ///   already collected path is skipped (whatever its kind) and not
+    ///   returned.
+    /// - An existing file at the destination is handled per `policy`;
+    ///   symlinks or directories in the way are always an error.
+    /// - Artifacts that are missing, not regular files, or reached through a
+    ///   symlink inside the output directory are errors.
+    /// - Artifacts are copied one by one, each atomically. If one fails, the
+    ///   ones before it **remain** in `dest`; nothing is rolled back.
     pub fn collect_artifacts(
         &self,
         artifacts: &[Artifact],
@@ -210,6 +255,40 @@ impl Workspace {
             dir.close().map(|()| None)
         }
     }
+}
+
+/// Copies the project into the (empty) workspace and prepares the output
+/// directory.
+fn materialize(
+    input: &ProjectInput,
+    request: &CompileRequest,
+    exclusions: &Exclusions,
+    config: &WorkspaceConfig,
+    root: &WorkspaceRoot,
+) -> Result<MaterializeReport, WorkspaceError> {
+    let open = |path: &Path| {
+        rustix::fs::open(path, DIR_FLAGS, rustix::fs::Mode::empty())
+            .map_err(|e| WorkspaceError::io("opening", path)(e.into()))
+    };
+    let src = open(input.root())?;
+    let src_id = fstat(&src).map_err(WorkspaceError::io("inspecting", input.root()))?;
+    if FileId::of(&src_id) != input.root_id() {
+        return Err(WorkspaceError::InputChanged(input.root().to_path_buf()));
+    }
+    let dst = open(root.path())?;
+    let report =
+        Materializer::new(config.limits, exclusions, input.root(), root.path()).run(&src, &dst)?;
+
+    let out = root.output_dir(&request.options);
+    fs::create_dir_all(&out).map_err(WorkspaceError::io("creating directory", &out))?;
+    // The entrypoint was checked on the host; make sure the copy is usable
+    // too (e.g. it was not a symlink to an excluded file).
+    if !root.resolve(&request.entrypoint).is_file() {
+        return Err(WorkspaceError::EntrypointExcluded(
+            request.entrypoint.clone(),
+        ));
+    }
+    Ok(report)
 }
 
 impl Drop for Workspace {

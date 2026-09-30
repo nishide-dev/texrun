@@ -8,11 +8,18 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 tempfile.workspace = true
 texrun-core.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
+
+# Unix only: the crate relies on `openat`-style descriptor APIs.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 texrun-core = { workspace = true, features = ["test-util"] }
 
 [lints]

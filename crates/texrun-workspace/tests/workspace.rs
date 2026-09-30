@@ -1,4 +1,5 @@
 //! Workspace behaviour on a real filesystem. No TeX installation needed.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,8 @@ use texrun_core::{
     EngineErrorKind, EngineInfo, TypesetEngine, WorkspacePath,
 };
 use texrun_workspace::{
-    ExclusionReason, Limit, OverwritePolicy, ProjectInput, Workspace, WorkspaceConfig,
-    WorkspaceError, WorkspaceLimits,
+    ExclusionReason, Limit, MAX_RECORDED_ENTRIES, OverwritePolicy, ProjectInput, Workspace,
+    WorkspaceConfig, WorkspaceError, WorkspaceErrorKind, WorkspaceLimits,
 };
 
 fn write(root: &Path, rel: &str, contents: &str) {
@@ -71,7 +72,6 @@ fn wp(s: &str) -> WorkspacePath {
     WorkspacePath::new(s).unwrap()
 }
 
-#[cfg(unix)]
 fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
     std::os::unix::fs::symlink(target, link).unwrap();
 }
@@ -200,7 +200,6 @@ fn entrypoint_outside_root_is_an_error() {
     ));
 }
 
-#[cfg(unix)]
 #[test]
 fn entrypoint_symlink_escaping_root_is_an_error() {
     let f = Fixture::new();
@@ -239,25 +238,43 @@ fn entrypoint_in_excluded_location_is_rejected() {
 
 // --- exclusions -----------------------------------------------------------
 
+fn excluded_paths(ws: &Workspace, reason: ExclusionReason) -> Vec<PathBuf> {
+    ws.report()
+        .excluded_with(reason)
+        .map(|e| e.path.clone())
+        .collect()
+}
+
 #[test]
-fn latexmkrc_and_vcs_and_output_dirs_are_not_copied() {
+fn tool_configs_vcs_formats_and_output_dirs_are_not_copied() {
     let f = Fixture::new();
     write(f.root(), "latexmkrc", "system('rm -rf ~');");
     write(f.root(), ".latexmkrc", "evil");
     write(f.root(), "sub/LATEXMKRC", "evil");
+    write(f.root(), "biber.conf", "<config/>");
+    write(f.root(), "sub/.biber.conf", "<config/>");
     write(f.root(), ".git/config", "[core]");
     write(f.root(), ".texrun/out/stale.pdf", "stale");
     write(f.root(), "target/debug/x", "x");
+    write(f.root(), "pdflatex.fmt", "format");
+    write(f.root(), "sub/custom.FMT", "format");
     write(f.root(), "sub/keep.tex", "keep");
+    // `target` is only excluded at the root.
+    write(f.root(), "figures/target/plot.pdf", "plot");
 
     let ws = f.create("main.tex").unwrap();
     for gone in [
         "latexmkrc",
         ".latexmkrc",
         "sub/LATEXMKRC",
+        "sub/latexmkrc",
+        "biber.conf",
+        "sub/.biber.conf",
         ".git",
         ".texrun/out/stale.pdf",
         "target",
+        "pdflatex.fmt",
+        "sub/custom.FMT",
     ] {
         assert!(
             fs::symlink_metadata(ws.path().join(gone)).is_err(),
@@ -265,24 +282,87 @@ fn latexmkrc_and_vcs_and_output_dirs_are_not_copied() {
         );
     }
     assert_eq!(read(ws.path(), "sub/keep.tex"), "keep");
+    assert_eq!(read(ws.path(), "figures/target/plot.pdf"), "plot");
     // The output directory exists but starts empty.
     assert_eq!(fs::read_dir(ws.output_dir()).unwrap().count(), 0);
 
-    let rc: Vec<_> = ws
-        .report()
-        .excluded_with(ExclusionReason::LatexmkRc)
-        .map(|e| e.path.clone())
-        .collect();
     assert_eq!(
-        rc,
-        [".latexmkrc", "latexmkrc", "sub/LATEXMKRC"].map(PathBuf::from)
+        excluded_paths(&ws, ExclusionReason::ToolConfig),
+        [
+            ".latexmkrc",
+            "biber.conf",
+            "latexmkrc",
+            "sub/.biber.conf",
+            "sub/LATEXMKRC"
+        ]
+        .map(PathBuf::from)
     );
-    let names: Vec<_> = ws
-        .report()
-        .excluded_with(ExclusionReason::ExcludedName)
-        .map(|e| e.path.clone())
-        .collect();
-    assert_eq!(names, [".git", ".texrun", "target"].map(PathBuf::from));
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedName),
+        [".git", ".texrun", "target"].map(PathBuf::from)
+    );
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedExtension),
+        ["pdflatex.fmt", "sub/custom.FMT"].map(PathBuf::from)
+    );
+}
+
+/// Regression (review M1): on case- and normalization-insensitive
+/// filesystems (default APFS), `latexm\u{212A}rc` (Kelvin sign) opens as
+/// `latexmkrc`.
+#[test]
+fn unicode_lookalikes_of_protected_names_are_excluded() {
+    let f = Fixture::new();
+    // Separate directories: on APFS these names collide with each other.
+    write(f.root(), "k1/latexm\u{212A}rc", "evil");
+    write(f.root(), "k2/.LATEXM\u{212A}RC", "evil");
+    write(f.root(), "k3/BIBE\u{0280}.conf", "not a lookalike, kept");
+    write(f.root(), "\u{FF54}arget/x", "fullwidth t");
+    write(f.root(), ".GI\u{FF34}/config", "fullwidth T");
+
+    let ws = f.create("main.tex").unwrap();
+    for dir in ["k1", "k2"] {
+        for name in [
+            "latexmkrc",
+            ".latexmkrc",
+            "latexm\u{212A}rc",
+            ".LATEXM\u{212A}RC",
+        ] {
+            let p = ws.path().join(dir).join(name);
+            assert!(fs::symlink_metadata(&p).is_err(), "{p:?}");
+            assert!(fs::read_to_string(&p).is_err(), "{p:?}");
+        }
+    }
+    assert!(ws.path().join("k3").is_dir());
+    assert!(fs::symlink_metadata(ws.path().join("target")).is_err());
+    assert!(fs::symlink_metadata(ws.path().join(".git")).is_err());
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ToolConfig),
+        ["k1/latexm\u{212A}rc", "k2/.LATEXM\u{212A}RC"].map(PathBuf::from)
+    );
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedName).len(),
+        2,
+        "{:?}",
+        ws.report()
+    );
+}
+
+#[test]
+fn output_dir_lookalikes_are_excluded() {
+    let f = Fixture::new();
+    write(f.root(), "BUILD/OU\u{FF34}/stale.pdf", "stale");
+    let ws = Workspace::create(
+        &f.input("main.tex"),
+        CompileOptions::default().with_output_dir(wp("build/out")),
+        &f.config(),
+    )
+    .unwrap();
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::OutputDirectory),
+        [PathBuf::from("BUILD/OU\u{FF34}")]
+    );
+    assert_eq!(fs::read_dir(ws.output_dir()).unwrap().count(), 0);
 }
 
 #[test]
@@ -313,7 +393,6 @@ fn custom_output_dir_is_excluded_and_other_names_configurable() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn special_files_are_skipped() {
     let f = Fixture::new();
@@ -330,7 +409,6 @@ fn special_files_are_skipped() {
 
 // --- symlinks -------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn symlinks_outside_root_are_rejected() {
     let outside = tempfile::tempdir().unwrap();
@@ -358,7 +436,6 @@ fn symlinks_outside_root_are_rejected() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn symlinks_inside_root_are_recreated_relative_to_the_workspace() {
     let f = Fixture::new();
@@ -471,6 +548,7 @@ fn default_limits() {
     let limits = WorkspaceLimits::default();
     assert_eq!(limits.max_total_bytes, 256 * 1024 * 1024);
     assert_eq!(limits.max_entries, 10_000);
+    assert_eq!(limits.max_scanned_entries, 40_000);
     assert_eq!(limits.max_depth, 32);
 }
 
@@ -653,7 +731,6 @@ fn same_name_outputs() {
     assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn collection_never_writes_through_symlinks() {
     let f = Fixture::new();
@@ -684,7 +761,6 @@ fn collection_never_writes_through_symlinks() {
     assert_eq!(fs::read_dir(victim.path()).unwrap().count(), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn collection_rejects_missing_and_non_regular_artifacts() {
     let f = Fixture::new();
@@ -717,4 +793,123 @@ fn engine_sees_only_the_workspace() {
     assert_eq!(calls[0].0, ws.path());
     assert!(!calls[0].0.starts_with(f.root()));
     assert_eq!(&calls[0].1, ws.request());
+}
+
+// --- review follow-ups ----------------------------------------------------
+
+/// Regression (review S1): excluded entries count against the scan limit,
+/// and the report does not grow without bound.
+#[test]
+fn excluded_entries_count_against_the_scan_limit() {
+    let f = Fixture::new();
+    for i in 0..1100 {
+        symlink(
+            format!("missing-{i}"),
+            f.root().join(format!("dangling-{i}")),
+        );
+    }
+    let run = |limits: WorkspaceLimits| {
+        Workspace::create(
+            &f.input("main.tex"),
+            CompileOptions::default(),
+            &f.config().with_limits(limits),
+        )
+    };
+    let err = run(WorkspaceLimits::default().with_max_scanned_entries(500)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WorkspaceError::LimitExceeded {
+                limit: Limit::ScannedEntries,
+                max: 500
+            }
+        ),
+        "{err:?}"
+    );
+
+    let ws = run(WorkspaceLimits::default()).unwrap();
+    let report = ws.report();
+    assert_eq!(report.scanned, 1101);
+    assert_eq!(report.entries, 1);
+    assert_eq!(report.excluded_total, 1100);
+    assert_eq!(report.excluded.len(), MAX_RECORDED_ENTRIES);
+    assert!(report.is_truncated());
+}
+
+/// Review N1: hard links are allowed but reported.
+#[test]
+fn hardlinked_files_are_reported() {
+    let f = Fixture::new();
+    write(f.root(), "a.tex", "shared");
+    fs::hard_link(f.root().join("a.tex"), f.root().join("b.tex")).unwrap();
+    let ws = f.create("main.tex").unwrap();
+    assert_eq!(read(ws.path(), "b.tex"), "shared");
+    assert_eq!(
+        ws.report().hardlinked,
+        [PathBuf::from("a.tex"), PathBuf::from("b.tex")]
+    );
+    assert_eq!(ws.report().hardlinked_total, 2);
+}
+
+/// Review N5: with `keep`, a failed workspace is kept for inspection.
+#[test]
+fn kept_workspace_survives_a_failed_materialization() {
+    let f = Fixture::new();
+    write(f.root(), "big.bin", &"x".repeat(1000));
+    let err = Workspace::create(
+        &f.input("main.tex"),
+        CompileOptions::default(),
+        &f.config()
+            .with_keep(true)
+            .with_limits(WorkspaceLimits::default().with_max_total_bytes(10)),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), WorkspaceErrorKind::LimitExceeded);
+    assert!(err.kind().is_input_error());
+    let WorkspaceError::KeptAfterFailure { path, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert!(path.is_dir());
+    assert_eq!(f.leftover_workspaces(), 1);
+}
+
+/// Review N2: collection opens artifacts component by component without
+/// following symlinks, so a symlinked directory inside the output directory
+/// cannot redirect the copy.
+#[test]
+fn collection_refuses_symlinked_directories_in_the_output_dir() {
+    let f = Fixture::new();
+    let dest = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(outside.path(), "secret.pdf", "secret");
+
+    let ws = f.create("main.tex").unwrap();
+    symlink(outside.path(), ws.output_dir().join("preview"));
+    let artifact = [Artifact::new(ArtifactKind::Pdf, wp("preview/secret.pdf"))];
+    let err = ws
+        .collect_artifacts(&artifact, dest.path(), OverwritePolicy::Replace)
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::ArtifactNotFile(_)), "{err:?}");
+    assert_eq!(err.kind(), WorkspaceErrorKind::ArtifactNotFile);
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn error_kinds_are_stable() {
+    let f = Fixture::new();
+    let kind = |r: Result<ProjectInput, WorkspaceError>| r.unwrap_err().kind();
+    assert_eq!(
+        kind(ProjectInput::new(f.root(), "../x.tex")),
+        WorkspaceErrorKind::InvalidEntrypoint
+    );
+    assert_eq!(
+        kind(ProjectInput::new(f.root(), "nope.tex")),
+        WorkspaceErrorKind::EntrypointNotFound
+    );
+    assert_eq!(
+        serde_json::to_value(WorkspaceErrorKind::EntrypointNotFound).unwrap(),
+        serde_json::json!("entrypoint_not_found")
+    );
+    assert!(!WorkspaceErrorKind::Io.is_input_error());
+    assert!(!WorkspaceErrorKind::InputChanged.is_input_error());
 }

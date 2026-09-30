@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use texrun_core::WorkspacePath;
 
 use crate::error::WorkspaceError;
+use crate::fsutil::FileId;
 
 /// A project on the host: a root directory and an entrypoint inside it.
 ///
@@ -17,6 +18,9 @@ use crate::error::WorkspaceError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInput {
     root: PathBuf,
+    /// Identity of the root when this value was created; re-checked when
+    /// the workspace is created so a swapped root is detected.
+    root_id: FileId,
     entrypoint: WorkspacePath,
 }
 
@@ -31,9 +35,13 @@ impl ProjectInput {
                 input: entrypoint.to_owned(),
                 source,
             })?;
-        let root = canonical_root(root.as_ref())?;
+        let (root, root_id) = canonical_root(root.as_ref())?;
         check_entrypoint(&root, &entrypoint)?;
-        Ok(Self { root, entrypoint })
+        Ok(Self {
+            root,
+            root_id,
+            entrypoint,
+        })
     }
 
     /// A project for a host entrypoint path such as the CLI's `main.tex`
@@ -58,10 +66,7 @@ impl ProjectInput {
             io::ErrorKind::NotFound => not_found(),
             _ => WorkspaceError::io("resolving", parent)(e),
         })?;
-        let root = match root {
-            Some(root) => canonical_root(root)?,
-            None => parent.clone(),
-        };
+        let (root, root_id) = canonical_root(root.unwrap_or(parent.as_path()))?;
         let rel_dir =
             parent
                 .strip_prefix(&root)
@@ -78,6 +83,7 @@ impl ProjectInput {
         check_entrypoint(&root, &entry)?;
         Ok(Self {
             root,
+            root_id,
             entrypoint: entry,
         })
     }
@@ -91,12 +97,19 @@ impl ProjectInput {
     pub fn entrypoint(&self) -> &WorkspacePath {
         &self.entrypoint
     }
+
+    pub(crate) fn root_id(&self) -> FileId {
+        self.root_id
+    }
 }
 
-fn canonical_root(root: &Path) -> Result<PathBuf, WorkspaceError> {
+fn canonical_root(root: &Path) -> Result<(PathBuf, FileId), WorkspaceError> {
     match fs::canonicalize(root) {
-        Ok(p) if p.is_dir() => Ok(p),
-        Ok(_) => Err(WorkspaceError::RootNotDirectory(root.to_path_buf())),
+        Ok(p) => match fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => Ok((p, FileId::of_metadata(&m))),
+            Ok(_) => Err(WorkspaceError::RootNotDirectory(root.to_path_buf())),
+            Err(e) => Err(WorkspaceError::io("inspecting", &p)(e)),
+        },
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             Err(WorkspaceError::RootNotDirectory(root.to_path_buf()))
         }
