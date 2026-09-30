@@ -1,0 +1,29 @@
+# Development environment with Rust + TeX Live. See docs/development.md.
+#
+#   docker compose build dev
+#   docker compose run --rm dev cargo test --workspace
+
+# Fixed project name so the cache volumes keep the same names regardless of
+# the checkout directory name (e.g. git worktrees).
+name: texrun
+
+services:
+  dev:
+    build:
+      context: docker/dev
+      dockerfile: Dockerfile
+    image: texrun-dev:latest
+    working_dir: /workspace
+    environment:
+      # Container build output lives in a named volume, never in host target/.
+      CARGO_TARGET_DIR: /cargo-target
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/cargo-target
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
