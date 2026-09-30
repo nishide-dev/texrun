@@ -376,6 +376,7 @@ fn per_file_limit(limits: &Limits) -> StopReason {
 ///   (`pids.max`).
 pub(crate) fn limit_reached(
     finished: &Finished,
+    log: &[u8],
     limits: &Limits,
     timeout: Duration,
 ) -> Option<LimitReached> {
@@ -387,22 +388,26 @@ pub(crate) fn limit_reached(
         .or_else(|| finished.status.code().filter(|&c| c > 128).map(|c| c - 128));
     if let CgroupOutcome::Applied(usage) = &finished.cgroup {
         if usage.oom_kills > 0 {
-            return Some(LimitReached::Resource(format!(
+            return Some(LimitReached::fatal(format!(
                 "resource limit exceeded: the compile needed more than {} bytes of memory \
                  (all its processes together), so it was stopped",
                 limits.max_memory_bytes
             )));
         }
         if usage.pids_max_hits > 0 {
-            return Some(LimitReached::Resource(format!(
-                "resource limit exceeded: the compile tried to run more than {} processes and \
-                 threads at once",
-                limits.max_processes
-            )));
+            // A refused `fork` may have been retried successfully.
+            return Some(LimitReached::Resource {
+                message: format!(
+                    "resource limit exceeded: the compile tried to run more than {} processes \
+                     and threads at once",
+                    limits.max_processes
+                ),
+                transient: true,
+            });
         }
     }
     if signal == Some(SIGXCPU) {
-        return Some(LimitReached::Resource(format!(
+        return Some(LimitReached::fatal(format!(
             "resource limit exceeded: a process of the compile used more than {} s of CPU time",
             limits.cpu_seconds(timeout)
         )));
@@ -410,23 +415,12 @@ pub(crate) fn limit_reached(
     if signal == Some(SIGXFSZ) {
         return Some(LimitReached::Output(per_file_limit(limits)));
     }
-    // `RLIMIT_AS` makes an allocation fail; the program says so on stderr
-    // and exits (kpathsea's `xmalloc` for the TeX programs, perl for
-    // latexmk). Only checked for a compile that failed, so text on stderr
-    // can at worst make a failure be explained wrongly.
-    let out_of_memory = |needle: &[u8]| {
-        finished
-            .stderr
-            .bytes
-            .windows(needle.len())
-            .any(|w| w == needle)
-    };
     if finished.rlimits_applied
         && cfg!(any(target_os = "linux", target_os = "android"))
         && !finished.status.success()
-        && (out_of_memory(b"memory exhausted") || out_of_memory(b"Out of memory!"))
+        && ran_out_of_memory(&finished.stderr.bytes, log)
     {
-        return Some(LimitReached::Resource(format!(
+        return Some(LimitReached::fatal(format!(
             "resource limit exceeded: a process of the compile ran out of memory (at most {} \
              bytes of address space per process)",
             limits.max_address_space
@@ -435,13 +429,44 @@ pub(crate) fn limit_reached(
     None
 }
 
+/// Whether `stderr` has the message of a program whose allocation failed
+/// (`RLIMIT_AS`), as a whole line: kpathsea's `xmalloc` (the TeX
+/// programs) or perl (latexmk). A line that also appears in the main `log`
+/// does not count: those messages go to stderr only, while text a document
+/// makes TeX or latexmk print (e.g. a label) also ends up in the log. So a
+/// document cannot make an ordinary failure look like this limit.
+pub(crate) fn ran_out_of_memory(stderr: &[u8], log: &[u8]) -> bool {
+    let log = String::from_utf8_lossy(log);
+    String::from_utf8_lossy(stderr).lines().any(|line| {
+        let line = line.trim_end_matches('\r');
+        let message = (line.starts_with("fatal: memory exhausted (xmalloc of ")
+            && line.ends_with(" bytes)."))
+            || line == "Out of memory!"
+            || line.starts_with("Out of memory in perl:")
+            || line.starts_with("Out of memory during ");
+        message && !log.lines().any(|l| l.trim_end_matches('\r') == line)
+    })
+}
+
 /// A limit reached, from [`limit_reached`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LimitReached {
     /// The per-file output limit (reported like the output size check).
     Output(StopReason),
-    /// CPU time, memory or processes.
-    Resource(String),
+    /// CPU time, memory or processes, with the message. `transient`: the
+    /// compile may still have succeeded (a refused process start that was
+    /// retried); it then stays successful, with a warning.
+    Resource { message: String, transient: bool },
+}
+
+impl LimitReached {
+    /// A limit that stopped a process of the compile.
+    fn fatal(message: String) -> Self {
+        Self::Resource {
+            message,
+            transient: false,
+        }
+    }
 }
 
 const SIGXCPU: i32 = rustix::process::Signal::XCPU.as_raw();
@@ -516,13 +541,13 @@ mod tests {
     fn reached_limits_are_told_apart() {
         let limits = Limits::default();
         let t = Duration::from_secs(60);
-        let reached = |status, cgroup| limit_reached(&finished(status, cgroup), &limits, t);
+        let reached = |status, cgroup| limit_reached(&finished(status, cgroup), b"", &limits, t);
         let none = CgroupOutcome::NotRequested;
         // Killed by SIGXCPU, or latexmk exiting with 128 + SIGXCPU.
         for status in [SIGXCPU, (128 + SIGXCPU) << 8] {
             assert!(matches!(
                 reached(status, none.clone()),
-                Some(LimitReached::Resource(m)) if m.contains("70 s of CPU time")
+                Some(LimitReached::Resource { message: m, transient: false }) if m.contains("70 s of CPU time")
             ));
         }
         assert!(matches!(
@@ -538,14 +563,68 @@ mod tests {
         usage.oom_kills = 1;
         assert!(matches!(
             reached(9, CgroupOutcome::Applied(usage)),
-            Some(LimitReached::Resource(m)) if m.contains("memory")
+            Some(LimitReached::Resource { message: m, transient: false }) if m.contains("memory")
         ));
         usage.oom_kills = 0;
         usage.pids_max_hits = 3;
         assert!(matches!(
             reached(12 << 8, CgroupOutcome::Applied(usage)),
-            Some(LimitReached::Resource(m)) if m.contains("64 processes")
+            Some(LimitReached::Resource { message: m, transient: true }) if m.contains("64 processes")
         ));
+    }
+
+    const XMALLOC: &str = "fatal: memory exhausted (xmalloc of 40000008 bytes).";
+
+    #[test]
+    fn out_of_memory_needs_the_whole_line_on_stderr_only() {
+        let yes = |stderr: &str, log: &str| ran_out_of_memory(stderr.as_bytes(), log.as_bytes());
+        // The programs' own messages, as whole lines.
+        assert!(yes(&format!("Latexmk: x\n{XMALLOC}\n"), ""));
+        assert!(yes("Out of memory!\n", ""));
+        assert!(yes("Out of memory in perl:util:safesysmalloc\n", ""));
+        assert!(yes("Out of memory during request for 64 bytes\n", ""));
+        // Only part of a line (e.g. a name a document chose, which latexmk
+        // prints indented or after a prefix).
+        for stderr in [
+            format!("Latexmk: Reference `{XMALLOC}' undefined\n"),
+            format!("  {XMALLOC}\n"),
+            "Latexmk: label Out of memory!\n".to_owned(),
+            "Out of memory!!\n".to_owned(),
+            "fatal: memory exhausted (xmalloc of 10 bytes). more\n".to_owned(),
+        ] {
+            assert!(!yes(&stderr, ""), "{stderr}");
+        }
+        // The same line in the log came from the document.
+        assert!(!yes(&format!("{XMALLOC}\n"), &format!("x\n{XMALLOC}\ny\n")));
+        assert!(!yes("Out of memory!\n", "Out of memory!\n"));
+    }
+
+    #[test]
+    fn an_out_of_memory_message_is_a_limit_only_for_a_failed_compile() {
+        let limits = Limits::default();
+        let t = Duration::from_secs(60);
+        let mut failed = finished(1 << 8, CgroupOutcome::NotRequested);
+        failed.stderr.bytes = format!("{XMALLOC}\n").into_bytes();
+        let reached = limit_reached(&failed, b"", &limits, t);
+        assert_eq!(
+            matches!(
+                &reached,
+                Some(LimitReached::Resource { message, transient: false })
+                    if message.contains("ran out of memory")
+            ),
+            cfg!(target_os = "linux"),
+            "{reached:?}"
+        );
+        // Not when the line is also in the log.
+        let log = format!("{XMALLOC}\n");
+        assert_eq!(limit_reached(&failed, log.as_bytes(), &limits, t), None);
+        // Not for a document whose text contains it.
+        failed.stderr.bytes = format!("Latexmk: Reference `{XMALLOC}' undefined\n").into_bytes();
+        assert_eq!(limit_reached(&failed, b"", &limits, t), None);
+        // Not for a compile that succeeded.
+        let mut ok = finished(0, CgroupOutcome::NotRequested);
+        ok.stderr.bytes = format!("{XMALLOC}\n").into_bytes();
+        assert_eq!(limit_reached(&ok, b"", &limits, t), None);
     }
 
     fn job<'a>(program: &'a Path, args: &[&str], cwd: &'a Path) -> Job<'a> {

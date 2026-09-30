@@ -460,11 +460,12 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 | 417 ページの文書（40 章 × 4 節 × 7 段落、数式 1,120 個、図 120 個（4724×3543 の PNG、JPEG、PDF）、目次・図目次・相互参照・hyperref・bibtex・makeindex）の latexmk 全体 | wall 3.3 s、CPU 3.3 s、memory.peak 47 MiB、pids.peak 10 |
 | 同じ文書の pdflatex 1 pass | CPU 0.66 s、memory.peak 24 MiB。`RLIMIT_AS` 128 MiB で成功、64 MiB で失敗 |
 | 7874×5906 の RGBA PNG（pdfTeX が展開する）を 2 回含む文書の pdflatex | memory.peak 68 MiB。`RLIMIT_AS` 256 MiB で成功、128 MiB で失敗 |
+| 15000×11251 の RGBA PNG を含む文書の pdflatex | `RLIMIT_AS` 256 MiB で `fatal: memory exhausted (xmalloc of 168765000 bytes)`、512 MiB で成功。pdfTeX は alpha の平面（幅 × 高さ byte）を一度に確保するので、必要な address space は画素数に比例する |
 | 1 ページの文書 | pdflatex は `RLIMIT_AS` 96 MiB 以下では起動しない（`texmf.cnf` の配列を最初に確保するため）。latexmk（perl）は 32 MiB で動いた |
 | bibtex / makeindex | memory.peak 4 MiB / 1 MiB、CPU 10 ms 未満 |
 | mutool draw（150 dpi、20 ページ）/ pdftoppm（同） | CPU 0.46 s / 1.76 s、memory.peak 30 MiB / 15 MiB。300 dpi でも `RLIMIT_AS` 256 MiB で成功 |
 
-- address space と memory の 4 GiB は、実測の最大（pdflatex の `RLIMIT_AS` 256 MiB、memory.peak 68 MiB）に対して 16 倍以上の余裕がある。大きな画像を含む文書でも誤爆しない値として、2 GiB（preview tool）より大きくした。
+- address space と memory の 4 GiB は、実測の最大（pdflatex の `RLIMIT_AS` 256 MiB、memory.peak 68 MiB）に対して 16 倍以上の余裕がある。画素数で言えば、alpha 付きの画像は約 40 億画素（約 65000×65000）まで入る。大きな画像を含む文書でも誤爆しない値として、2 GiB（preview tool）より大きくした。
 - `pids.max` の 64 は、実測の 10 に対して十分に大きい。pids は thread も数える。
 - `cpu.max` の 2 CPU は、latexmk が pdflatex などを順に（同時には 1 つずつ）起動するので、通常の compile を遅くしない。複数のプロセスや thread で CPU を使い続ける場合に、host の CPU を占有させない。
 - **CPU 時間は timeout から決める。** `RLIMIT_CPU` はプロセスごとの CPU 時間なので、single thread のプロセスは wall-clock 以上の CPU 時間を使えない。soft を timeout + 10 s にすると、timeout より前に通常の文書で当たることはない（上の 417 ページの文書は 1 pass 0.66 s）。この上限の役割は、(1) 複数 thread で CPU を使うプロセス、(2) process group を抜けて texrun の kill から逃れたプロセス（cgroup が無い環境）が CPU を使い続けられる時間を抑えることである。
@@ -476,10 +477,17 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 **cgroup（Linux、cgroup v2）。**
 
 - 使う cgroup は `Cgroups::detect` で探す。次の 2 か所だけを、この順に見る。
-  1. **texrun 自身の cgroup。** texrun が書き込める（委譲されている。例: `systemd-run --user --scope -p Delegate=yes texrun compile ...`）うえに、ほかのプロセスがいない場合に使う。cgroup v2 は、プロセスのいない cgroup からしか子 cgroup に controller を渡せない。そのため texrun は、まず自分を leaf の子 cgroup（`texrun-<pid>.main`）に移し、それから `memory` / `pids` / `cpu` を有効にする（systemd が委譲先に勧めている方法）。leaf は texrun の終了後に空のまま残り、委譲元（systemd の scope など）が消すときに一緒に消える。
-  2. **cgroup namespace の root。** host の root cgroup ではなく（container の中）、書き込めて、root 自身にプロセスがいない場合に使う（例: container のプロセスを leaf に移した場合。`docker/dev/with-cgroup.sh`）。
+  1. **texrun 自身の cgroup。** texrun に明示的に委譲されていて（例: `systemd-run --user --scope -p Delegate=yes texrun compile ...`）、ほかのプロセスがいない場合に使う。委譲されていることは、次のどちらかで判断する。書き込めるだけでは使わない。root はどの cgroup にも書き込めるので、systemd が唯一の書き手として管理する cgroup（`Delegate=` の無い service など）を変更してしまうためである。
+     - systemd の委譲の印（xattr の `trusted.delegate` か `user.delegate` が `1`。`Delegate=yes` の cgroup に付く）がある
+     - cgroup のディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者が texrun の euid で、euid が 0 でない（ユーザーに委譲された cgroup は chown される）
+
+     cgroup v2 は、プロセスのいない cgroup からしか子 cgroup に controller を渡せない。そのため texrun は、まず自分を leaf の子 cgroup（`texrun-<pid>.main`）に移し、それから `memory` / `pids` / `cpu` を有効にする（systemd が委譲先に勧めている方法）。leaf は texrun の終了後に空のまま残り、委譲元（systemd の scope など）が消すときに一緒に消える。
+  2. **cgroup namespace の root。** host の root cgroup ではなく（container の中）、cgroup v2 が `nsdelegate` 付きで mount されていて（kernel が namespace を委譲の境界として扱う。container の runtime が container に渡した cgroup である）、書き込めて、root 自身にプロセスがいない場合に使う（例: container のプロセスを leaf に移した場合。`docker/dev/with-cgroup.sh`）。
   
-  これより上の、単に書き込めるだけの cgroup（`systemd --user` の slice など）は使わない。ほかの manager が管理しているためである。どちらの場合も、`memory` と `pids` の controller が使えて、上限と `cgroup.kill`（Linux 5.14 以降）を持つ試験用の cgroup を作って消せることを確かめてから使う。
+  これより上の、単に書き込めるだけの cgroup（`systemd --user` の slice など）は使わない。ほかの manager が管理しているためである。明示的に使わせたい cgroup は、library の `Cgroups::at(dir)` で指定する（委譲の判断は呼び出し側の責任）。
+
+  どちらの場合も、`cgroup.kill`（Linux 5.14 以降）があることを、自分を移す前に確かめる。`memory` と `pids` の controller を有効にし（`cpu` は別に試し、有効にできなければ `cpu.max` を使わない）、上限を持つ試験用の cgroup を作って消せることを確かめてから使う。途中で失敗した場合は、有効にした controller と自分の移動を元に戻す。
+- texrun が強制終了された（`SIGKILL` など）場合、その run の cgroup が残る。中のプロセスが終わった後も、空のディレクトリは残る。`Cgroups::detect` は、親の直下にある `texrun-<pid>.*` のうち、その pid のプロセスがもう無いものを `rmdir` する。`rmdir` は空の cgroup にしか成功しないので、プロセスのいる cgroup は消さない（kill もしない）。
 - run（latexmk 1 回、preview tool 1 回）ごとに子 cgroup `texrun-<pid>.<n>` を作って上限を書く。supervisor は spawn の直後、子が gate で合図を待っている間に、子をこの cgroup に移す（exec gate でも rc の stdin gate でも同じ）。そのため、全ての子孫が最初から cgroup の中にいる。kill のたびに `cgroup.kill` にも書き（§3.6）、reap の後に `memory.events` の `oom_kill` と `pids.events` の `max` を読んでから cgroup を消す。
 - gate を使わない preview（library で `StartMode::Immediate`）では、移動より前に起動された子孫が cgroup から漏れる（§3.6）。CLI では起きない。
 - **使えない場合の扱い（fail-open / fail-closed）は CLI の `--cgroup` で選ぶ。**
@@ -493,14 +501,15 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 **上限に達したときの表現。** §3.2 の出力上限と揃える。
 
 - `CompileOutcome::Failed` にし、`severity = error`、`kind = resource_limit` の diagnostic を付ける。message は「resource limit exceeded: ...」で、どの上限かを書く。専用の outcome は追加しない。消費側は、失敗の理由を diagnostic の kind で分けられるためである。
-- timeout や cancel で止まった場合は、`TimedOut` / `Cancelled` のままにする。その前に上限に達していた場合は、同じ diagnostic も付ける。たとえば perl は `pids.max` で拒否された `fork` を 5 秒ごとに再試行するので、プロセス数の上限は timeout で終わる。
+- timeout や cancel で止まった場合は、`TimedOut` / `Cancelled` のままにする。その前に上限に達していた場合は、同じ diagnostic も付ける。たとえば perl は `pids.max` で拒否された `fork` を 5 秒ごとに再試行するので、プロセス数の上限は timeout で終わることが多い。
+- **成功した compile は `Failed` にしない。** プロセス数の上限は、一時的に達しても、perl の再試行で compile が最後まで進み、PDF ができることがある。その場合は `Succeeded` のままにし、`resource_limit` の diagnostic を warning で付ける。memory（`memory.oom.group` で全体が止まる）と CPU 時間（latexmk が 128 + signal で終わる）は、成功した compile では起きない。
 - 判定の方法:
 
   | 上限 | 判定 |
   | --- | --- |
   | CPU 時間 | latexmk、または latexmk が起動したツールが `SIGXCPU` で終わった。texrun 管理 rc の `texrun_run` は、ツールが `SIGXCPU` / `SIGXFSZ` で終わったら latexmk を終了コード 128 + signal ですぐに終わらせる。latexmk 自身の終了コードは 128 未満で、文書から latexmk の終了コードは決められない |
   | memory（cgroup） | `memory.events` の `oom_kill` が 1 以上 |
-  | address space（`RLIMIT_AS`） | 失敗した compile で、確保に失敗したプログラム自身のメッセージ（kpathsea の `memory exhausted`、perl の `Out of memory!`）が stderr にある。失敗した compile にしか使わないので、stderr の文字列は、最悪でも失敗の説明を誤らせるだけである |
+  | address space（`RLIMIT_AS`） | 失敗した compile で、確保に失敗したプログラム自身のメッセージが、stderr に**行全体として**ある: kpathsea の `fatal: memory exhausted (xmalloc of <n> bytes).`、perl の `Out of memory!`（またはその行頭の形）。さらに、同じ行が main の `.log` に無いこと。これらのメッセージは stderr にだけ出る一方、文書が latexmk や TeX に出力させる文字列（ラベル名など）は行頭に来ないか（latexmk は `Latexmk:` の後やインデントの後に出す）、log にも残る。そのため、文書からこの判定は成立させられない |
   | プロセス数（cgroup） | `pids.events` の `max` が 1 以上 |
   | 1 ファイルのサイズ | §3.2（`SIGXFSZ` と、終了後の集計） |
 
@@ -509,9 +518,10 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 
 **テスト。** 上限を超える fixture は、防御の確認に必要な最小限にとどめる。
 
-- `crates/texrun-process/tests/limits.rs`: CPU を使い続ける `sh` のループが `SIGXCPU` で止まる、perl の大きな確保が `RLIMIT_AS`（Linux）と cgroup の `memory.max` で止まる、`sleep` を 40 個起動する script が `pids.max` で止まり、起動されたプロセスが残らない、新しい session に移ったプロセスも `cgroup.kill` で止まる（対照: cgroup が無いと残る）、run の cgroup が消える、soft と hard が別々に渡る、core を無効にしない CPU / file size の limit を拒否する。
+- `crates/texrun-process/tests/limits.rs`: CPU を使い続ける `sh` のループが `SIGXCPU` で止まる、`cpu.max` で throttle される（`nr_throttled`）、perl の大きな確保が `RLIMIT_AS`（Linux）と cgroup の `memory.max` で止まる、`sleep` を 40 個起動する script が `pids.max` で止まり、起動されたプロセスが残らない、新しい session に移ったプロセスも `cgroup.kill` で止まる（対照: cgroup が無いと残る）、run の cgroup が消える、soft と hard が別々に渡る、core を無効にしない CPU / file size の limit を拒否する。
 - `crates/texrun-texlive/tests/limits.rs`: 既存の `timeout` fixture（無限ループ）が CPU 時間 2 s で `resource_limit` になる（macOS の library 利用で gate が無い場合は timeout になる）、`minimal` が小さい `RLIMIT_AS` / `memory.max` / `pids.max` で止まる、200 ページ超の文書（test の中で生成）が既定の上限に当たらない。
-- `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、自分の cgroup の leaf に移る経路、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
+- `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、委譲の印のある cgroup では自分を leaf に移し、印の無い cgroup には何もしない（controller も有効にしない）こと、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
+- unit test: 委譲の印と所有者の判定、`nsdelegate` の読み取り、`RLIMIT_AS` のメッセージの行全体での照合（行の一部や log にもある行では成立しない）、一時的なプロセス数の上限で成功した compile が warning になること、engine の gate の分岐（exec gate、Linux の stdin gate、macOS の必須の gate）。
 
 ## 4. 将来の sandbox backend（#26）
 

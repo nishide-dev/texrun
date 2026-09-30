@@ -302,15 +302,17 @@ fn cgroup_kill_reaches_a_process_outside_the_group() {
 fn cgroup_cpu_limit_throttles_but_the_timeout_stops() {
     let Some(cgroups) = cgroups() else { return };
     let dir = tempfile::tempdir().unwrap();
-    let spec = gated_sh(dir.path(), "while :; do :; done")
+    // Two busy loops against a quota of one CPU.
+    let spec = gated_sh(dir.path(), "while :; do :; done & while :; do :; done")
         .with_cgroup(cgroups, CgroupLimits::new().with_cpus(1));
     let start = Instant::now();
     let done = run(
         &spec,
-        Watch::<()>::new().with_timeout(Duration::from_millis(500)),
+        Watch::<()>::new().with_timeout(Duration::from_secs(1)),
     )
     .unwrap();
     assert_eq!(done.stop, Some(texrun_process::Stop::TimedOut));
     assert!(start.elapsed() < Duration::from_secs(10));
-    applied(&done.cgroup);
+    let usage = applied(&done.cgroup);
+    assert!(usage.cpu_throttled.is_some_and(|n| n >= 1), "{usage:?}");
 }

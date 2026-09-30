@@ -85,6 +85,9 @@ pub struct CgroupUsage {
     /// Largest number of processes and threads (`pids.peak`, if the kernel
     /// has it).
     pub pids_peak: Option<u64>,
+    /// Periods in which the run was throttled by `cpu.max` (`cpu.stat`
+    /// `nr_throttled`, where the cpu controller is used).
+    pub cpu_throttled: Option<u64>,
 }
 
 /// Whether and how a run was placed in a cgroup.
@@ -150,23 +153,33 @@ impl Cgroups {
     /// Linux with cgroup v2 at `/sys/fs/cgroup` only. Two places are
     /// considered, in this order:
     ///
-    /// 1. **this process's own cgroup**, if this process may write to it
-    ///    (it was delegated, e.g. `systemd-run --user --scope -p
-    ///    Delegate=yes`) and no other process is in it. The cgroup v2 rule
-    ///    that only a cgroup without processes can hand controllers to its
-    ///    children means this process first moves itself into a leaf
-    ///    child (`texrun-<pid>.main`), as systemd recommends for delegated
+    /// 1. **this process's own cgroup**, if it was explicitly delegated
+    ///    (e.g. `systemd-run --user --scope -p Delegate=yes`): it carries
+    ///    systemd's delegation marker (the `trusted.delegate` or
+    ///    `user.delegate` xattr), or it is owned by this process's user,
+    ///    which is not root. Being writable is not enough (root can write
+    ///    to every cgroup, including those systemd manages alone). No
+    ///    other process may be in it: the cgroup v2 rule that only a cgroup
+    ///    without processes can hand controllers to its children means this
+    ///    process first moves itself into a leaf child
+    ///    (`texrun-<pid>.main`), as systemd recommends for delegated
     ///    cgroups; the leaf is left behind (empty) when texrun exits;
     /// 2. **the root of this process's cgroup namespace**, if that is not
-    ///    the host's root cgroup (i.e. in a container), is writable and has
-    ///    no processes of its own (e.g. a container whose processes were
-    ///    moved into a child cgroup).
+    ///    the host's root cgroup (i.e. in a container), cgroup v2 is mounted
+    ///    with `nsdelegate` (the kernel then treats the namespace as
+    ///    delegated to it, as a container runtime does), it is writable and
+    ///    has no processes of its own (e.g. a container whose processes
+    ///    were moved into a child cgroup).
     ///
-    /// A place is used only if the `memory` and `pids` controllers can be
-    /// enabled for its children and a test cgroup with the limits and
-    /// `cgroup.kill` (Linux 5.14) can be created and removed. Cgroups that
-    /// are merely writable further up (e.g. a `systemd --user` slice) are
-    /// never used: they belong to another manager.
+    /// A place is used only if `cgroup.kill` exists (Linux 5.14), the
+    /// `memory` and `pids` controllers can be enabled for its children
+    /// (`cpu` too where possible), and a test cgroup with the limits can be
+    /// created and removed; otherwise every change made to it is undone.
+    /// Empty run cgroups of texrun processes that are gone (e.g. killed)
+    /// are removed from it. Cgroups that are merely writable further up
+    /// (e.g. a `systemd --user` slice) are never used: they belong to
+    /// another manager. [`Cgroups::at`] uses a given cgroup without these
+    /// delegation checks.
     ///
     /// Otherwise the result is [unavailable](Cgroups::check) with the
     /// reason.
@@ -175,9 +188,11 @@ impl Cgroups {
     }
 
     /// Uses `dir`, a cgroup v2 directory, as the parent of the run
-    /// cgroups (e.g. one prepared by the caller), after the same checks as
-    /// [`Cgroups::detect`]. Moving a child there also needs write access
-    /// to the common ancestor of its cgroup and `dir`.
+    /// cgroups (e.g. one prepared by the caller), after the same usability
+    /// checks as [`Cgroups::detect`] but without its delegation checks:
+    /// that `dir` may be managed by texrun is the caller's decision. Moving
+    /// a child there also needs write access to the common ancestor of its
+    /// cgroup and `dir`.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self::from(imp::at(&dir.into()))
     }
@@ -343,6 +358,7 @@ pub(crate) mod linux {
                 pids_max_hits: event(&self.dir.join("pids.events"), "max").unwrap_or(0),
                 memory_peak: number(&self.dir.join("memory.peak")),
                 pids_peak: number(&self.dir.join("pids.peak")),
+                cpu_throttled: event(&self.dir.join("cpu.stat"), "nr_throttled"),
             }
             // Dropping `self` removes the directory.
         }
@@ -415,18 +431,19 @@ pub(crate) mod linux {
             return Err(format!("cgroup v2 is not mounted at {MOUNT}"));
         }
         let own = mount.join(own_cgroup()?);
-        let own_reason = match prepare(&own, true) {
+        let own_reason = match delegated(&own).and_then(|()| prepare(&own, true)) {
             Ok(parent) => return Ok(parent),
             Err(reason) => reason,
         };
-        // The namespace root, when it is not the host's root cgroup (which
-        // has no `cgroup.type`).
-        if own != mount && mount.join("cgroup.type").is_file() {
-            return prepare(mount, false).map_err(|root_reason| {
-                format!(
-                    "no delegated cgroup: own cgroup: {own_reason}; namespace root: {root_reason}"
-                )
-            });
+        if own != mount {
+            return namespace_root(mount)
+                .and_then(|()| prepare(mount, false))
+                .map_err(|root_reason| {
+                    format!(
+                        "no delegated cgroup: own cgroup: {own_reason}; namespace root: \
+                         {root_reason}"
+                    )
+                });
         }
         Err(format!("no delegated cgroup: {own_reason}"))
     }
@@ -437,16 +454,100 @@ pub(crate) mod linux {
         prepare(dir, is_own)
     }
 
+    /// `Ok` if `dir` was explicitly delegated to this process: it carries
+    /// systemd's delegation marker (the `trusted.delegate` or
+    /// `user.delegate` xattr, set for `Delegate=yes`), or it is owned by
+    /// this process's user, which is not root (a cgroup delegated to a
+    /// user is chowned to them). Being writable is not enough: root can
+    /// write to every cgroup, including those another manager owns.
+    fn delegated(dir: &Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let markers: Vec<Option<Vec<u8>>> = ["trusted.delegate", "user.delegate"]
+            .iter()
+            .map(|name| {
+                let mut buf = [0u8; 16];
+                rustix::fs::getxattr(dir, *name, &mut buf[..])
+                    .ok()
+                    .map(|n| buf[..n].to_vec())
+            })
+            .collect();
+        let owners: Vec<Option<u32>> = ["", "cgroup.procs", "cgroup.subtree_control"]
+            .iter()
+            .map(|name| fs::metadata(dir.join(name)).ok().map(|m| m.uid()))
+            .collect();
+        let euid = rustix::process::geteuid().as_raw();
+        if has_delegation_evidence(&markers, &owners, euid) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} is not delegated to texrun (no delegation marker, and not owned by this \
+                 non-root user)",
+                dir.display()
+            ))
+        }
+    }
+
+    /// See [`delegated`]: a marker `1`, or every file owned by `euid` ≠ 0.
+    pub(super) fn has_delegation_evidence(
+        markers: &[Option<Vec<u8>>],
+        owners: &[Option<u32>],
+        euid: u32,
+    ) -> bool {
+        let marked = markers.iter().flatten().any(|m| m.as_slice() == b"1");
+        let owned = euid != 0 && !owners.is_empty() && owners.iter().all(|o| *o == Some(euid));
+        marked || owned
+    }
+
+    /// `Ok` if `mount`, the root of this process's cgroup namespace, is a
+    /// delegation boundary: not the host's root cgroup (which has no
+    /// `cgroup.type`; in the host's namespace the mount is that root), and
+    /// mounted with `nsdelegate`, under which the kernel treats a cgroup
+    /// namespace as delegated (e.g. a container's, handed to it by the
+    /// runtime).
+    fn namespace_root(mount: &Path) -> Result<(), String> {
+        if !mount.join("cgroup.type").is_file() {
+            return Err(format!("{} is the host's root cgroup", mount.display()));
+        }
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|e| format!("cannot read /proc/self/mountinfo: {e}"))?;
+        if mounted_with_nsdelegate(&mountinfo, MOUNT) {
+            Ok(())
+        } else {
+            Err(format!("{MOUNT} is not mounted with nsdelegate"))
+        }
+    }
+
+    /// Whether the cgroup2 mount at `point` in `mountinfo` has the
+    /// `nsdelegate` super option.
+    pub(super) fn mounted_with_nsdelegate(mountinfo: &str, point: &str) -> bool {
+        mountinfo.lines().any(|line| {
+            let Some((mount, fs)) = line.split_once(" - ") else {
+                return false;
+            };
+            let mut fs = fs.split(' ');
+            mount.split(' ').nth(4) == Some(point)
+                && fs.next() == Some("cgroup2")
+                && fs
+                    .nth(1)
+                    .is_some_and(|opts| opts.split(',').any(|o| o == "nsdelegate"))
+        })
+    }
+
     /// Makes `dir` usable as the parent of run cgroups. `is_own`: this
-    /// process is in `dir` and may move itself into a leaf.
+    /// process is in `dir` and may move itself into a leaf. Every change
+    /// is undone if `dir` turns out to be unusable.
     fn prepare(dir: &Path, is_own: bool) -> Result<Parent, String> {
         let shown = dir.display();
         if !dir.join("cgroup.type").is_file() {
             return Err(format!("{shown} is not a non-root cgroup v2 directory"));
         }
+        if !dir.join("cgroup.kill").is_file() {
+            return Err("cgroup.kill is missing (Linux 5.14 or later is needed)".to_owned());
+        }
         for name in ["", "cgroup.procs", "cgroup.subtree_control"] {
             if !writable(&dir.join(name)) {
-                return Err(format!("{shown} is not writable (not delegated)"));
+                return Err(format!("{shown} is not writable"));
             }
         }
         let available = words(&dir.join("cgroup.controllers"))
@@ -456,40 +557,44 @@ pub(crate) mod linux {
                 "the {missing} controller is not available in {shown}"
             ));
         }
-        let cpu = available.iter().any(|a| a == "cpu");
         let enabled = words(&dir.join("cgroup.subtree_control")).unwrap_or_default();
-        let wanted: Vec<&str> = NEEDED
-            .iter()
-            .copied()
-            .chain(cpu.then_some("cpu"))
-            .filter(|c| !enabled.iter().any(|e| e == c))
-            .collect();
-        if !wanted.is_empty() {
+        let is_enabled = |c: &str| enabled.iter().any(|e| e == c);
+        let wanted: Vec<&str> = NEEDED.iter().copied().filter(|c| !is_enabled(c)).collect();
+        let wants_cpu = available.iter().any(|a| a == "cpu") && !is_enabled("cpu");
+        let mut undo = Undo {
+            dir,
+            leaf: None,
+            disable: Vec::new(),
+        };
+        if !wanted.is_empty() || wants_cpu {
             let procs = words(&dir.join("cgroup.procs"))
                 .map_err(|e| format!("cannot read the processes of {shown}: {e}"))?;
             let me = std::process::id().to_string();
-            let leaf = if procs.is_empty() {
-                None
-            } else if is_own && procs == [me] {
-                Some(move_into_leaf(dir)?)
-            } else {
+            if is_own && procs == [me] {
+                undo.leaf = Some(move_into_leaf(dir)?);
+            } else if !procs.is_empty() {
                 return Err(format!(
                     "{shown} has other processes, so its controllers cannot be enabled for \
                      child cgroups"
                 ));
-            };
+            }
+        }
+        if !wanted.is_empty() {
             let request: Vec<String> = wanted.iter().map(|c| format!("+{c}")).collect();
-            if let Err(e) = write(&dir.join("cgroup.subtree_control"), &request.join(" ")) {
-                if let Some(leaf) = leaf {
-                    // Undo the move.
-                    let _ = write(&dir.join("cgroup.procs"), &std::process::id().to_string());
-                    let _ = fs::remove_dir(leaf);
-                }
-                return Err(format!(
+            write(&dir.join("cgroup.subtree_control"), &request.join(" ")).map_err(|e| {
+                format!(
                     "cannot enable the {} controllers in {shown}: {e}",
                     wanted.join(", ")
-                ));
-            }
+                )
+            })?;
+            undo.disable.extend(wanted.iter().copied());
+        }
+        // Best effort, apart from memory and pids: the cpu controller cannot
+        // always be enabled (e.g. with realtime processes around).
+        let cpu = is_enabled("cpu")
+            || (wants_cpu && write(&dir.join("cgroup.subtree_control"), "+cpu").is_ok());
+        if wants_cpu && cpu {
+            undo.disable.push("cpu");
         }
         let parent = Parent {
             dir: dir.to_owned(),
@@ -497,7 +602,59 @@ pub(crate) mod linux {
             next: AtomicU64::new(0),
         };
         probe(&parent)?;
+        remove_stale(dir);
+        undo.disable.clear();
+        undo.leaf = None;
         Ok(parent)
+    }
+
+    /// Changes [`prepare`] made to a cgroup, undone when dropped unless
+    /// cleared.
+    struct Undo<'a> {
+        dir: &'a Path,
+        /// The leaf this process moved into.
+        leaf: Option<PathBuf>,
+        /// Controllers enabled for the children.
+        disable: Vec<&'a str>,
+    }
+
+    impl Drop for Undo<'_> {
+        fn drop(&mut self) {
+            if !self.disable.is_empty() {
+                let request: Vec<String> = self.disable.iter().map(|c| format!("-{c}")).collect();
+                let _ = write(&self.dir.join("cgroup.subtree_control"), &request.join(" "));
+            }
+            if let Some(leaf) = self.leaf.take() {
+                let _ = write(
+                    &self.dir.join("cgroup.procs"),
+                    &std::process::id().to_string(),
+                );
+                let _ = fs::remove_dir(leaf);
+            }
+        }
+    }
+
+    /// Removes run cgroups left behind by texrun processes that are gone
+    /// (e.g. killed): only empty ones, since `rmdir` fails for a cgroup
+    /// with processes or children. Nothing is killed.
+    fn remove_stale(dir: &Path) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("texrun-"))
+                .and_then(|n| n.split_once('.'))
+                .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = fs::remove_dir(entry.path());
+            }
+        }
     }
 
     /// Moves this process into a new leaf child of `dir` (its cgroup).
@@ -519,13 +676,10 @@ pub(crate) mod linux {
             .with_memory_max(1 << 30)
             .with_pids_max(64)
             .with_cpus(1);
-        let run = parent
+        parent
             .create(&limits)
-            .map_err(|e| format!("cannot create a cgroup in {}: {e}", parent.dir.display()))?;
-        if !run.dir.join("cgroup.kill").is_file() {
-            return Err("cgroup.kill is missing (Linux 5.14 or later is needed)".to_owned());
-        }
-        Ok(())
+            .map(drop)
+            .map_err(|e| format!("cannot create a cgroup in {}: {e}", parent.dir.display()))
     }
 }
 
@@ -601,6 +755,53 @@ mod tests {
         assert!(cgroups.parent().is_none());
         assert!(!cgroups.is_required());
         assert!(cgroups.with_required(true).is_required());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn delegation_needs_a_marker_or_a_non_root_owner() {
+        use super::linux::has_delegation_evidence as evidence;
+        let one = Some(b"1".to_vec());
+        let owned = [Some(1000), Some(1000), Some(1000)];
+        let root = [Some(0), Some(0), Some(0)];
+        // Writable to root, but no marker: not delegated.
+        assert!(!evidence(&[None, None], &root, 0));
+        assert!(evidence(&[one.clone(), None], &root, 0));
+        assert!(evidence(&[None, one], &root, 0));
+        assert!(!evidence(&[Some(b"0".to_vec()), None], &root, 0));
+        // Chowned to a non-root user.
+        assert!(evidence(&[None, None], &owned, 1000));
+        assert!(!evidence(&[None, None], &owned, 1001));
+        assert!(!evidence(
+            &[None, None],
+            &[Some(1000), Some(0), Some(1000)],
+            1000
+        ));
+        assert!(!evidence(
+            &[None, None],
+            &[Some(1000), None, Some(1000)],
+            1000
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn nsdelegate_is_read_from_mountinfo() {
+        use super::linux::mounted_with_nsdelegate as nsdelegate;
+        let line = |opts: &str| {
+            format!("35 30 0:30 / /sys/fs/cgroup ro,nosuid shared:9 - cgroup2 cgroup {opts}\n")
+        };
+        assert!(nsdelegate(
+            &line("rw,nsdelegate,memory_recursiveprot"),
+            "/sys/fs/cgroup"
+        ));
+        assert!(!nsdelegate(
+            &line("rw,memory_recursiveprot"),
+            "/sys/fs/cgroup"
+        ));
+        assert!(!nsdelegate(&line("rw,nsdelegate"), "/mnt"));
+        let other_fs = "35 30 0:30 / /sys/fs/cgroup rw - tmpfs tmpfs rw,nsdelegate\n";
+        assert!(!nsdelegate(other_fs, "/sys/fs/cgroup"));
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

@@ -367,6 +367,13 @@ fn render_previews(
 /// The cgroups for `--cgroup`: none for `off`; otherwise the delegated
 /// cgroup found, which may be unavailable (with the reason) for `auto`,
 /// but not for `required`.
+/// The hint for `--cgroup required` without a usable cgroup.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CGROUP_HINT: &str = "run texrun in a delegated cgroup of its own (e.g. systemd-run --user \
+                           --scope -p Delegate=yes texrun ...), or use --cgroup auto";
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const CGROUP_HINT: &str = "cgroups exist on Linux only; use --cgroup auto or --cgroup off here";
+
 fn select_cgroups(mode: CgroupMode) -> Result<Option<Cgroups>, ErrorInfo> {
     let required = match mode {
         CgroupMode::Off => return Ok(None),
@@ -381,10 +388,7 @@ fn select_cgroups(mode: CgroupMode) -> Result<Option<Cgroups>, ErrorInfo> {
             Category::Runtime,
             format!("--cgroup required, but no cgroup can be used: {reason}"),
         )
-        .with_hint(
-            "run texrun in a delegated cgroup of its own (e.g. systemd-run --user --scope \
-             -p Delegate=yes texrun ...), or use --cgroup auto",
-        ));
+        .with_hint(CGROUP_HINT));
     }
     Ok(Some(cgroups))
 }

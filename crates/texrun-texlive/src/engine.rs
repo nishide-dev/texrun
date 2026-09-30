@@ -296,7 +296,7 @@ impl LatexmkEngine {
 
         // A file that hit RLIMIT_FSIZE stops the writer without the poll loop
         // noticing; check the sizes once more.
-        let reached = process::limit_reached(&finished, &limits, timeout);
+        let reached = process::limit_reached(&finished, &plan.main_log(), &limits, timeout);
         let stop = finished
             .stop
             .clone()
@@ -313,36 +313,12 @@ impl LatexmkEngine {
 
         let artifacts = plan.collect_artifacts();
         let pdf_ok = artifacts.iter().any(|a| a.kind == ArtifactKind::Pdf);
-        let mut diagnostics = Vec::new();
-        let limit_diagnostic = |message: &str| {
-            Diagnostic::new(Severity::Error, DiagnosticKind::ResourceLimit, message)
-        };
-        // A limit reached before a timeout or cancellation is reported too:
-        // it may be why the compile did not finish (e.g. perl retries a
-        // `fork` refused by `pids.max` until the timeout).
-        if let Some(LimitReached::Resource(message)) = &reached {
-            diagnostics.push(limit_diagnostic(message));
-        }
-        let outcome = match (&stop, &reached) {
-            (Some(StopReason::TimedOut), _) => CompileOutcome::TimedOut,
-            (Some(StopReason::Cancelled), _) => CompileOutcome::Cancelled,
-            (Some(StopReason::OutputLimit(message)), _) => {
-                diagnostics.push(limit_diagnostic(message));
-                CompileOutcome::Failed
-            }
-            (None, Some(LimitReached::Resource(_))) => CompileOutcome::Failed,
-            (None, _) if finished.status.success() && pdf_ok => CompileOutcome::Succeeded,
-            (None, _) => {
-                if finished.status.success() {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Error,
-                        DiagnosticKind::Other,
-                        "latexmk finished without producing a PDF",
-                    ));
-                }
-                CompileOutcome::Failed
-            }
-        };
+        let (outcome, mut diagnostics) = decide(
+            stop.as_ref(),
+            reached.as_ref(),
+            finished.status.success(),
+            pdf_ok,
+        );
         diagnostics.extend(plan.parse_log());
         // When latexmk started, for telling this compile's BibTeX logs from
         // stale ones.
@@ -378,6 +354,16 @@ impl LatexmkEngine {
         timeout: Duration,
         cancel: &CancelToken,
     ) -> Result<(process::Finished, Start<'_>, Vec<String>), EngineError> {
+        // A required cgroup that cannot be used is its own error, not one
+        // of the exec gate (both are `RunError::Unsupported`).
+        if let Some(cgroups) = &self.config.cgroups
+            && cgroups.is_required()
+            && let Err(reason) = cgroups.check()
+        {
+            return Err(EngineError::Unsupported(format!(
+                "latexmk must run in a cgroup of its own, but none can be used ({reason})"
+            )));
+        }
         let mut notes = Vec::new();
         let mut start = self.start(&mut notes)?;
         loop {
@@ -404,7 +390,8 @@ impl LatexmkEngine {
             match finished {
                 // The exec gate became unusable after it was checked;
                 // nothing was started.
-                Err(RunError::Unsupported(reason)) if matches!(start, Start::ExecGate(_)) => {
+                Err(RunError::Unsupported(reason)) if matches!(&start, Start::ExecGate(gate) if gate.check().is_err()) =>
+                {
                     start = self.without_gate(&reason, &mut notes)?;
                 }
                 other => return Ok((other.map_err(process::engine_error)?, start, notes)),
@@ -550,6 +537,60 @@ pub(crate) fn parse_version(output: &str) -> Option<String> {
         let version = version.trim();
         (!version.is_empty()).then(|| version.to_owned())
     })
+}
+
+/// The outcome of a finished latexmk run, and the diagnostics texrun adds:
+/// `stop` (why texrun stopped it, if it did), `reached` (a resource limit
+/// it reached), whether latexmk exited successfully and whether a PDF
+/// exists (docs/security.md §3.2, §3.10).
+fn decide(
+    stop: Option<&StopReason>,
+    reached: Option<&LimitReached>,
+    success: bool,
+    pdf_ok: bool,
+) -> (CompileOutcome, Vec<Diagnostic>) {
+    let limit =
+        |severity, message: &str| Diagnostic::new(severity, DiagnosticKind::ResourceLimit, message);
+    let mut diagnostics = Vec::new();
+    let succeeded = success && pdf_ok;
+    // A limit reached before a timeout or cancellation is reported too: it
+    // may be why the compile did not finish (e.g. perl retries a `fork`
+    // refused by `pids.max` until the timeout). One that did not keep the
+    // compile from succeeding (a retried `fork`) is only a warning.
+    let reached_fatally = match reached {
+        Some(LimitReached::Resource { message, transient }) => {
+            let passed = *transient && stop.is_none() && succeeded;
+            let severity = if passed {
+                Severity::Warning
+            } else {
+                Severity::Error
+            };
+            diagnostics.push(limit(severity, message));
+            !passed
+        }
+        _ => false,
+    };
+    let outcome = match stop {
+        Some(StopReason::TimedOut) => CompileOutcome::TimedOut,
+        Some(StopReason::Cancelled) => CompileOutcome::Cancelled,
+        Some(StopReason::OutputLimit(message)) => {
+            diagnostics.push(limit(Severity::Error, message));
+            CompileOutcome::Failed
+        }
+        None if reached_fatally => CompileOutcome::Failed,
+        None if succeeded => CompileOutcome::Succeeded,
+        None => {
+            if success {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticKind::Other,
+                    "latexmk finished without producing a PDF",
+                ));
+            }
+            CompileOutcome::Failed
+        }
+    };
+    (outcome, diagnostics)
 }
 
 /// Which resource limits were in place for latexmk (docs/security.md §3.10).
@@ -721,6 +762,16 @@ impl Plan {
                     .then(|| Artifact::new(kind, name).with_size_bytes(meta.len()))
             })
             .collect()
+    }
+
+    /// The main log (its end if it is long), or nothing if there is none.
+    fn main_log(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let path = self.output_dir.join(format!("{}.log", self.stem));
+        if read_log(&path, &mut buf).is_err() {
+            buf.clear();
+        }
+        buf
     }
 
     /// Parses the main log into diagnostics with workspace-relative files.
@@ -1173,6 +1224,83 @@ mod tests {
             engine.write_rc(root.path(), true),
             Err(EngineError::Unavailable { .. })
         ));
+    }
+
+    /// How latexmk is started with and without a usable exec gate (the
+    /// rc's stdin gate is the Linux fallback, docs/security.md §3.2).
+    #[test]
+    fn latexmk_starts_through_the_gate_or_a_fallback() {
+        let start = |config: LatexmkConfig| {
+            let engine = LatexmkEngine::new(config);
+            let mut notes = Vec::new();
+            let start = engine.start(&mut notes).map(|s| format!("{s:?}"));
+            (start.map_err(|e| e.to_string()), notes)
+        };
+        let usable = ExecGate::new("/bin/sh");
+        let (usable_start, notes) = start(LatexmkConfig::default().with_exec_gate(usable));
+        assert!(usable_start.unwrap().starts_with("ExecGate"));
+        assert!(notes.is_empty());
+
+        let missing = ExecGate::new("/nonexistent/texrun");
+        for config in [
+            LatexmkConfig::default(),
+            LatexmkConfig::default().with_exec_gate(missing.clone()),
+        ] {
+            let (fallback, notes) = start(config);
+            if texrun_process::PRLIMIT_SUPPORTED {
+                assert_eq!(fallback.unwrap(), "StdinGate");
+                assert!(notes.is_empty(), "{notes:?}");
+            } else {
+                assert_eq!(fallback.unwrap(), "Unlimited");
+                assert!(notes[0].starts_with("rlimits:"), "{notes:?}");
+            }
+        }
+
+        let (required, _) =
+            start(LatexmkConfig::default().with_exec_gate(missing.with_required(true)));
+        if texrun_process::PRLIMIT_SUPPORTED {
+            assert_eq!(required.unwrap(), "StdinGate", "same guarantee on Linux");
+        } else {
+            let err = required.unwrap_err();
+            assert!(err.contains("/nonexistent/texrun"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_limit_that_did_not_stop_the_compile_is_a_warning() {
+        let transient = LimitReached::Resource {
+            message: "processes".to_owned(),
+            transient: true,
+        };
+        let fatal = LimitReached::Resource {
+            message: "cpu".to_owned(),
+            transient: false,
+        };
+        let severity = |d: &[Diagnostic]| d.iter().map(|d| d.severity).collect::<Vec<_>>();
+
+        // A retried `fork` and a successful compile: still a success.
+        let (outcome, d) = decide(None, Some(&transient), true, true);
+        assert_eq!(outcome, CompileOutcome::Succeeded);
+        assert_eq!(severity(&d), [Severity::Warning]);
+        assert_eq!(d[0].kind, DiagnosticKind::ResourceLimit);
+        // ... but not if the compile failed.
+        let (outcome, d) = decide(None, Some(&transient), false, false);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // A limit that stopped a process fails the compile.
+        let (outcome, d) = decide(None, Some(&fatal), true, true);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // A timeout stays a timeout, with the limit as the likely reason.
+        let (outcome, d) = decide(Some(&StopReason::TimedOut), Some(&transient), false, false);
+        assert_eq!(outcome, CompileOutcome::TimedOut);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // Output limits as before.
+        let output = StopReason::OutputLimit("output limit exceeded: x".to_owned());
+        let (outcome, d) = decide(Some(&output), None, false, true);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(d[0].kind, DiagnosticKind::ResourceLimit);
+        assert_eq!(decide(None, None, true, true).0, CompileOutcome::Succeeded);
     }
 
     #[test]

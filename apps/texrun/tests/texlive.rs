@@ -286,28 +286,54 @@ fn texlive_sigint_stops_pdflatex() {
     assert!(left.is_empty(), "{left:?}");
 }
 
-/// texrun started alone in a delegated cgroup (as with `systemd-run --user
-/// --scope -p Delegate=yes`) moves itself into a leaf of it and runs the
-/// engine and the preview tools in cgroups of their own. Needs a cgroup
-/// this test can create one in (docs/development.md, "cgroup tests");
-/// skipped otherwise, unless `TEXRUN_REQUIRE_CGROUP=1`.
+/// A cgroup this test may create cgroups in (docs/development.md, "cgroup
+/// test"), or `None` (skipped) unless `TEXRUN_REQUIRE_CGROUP=1`.
 #[cfg(target_os = "linux")]
-#[test]
-fn texlive_uses_a_delegated_cgroup_of_its_own() {
-    common::require_texlive!();
+fn cgroup_parent() -> Option<std::path::PathBuf> {
     let cgroups = texrun_process::Cgroups::detect();
-    let parent = match cgroups.check() {
-        Ok(()) => cgroups.parent().unwrap().to_owned(),
+    match cgroups.check() {
+        Ok(()) => Some(cgroups.parent().unwrap().to_owned()),
         Err(reason) if std::env::var_os("TEXRUN_REQUIRE_CGROUP").is_some_and(|v| v == "1") => {
             panic!("TEXRUN_REQUIRE_CGROUP=1, but no cgroup can be used: {reason}")
         }
         Err(reason) => {
             eprintln!("skipped: no delegated cgroup ({reason})");
-            return;
+            None
         }
-    };
-    let own = parent.join(format!("texrun-cli-test-{}", std::process::id()));
+    }
+}
+
+/// What a compile run alone in a fresh cgroup did to that cgroup.
+#[cfg(target_os = "linux")]
+struct OwnCgroupRun {
+    code: Option<i32>,
+    doc: Value,
+    stderr: String,
+    /// `cgroup.subtree_control` of the cgroup after the run.
+    subtree_control: String,
+    /// Child cgroups texrun left in it (its `.main` leaf).
+    children: Vec<String>,
+}
+
+/// Runs `texrun compile --json <args> main.tex` as the only process of a
+/// new cgroup below `parent`, marked as delegated (`trusted.delegate=1`,
+/// as systemd does for `Delegate=yes`) or not, and removes the cgroup.
+#[cfg(target_os = "linux")]
+fn compile_in_own_cgroup(parent: &Path, delegated: bool, args: &[&str]) -> OwnCgroupRun {
+    let own = parent.join(format!(
+        "texrun-cli-test-{}-{delegated}",
+        std::process::id()
+    ));
     fs::create_dir(&own).unwrap();
+    if delegated {
+        rustix::fs::setxattr(
+            &own,
+            "trusted.delegate",
+            b"1",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+    }
     let dir = project(&[(
         "main.tex",
         "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n",
@@ -315,28 +341,47 @@ fn texlive_uses_a_delegated_cgroup_of_its_own() {
     let out = Command::new("/bin/sh")
         .args(["-c", "echo $$ > \"$0/cgroup.procs\" && exec \"$@\""])
         .arg(&own)
-        .args([
-            env!("CARGO_BIN_EXE_texrun"),
-            "compile",
-            "--json",
-            "--cgroup",
-            "required",
-        ])
+        .args([env!("CARGO_BIN_EXE_texrun"), "compile", "--json"])
+        .args(args)
         .arg("main.tex")
         .current_dir(dir.path())
         .output()
         .unwrap();
-    // The leaf texrun moved itself into, then the cgroup itself.
+    let subtree_control = fs::read_to_string(own.join("cgroup.subtree_control")).unwrap();
+    let mut children = Vec::new();
     for entry in fs::read_dir(&own).unwrap().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            children.push(entry.file_name().to_string_lossy().into_owned());
             let _ = fs::remove_dir(entry.path());
         }
     }
     let _ = fs::remove_dir(&own);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let doc: Value =
+    assert!(!own.exists(), "the test cgroup was removed");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let doc =
         serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
-    assert_eq!(out.status.code(), Some(0), "{doc:#}\n{stderr}");
+    OwnCgroupRun {
+        code: out.status.code(),
+        doc,
+        stderr,
+        subtree_control,
+        children,
+    }
+}
+
+/// texrun started alone in a delegated cgroup (as with `systemd-run --user
+/// --scope -p Delegate=yes`) moves itself into a leaf of it and runs the
+/// engine and the preview tools in cgroups of their own.
+#[cfg(target_os = "linux")]
+#[test]
+fn texlive_uses_a_delegated_cgroup_of_its_own() {
+    common::require_texlive!();
+    let Some(parent) = cgroup_parent() else {
+        return;
+    };
+    let run = compile_in_own_cgroup(&parent, true, &["--cgroup", "required"]);
+    let doc = &run.doc;
+    assert_eq!(run.code, Some(0), "{doc:#}\n{}", run.stderr);
     assert_eq!(
         doc["resource_limits"],
         serde_json::json!({ "rlimits": true, "cgroup": true }),
@@ -348,5 +393,33 @@ fn texlive_uses_a_delegated_cgroup_of_its_own() {
             .is_none_or(|n| n.iter().all(|n| n["kind"] != "resource_limits")),
         "{doc:#}"
     );
-    assert!(!own.exists(), "the test cgroup was removed");
+    assert!(
+        run.subtree_control.contains("memory"),
+        "{}",
+        run.subtree_control
+    );
+    assert_eq!(run.children.len(), 1, "{:?}", run.children);
+    assert_eq!(
+        run.children[0].rsplit_once('.').map(|(_, kind)| kind),
+        Some("main"),
+        "{:?}",
+        run.children
+    );
+}
+
+/// A cgroup that is writable (texrun runs as root here) but carries no
+/// delegation marker is left alone: texrun neither moves itself into a
+/// leaf nor enables controllers there. (It may still use the container's
+/// cgroup namespace root.)
+#[cfg(target_os = "linux")]
+#[test]
+fn texlive_leaves_a_cgroup_that_was_not_delegated_alone() {
+    common::require_texlive!();
+    let Some(parent) = cgroup_parent() else {
+        return;
+    };
+    let run = compile_in_own_cgroup(&parent, false, &["--cgroup", "auto"]);
+    assert_eq!(run.code, Some(0), "{:#}\n{}", run.doc, run.stderr);
+    assert_eq!(run.subtree_control.trim(), "", "controllers were enabled");
+    assert!(run.children.is_empty(), "{:?}", run.children);
 }

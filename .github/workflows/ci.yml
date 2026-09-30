@@ -171,10 +171,16 @@ jobs:
           fi
       # cgroup limits (#25, docs/development.md "cgroup test"): the cgroup
       # mount of the container above is read-only, so the cgroup tests skip
-      # there. They run again in a privileged container that
-      # docker/dev/with-cgroup.sh prepares; TEXRUN_REQUIRE_CGROUP=1 (set by
-      # the script) turns a missing cgroup into a failure.
-      - name: Run cgroup tests (privileged container)
+      # there. The whole suite runs again in a privileged container that
+      # docker/dev/with-cgroup.sh prepares, so that the tests whose `auto`
+      # behaviour changes with a usable cgroup are covered too;
+      # TEXRUN_REQUIRE_CGROUP=1 (set by the script) turns a missing cgroup
+      # into a failure.
+      #
+      # --privileged is acceptable here only because GitHub-hosted runners
+      # are throwaway VMs whose jobs already have sudo and the docker socket.
+      # Revisit this step before running the job on a self-hosted runner.
+      - name: Run tests with cgroups (privileged container)
         shell: bash
         run: |
           set -o pipefail
@@ -187,7 +193,7 @@ jobs:
             -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
             "${IMAGE}" \
             docker/dev/with-cgroup.sh \
-            cargo test --workspace --all-features --locked -- cgroup
+            cargo test --workspace --all-features --locked
       - name: Save cargo cache
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

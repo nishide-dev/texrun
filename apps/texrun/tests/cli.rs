@@ -463,12 +463,12 @@ fn cgroup_modes_are_reported() {
         assert_eq!(doc["error"]["stage"], "setup", "{doc:#}");
         assert_eq!(doc["error"]["kind"], "unsupported", "{doc:#}");
         assert_eq!(doc["error"]["category"], "runtime", "{doc:#}");
-        assert!(
-            doc["error"]["hint"]
-                .as_str()
-                .unwrap()
-                .contains("Delegate=yes")
-        );
+        let hint = doc["error"]["hint"].as_str().unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(hint.contains("Delegate=yes"), "{hint}");
+        } else {
+            assert!(hint.contains("Linux only"), "{hint}");
+        }
         assert!(doc.get("outcome").is_none());
         let plain = env.run(&["compile", "--cgroup", "required", "main.tex"]);
         assert_eq!(code(&plain), 3);
