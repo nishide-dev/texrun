@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use texrun_preview::{BackendChoice, MAX_DPI, PageRange};
+
 use crate::duration::parse_timeout;
 
 /// Default of `--timeout` (docs/security.md §3.1); a unit test checks that
@@ -24,7 +26,8 @@ Exit codes:
   3    texrun runtime error: latexmk missing or unusable, I/O errors,
        artifacts could not be copied to the output directory
   4    the compile timed out (see --timeout)
-  130  cancelled by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP";
+  130  interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP
+Page previews never change the exit code.";
 
 const COMPILE_AFTER_HELP: &str = "\
 Output:
@@ -39,9 +42,11 @@ Output:
   the entrypoint's directory (e.g. \\input{../common/macros}) cannot be read
   by TeX; put the entrypoint in the project root instead.
 
-  The PDF and log are copied to the output directory, replacing files of the
-  same name. A PDF from an earlier run is not removed when the compile
-  fails; rely on the exit code or the JSON `outcome`.
+  The PDF, the log and, after a successful compile, PNG previews of the
+  first pages (preview/page-NNN.png) are copied to the output directory,
+  replacing files of the same name. Files from an earlier run (a PDF when
+  the compile now fails, previews of pages no longer rendered) are not
+  removed; rely on the exit code and the reported artifacts.
 ";
 
 /// Compile LaTeX documents and report structured results.
@@ -112,20 +117,53 @@ pub struct CompileArgs {
     pub preview: PreviewArgs,
 }
 
-/// Page preview options (#8), reserved until previews are integrated.
-///
-/// Hidden from the help for now. `--no-preview` is accepted and has no
-/// effect (no previews are produced yet); `--pages` is rejected with a usage
-/// error so that scripts do not silently get no previews.
+/// Page preview options (#8). Previews are rendered only after a
+/// successful compile; failures to render them are reported as notices and
+/// never change the exit code.
 #[derive(Debug, Args)]
 pub struct PreviewArgs {
     /// Do not render page previews.
-    #[arg(long, hide = true, conflicts_with = "pages")]
+    #[arg(long, conflicts_with_all = ["pages", "preview_dpi", "preview_backend"])]
     pub no_preview: bool,
 
-    /// Pages to render as previews: N, N-M, N- or -M.
-    #[arg(long, hide = true, value_name = "RANGE")]
-    pub pages: Option<String>,
+    /// Pages to render as PNG previews: N, N-M, N- or -M [default: the first
+    /// 20 pages; at most 200 pages are rendered].
+    #[arg(long, value_name = "RANGE", value_parser = parse_pages)]
+    pub pages: Option<PageRange>,
+
+    /// Preview resolution [default: 144]. Large pages are rendered at a lower
+    /// resolution (long edge at most 4096 px).
+    #[arg(long, value_name = "DPI", value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_DPI)))]
+    pub preview_dpi: Option<u32>,
+
+    #[allow(clippy::doc_markdown, reason = "the doc comment is the --help text")]
+    /// Preview renderer [default: auto: MuPDF (mutool) if installed,
+    /// otherwise Poppler (pdftoppm)].
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    pub preview_backend: Option<PreviewBackend>,
+}
+
+/// `--preview-backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PreviewBackend {
+    Auto,
+    Mupdf,
+    Poppler,
+}
+
+impl From<PreviewBackend> for BackendChoice {
+    fn from(value: PreviewBackend) -> Self {
+        match value {
+            PreviewBackend::Auto => Self::Auto,
+            PreviewBackend::Mupdf => Self::Mupdf,
+            PreviewBackend::Poppler => Self::Poppler,
+        }
+    }
+}
+
+fn parse_pages(s: &str) -> Result<PageRange, String> {
+    s.parse()
+        .map_err(|e: texrun_preview::PageRangeError| e.to_string())
 }
 
 #[cfg(test)]
@@ -149,6 +187,44 @@ mod tests {
         assert_eq!(args.timeout, texrun_texlive::DEFAULT_TIMEOUT);
         assert!(!args.keep_workspace);
         assert_eq!(args.source_date_epoch, None);
+        assert!(!args.preview.no_preview);
+        assert_eq!(args.preview.pages, None);
+    }
+
+    #[test]
+    fn preview_options() {
+        let cli = Cli::try_parse_from([
+            "texrun",
+            "compile",
+            "--pages",
+            "2-4",
+            "--preview-dpi",
+            "72",
+            "--preview-backend",
+            "poppler",
+            "m.tex",
+        ])
+        .unwrap();
+        let Command::Compile(args) = cli.command;
+        assert_eq!(
+            args.preview.pages,
+            Some(PageRange::new(2, Some(4)).unwrap())
+        );
+        assert_eq!(args.preview.preview_dpi, Some(72));
+        assert_eq!(args.preview.preview_backend, Some(PreviewBackend::Poppler));
+        for bad in [
+            &["--pages", "0"][..],
+            &["--pages", "3-1"],
+            &["--preview-dpi", "0"],
+            &["--preview-dpi", "5000"],
+            &["--preview-backend", "ghostscript"],
+            &["--no-preview", "--preview-dpi", "72"],
+        ] {
+            let mut command_line = vec!["texrun", "compile"];
+            command_line.extend_from_slice(bad);
+            command_line.push("m.tex");
+            assert!(Cli::try_parse_from(&command_line).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

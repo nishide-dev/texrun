@@ -1,8 +1,8 @@
 //! `texrun compile`.
 //!
 //! Pipeline: resolve the project → probe latexmk → create the workspace →
-//! compile → (previews, #8) → collect artifacts to the output directory →
-//! remove the workspace. Every step either adds to the [`CompileReport`] or
+//! compile → render page previews (after a successful compile only) →
+//! collect artifacts to the output directory → remove the workspace. Every step either adds to the [`CompileReport`] or
 //! ends it with an [`ErrorInfo`]; the report is printed once at the end, and
 //! the exit code is derived from it.
 //!
@@ -18,6 +18,7 @@ use std::process::ExitCode;
 
 use texrun_core::schema::Versioned;
 use texrun_core::{CancelToken, CompileOptions, CompileResult, TypesetEngine};
+use texrun_preview::{PreviewOptions, PreviewReport, Previewer};
 use texrun_texlive::{LatexmkConfig, LatexmkEngine};
 use texrun_workspace::{OverwritePolicy, ProjectInput, Workspace, WorkspaceConfig, WorkspaceError};
 
@@ -67,7 +68,15 @@ fn print_report(args: &CompileArgs, report: &CompileReport) {
     if let Some(result) = &report.result {
         let mut stdout = io::stdout().lock();
         let _ = stdout
-            .write_all(human::render_result(result, &display_paths(args), args.timeout).as_bytes())
+            .write_all(
+                human::render_result(
+                    result,
+                    report.preview.as_ref(),
+                    &display_paths(args),
+                    args.timeout,
+                )
+                .as_bytes(),
+            )
             .and_then(|()| stdout.flush());
     }
     if let Some(error) = &report.error {
@@ -105,6 +114,7 @@ fn execute(
     report: &mut CompileReport,
 ) -> Result<(), ErrorInfo> {
     check_args(args)?;
+    let preview_options = preview_options(args, cancel)?;
 
     let input = ProjectInput::from_host_entrypoint(&args.entrypoint, args.root.as_deref())
         .map_err(|e| ErrorInfo::from_workspace(Stage::Project, &e))?;
@@ -158,12 +168,23 @@ fn execute(
         .map_err(|e| ErrorInfo::from_engine(Stage::Compile, &e))?;
     let mut result = run.result;
 
-    // #8: render page previews into `ws.output_dir()` here (unless
-    // `--no-preview`) and attach them to `result`, so that the collection
-    // below copies them with the PDF.
+    // Previews are rendered into the workspace output directory and
+    // attached to the result, so that the collection below copies them
+    // together with the PDF.
+    let mut preview = render_previews(&ws, &result, preview_options);
+    if let Some(preview) = &preview {
+        preview.attach_to(&mut result);
+    }
 
     let collected = collect(&ws, &mut result, &output);
+    if collected.is_err()
+        && let Some(preview) = &mut preview
+    {
+        // The images only existed in the workspace.
+        preview.pages.clear();
+    }
     report.result = Some(result);
+    report.preview = preview;
     if let Err(e) = ws.close() {
         eprintln!("warning: could not remove the workspace: {e}");
     }
@@ -171,16 +192,60 @@ fn execute(
     Ok(())
 }
 
+/// The preview options from the command line, or `None` for
+/// `--no-preview`. Validated before anything runs.
+fn preview_options(
+    args: &CompileArgs,
+    cancel: &CancelToken,
+) -> Result<Option<PreviewOptions>, ErrorInfo> {
+    let p = &args.preview;
+    if p.no_preview {
+        return Ok(None);
+    }
+    // The same token as the compile: Ctrl-C also stops the renderer.
+    let mut options = PreviewOptions::default().with_cancel(cancel.clone());
+    if let Some(pages) = p.pages {
+        options = options.with_pages(pages);
+    }
+    if let Some(dpi) = p.preview_dpi {
+        options = options.with_dpi(dpi);
+    }
+    if let Some(backend) = p.preview_backend {
+        options = options.with_backend(backend.into());
+    }
+    options.validate().map_err(|e| {
+        ErrorInfo::new(
+            Stage::Args,
+            "invalid_preview_options",
+            Category::Usage,
+            e.to_string(),
+        )
+    })?;
+    Ok(Some(options))
+}
+
+/// Renders previews of the PDF after a successful compile. Problems while
+/// rendering are notices in the returned report, never errors.
+fn render_previews(
+    ws: &Workspace,
+    result: &CompileResult,
+    options: Option<PreviewOptions>,
+) -> Option<PreviewReport> {
+    let options = options?;
+    if !result.is_success() {
+        return None;
+    }
+    let pdf = result.pdf()?;
+    let output_root = ws.output_dir();
+    let pdf = output_root.join(pdf.path.as_path());
+    // Options were validated up front; `render` cannot fail otherwise.
+    Previewer::detect()
+        .render(&pdf, &output_root, &options)
+        .ok()
+}
+
 /// Checks that are not expressed in the clap definition.
 fn check_args(args: &CompileArgs) -> Result<(), ErrorInfo> {
-    if args.preview.pages.is_some() {
-        return Err(ErrorInfo::new(
-            Stage::Args,
-            "unsupported_option",
-            Category::Usage,
-            "--pages: page previews are not available in this version of texrun",
-        ));
-    }
     let paths = [
         ("the entrypoint", Some(&args.entrypoint)),
         ("--root", args.root.as_ref()),

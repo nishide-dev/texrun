@@ -10,6 +10,7 @@ use std::time::Duration;
 use texrun_core::{
     ArtifactKind, CompileOutcome, CompileResult, Diagnostic, DiagnosticKind, Severity,
 };
+use texrun_preview::PreviewReport;
 use texrun_workspace::{ExclusionReason, MaterializeReport};
 
 use crate::duration::format_duration;
@@ -46,7 +47,12 @@ impl Paths {
 }
 
 /// Renders the result of a compile that ran to an outcome (stdout).
-pub fn render_result(result: &CompileResult, paths: &Paths, timeout: Duration) -> String {
+pub fn render_result(
+    result: &CompileResult,
+    preview: Option<&PreviewReport>,
+    paths: &Paths,
+    timeout: Duration,
+) -> String {
     let mut out = String::new();
     render_diagnostics(&mut out, &result.diagnostics, paths);
 
@@ -81,7 +87,49 @@ pub fn render_result(result: &CompileResult, paths: &Paths, timeout: Duration) -
     if result.is_success() && result.pdf().is_none() {
         let _ = writeln!(out, "  (no PDF was reported)");
     }
+    if let Some(preview) = preview {
+        render_preview(&mut out, preview, paths);
+    }
     out
+}
+
+/// `previews: <first> .. <last> (N of M pages, backend)` and the notices.
+fn render_preview(out: &mut String, preview: &PreviewReport, paths: &Paths) {
+    let pages = &preview.pages;
+    if let (Some(first), Some(last)) = (pages.first(), pages.last()) {
+        let first_path = paths.output_file(first.artifact.path.as_str());
+        let range = if pages.len() == 1 {
+            first_path
+        } else {
+            format!("{first_path} .. {}", escape(last.artifact.path.file_name()))
+        };
+        let total = match &preview.pdf {
+            Some(pdf) => format!("{} of {} pages", pages.len(), pdf.page_count),
+            None => format!("{} pages", pages.len()),
+        };
+        let backend = preview
+            .backend
+            .map(|b| format!(", {}", b.name()))
+            .unwrap_or_default();
+        let label = if pages.len() == 1 {
+            "preview"
+        } else {
+            "previews"
+        };
+        let _ = writeln!(out, "  {label}: {range} ({total}{backend})");
+    }
+    for notice in &preview.notices {
+        let label = if notice.severity >= Severity::Warning {
+            "warning"
+        } else {
+            "note"
+        };
+        let page = notice
+            .page
+            .map(|p| format!(" (page {p})"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "{label}: preview: {}{page}", escape(&notice.message));
+    }
 }
 
 fn counts(result: &CompileResult) -> String {
@@ -270,7 +318,7 @@ mod tests {
             ArtifactKind::Log,
             WorkspacePath::new("main.log").unwrap(),
         ));
-        let text = render_result(&r, &paths(), Duration::from_secs(60));
+        let text = render_result(&r, None, &paths(), Duration::from_secs(60));
         assert_eq!(
             text,
             "paper/chapters/intro.tex:3: error: Undefined control sequence\n\
@@ -296,7 +344,7 @@ mod tests {
             WorkspacePath::new("main.log").unwrap(),
         ));
         assert_eq!(
-            render_result(&r, &paths(), Duration::from_secs(60)),
+            render_result(&r, None, &paths(), Duration::from_secs(60)),
             "Compiled paper/main.tex in 1.23s\n  PDF: paper/texrun-out/main.pdf\n"
         );
     }
@@ -339,7 +387,37 @@ mod tests {
             EngineInfo::new("texlive"),
             Duration::from_secs(5),
         );
-        let text = render_result(&r, &paths(), Duration::from_secs(5));
+        let text = render_result(&r, None, &paths(), Duration::from_secs(5));
         assert!(text.contains("Timed out compiling paper/main.tex after 5s (limit 5s"));
+    }
+
+    #[test]
+    fn previews_and_their_notices_are_listed_and_escaped() {
+        let preview: PreviewReport = serde_json::from_value(serde_json::json!({
+            "status": "partial",
+            "backend": "mupdf",
+            "pdf": { "page_count": 30 },
+            "pages": [
+                { "kind": "preview", "path": "preview/page-001.png", "page": 1,
+                  "width_px": 10, "height_px": 10, "dpi": 144 },
+                { "kind": "preview", "path": "preview/page-002.png", "page": 2,
+                  "width_px": 10, "height_px": 10, "dpi": 144 }
+            ],
+            "notices": [
+                { "severity": "info", "kind": "page_limit",
+                  "message": "only the first 20 pages" },
+                { "severity": "warning", "kind": "render_failed",
+                  "message": "bad \u{202E}page", "page": 3 }
+            ]
+        }))
+        .unwrap();
+        let mut out = String::new();
+        render_preview(&mut out, &preview, &paths());
+        assert_eq!(
+            out,
+            "  previews: paper/texrun-out/preview/page-001.png .. page-002.png (2 of 30 pages, mupdf)\n\
+             note: preview: only the first 20 pages\n\
+             warning: preview: bad \\u{202E}page (page 3)\n"
+        );
     }
 }

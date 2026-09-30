@@ -437,6 +437,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "texrun-core",
+ "texrun-preview",
  "texrun-texlive",
  "texrun-workspace",
 ]

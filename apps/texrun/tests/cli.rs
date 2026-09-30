@@ -52,6 +52,17 @@ impl Env {
             fs::create_dir(base.path().join(dir)).unwrap();
         }
         let env = Self { base };
+        // PATH is only this directory, so no real latexmk or preview tool
+        // of the host is found; the fake scripts get the few commands they
+        // use as symlinks.
+        for tool in ["basename", "date", "env", "sleep"] {
+            let real = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.is_file())
+                .unwrap_or_else(|| panic!("{tool} not found"));
+            std::os::unix::fs::symlink(real, env.path("bin").join(tool)).unwrap();
+        }
         env.write_latexmk(behaviour);
         env
     }
@@ -61,8 +72,12 @@ impl Env {
     }
 
     fn write_latexmk(&self, behaviour: &str) {
-        let fake = self.path("bin/latexmk");
-        fs::write(&fake, format!("{FAKE_HEAD}{behaviour}")).unwrap();
+        self.write_tool("latexmk", &format!("{FAKE_HEAD}{behaviour}"));
+    }
+
+    fn write_tool(&self, name: &str, script: &str) {
+        let fake = self.path("bin").join(name);
+        fs::write(&fake, script).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -82,10 +97,7 @@ impl Env {
         cmd.args(args)
             .current_dir(self.path("proj"))
             .env_clear()
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.path("bin").display()),
-            )
+            .env("PATH", self.path("bin"))
             .env("TMPDIR", self.path("tmp"))
             .env("HOME", self.path("home"));
         cmd
@@ -147,12 +159,14 @@ fn help_documents_commands_options_and_exit_codes() {
         "[default: 60s]",
         "--keep-workspace",
         "--source-date-epoch <SECONDS>",
+        "--no-preview",
+        "--pages <RANGE>",
+        "--preview-dpi <DPI>",
+        "--preview-backend <BACKEND>",
         "130",
     ] {
         assert!(text.contains(needle), "missing {needle}:\n{text}");
     }
-    // Reserved preview options stay hidden until #8 is integrated.
-    assert!(!text.contains("--pages"), "{text}");
 
     let version = env.run(&["--version"]);
     assert_eq!(code(&version), 0);
@@ -179,9 +193,12 @@ fn usage_errors_exit_2_and_report_json_when_requested() {
     assert_eq!(doc["error"]["category"], "usage");
     assert!(doc.get("outcome").is_none());
 
-    let pages = env.run(&["compile", "--json", "--pages", "1-3", "main.tex"]);
+    let pages = env.run(&["compile", "--json", "--pages", "3-1", "main.tex"]);
     assert_eq!(code(&pages), 2);
-    assert_eq!(json(&pages)["error"]["kind"], "unsupported_option");
+    let doc = json(&pages);
+    assert_eq!(doc["error"]["kind"], "usage");
+    let message = doc["error"]["message"].as_str().unwrap();
+    assert!(message.contains("invalid page range"), "{message}");
 }
 
 #[test]
@@ -191,11 +208,18 @@ fn success_copies_the_pdf_next_to_the_entrypoint() {
 
     let out = env.run(&["compile", "paper/main.tex"]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert_eq!(
-        stdout(&out).lines().last(),
-        Some("  PDF: paper/texrun-out/main.pdf")
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("Compiled paper/main.tex in "),
+        "{text}"
     );
-    assert!(stdout(&out).starts_with("Compiled paper/main.tex in "));
+    assert_eq!(lines[1], "  PDF: paper/texrun-out/main.pdf");
+    // No preview tool: a warning, but still a success.
+    assert!(
+        lines[2].starts_with("warning: preview: no PDF preview tool was found"),
+        "{text}"
+    );
     assert!(env.path("proj/paper/texrun-out/main.pdf").is_file());
     assert!(env.path("proj/paper/texrun-out/main.log").is_file());
     assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
@@ -233,6 +257,77 @@ fn success_copies_the_pdf_next_to_the_entrypoint() {
         "{excluded:?}"
     );
     assert!(doc.get("error").is_none());
+    assert_eq!(doc["preview"]["status"], "skipped");
+    assert_eq!(doc["preview"]["notices"][0]["kind"], "tool_unavailable");
+
+    let doc = json(&env.run(&["compile", "--json", "--no-preview", "paper/main.tex"]));
+    assert!(doc.get("preview").is_none(), "{doc}");
+}
+
+/// `pdfinfo` output for a 3-page document (as in texrun-preview's tests).
+const FAKE_PDFINFO: &str = r#"#!/bin/sh
+echo "Pages:           3"
+for p in 1 2 3; do
+  echo "Page    $p size:  300 x 400 pts"
+  echo "Page    $p rot:   0"
+done
+"#;
+
+/// A `pdftoppm` that writes a tiny PNG header (2 x 3 px) to `<prefix>.png`.
+const FAKE_PDFTOPPM: &str = r#"#!/bin/sh
+for a; do last=$a; done
+printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\002\000\000\000\003' > "$last.png"
+"#;
+
+#[test]
+fn previews_are_rendered_and_collected_after_success() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.write_tool("pdfinfo", FAKE_PDFINFO);
+    env.write_tool("pdftoppm", FAKE_PDFTOPPM);
+    env.file("proj/main.tex", MINIMAL);
+
+    let out = env.run(&[
+        "compile",
+        "--json",
+        "--preview-backend",
+        "poppler",
+        "main.tex",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json(&out);
+    let preview = &doc["preview"];
+    assert_eq!(preview["status"], "rendered", "{preview:#}");
+    assert_eq!(preview["backend"], "poppler");
+    assert_eq!(preview["pdf"]["page_count"], 3);
+    assert_eq!(preview["pages"][0]["path"], "preview/page-001.png");
+    assert_eq!(preview["pages"][0]["width_px"], 2);
+    let previews: Vec<&Value> = doc["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["kind"] == "preview")
+        .collect();
+    assert_eq!(previews.len(), 3);
+    assert_eq!(previews[2]["page"], 3);
+    let output_dir = Path::new(doc["output_dir"].as_str().unwrap());
+    assert!(output_dir.join("preview/page-003.png").is_file());
+    assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
+
+    let out = env.run(&["compile", "--pages", "2-", "main.tex"]);
+    assert_eq!(code(&out), 0);
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "  previews: texrun-out/preview/page-002.png .. page-003.png (2 of 3 pages, poppler)"
+        ),
+        "{text}"
+    );
+
+    // Not after a failed compile.
+    env.write_latexmk(FAKE_FAIL);
+    let doc = json(&env.run(&["compile", "--json", "main.tex"]));
+    assert_eq!(doc["outcome"], "failed");
+    assert!(doc.get("preview").is_none(), "{doc}");
 }
 
 #[test]
@@ -332,10 +427,7 @@ fn missing_latexmk_is_a_runtime_error() {
     env.remove_latexmk();
     env.file("proj/main.tex", MINIMAL);
 
-    // Only the (now empty) fake bin directory: the host may have latexmk.
-    let only_bin = env.path("bin");
-    let run = |args: &[&str]| env.command(args).env("PATH", &only_bin).output().unwrap();
-    let out = run(&["compile", "--json", "main.tex"]);
+    let out = env.run(&["compile", "--json", "main.tex"]);
     assert_eq!(code(&out), 3);
     let doc = json(&out);
     assert_eq!(doc["schema_version"], 1);
@@ -351,7 +443,7 @@ fn missing_latexmk_is_a_runtime_error() {
     assert!(doc.get("outcome").is_none());
     assert_eq!(doc["project"]["entrypoint"], "main.tex");
 
-    let plain = run(&["compile", "main.tex"]);
+    let plain = env.run(&["compile", "main.tex"]);
     assert_eq!(code(&plain), 3);
     assert!(plain.stdout.is_empty());
     assert!(stderr(&plain).starts_with("error: engine `texlive` is unavailable"));

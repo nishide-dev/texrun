@@ -77,6 +77,41 @@ fn texlive_compiles_a_document_with_includes() {
     assert!(text.contains("PDF: texrun-out/main.pdf"), "{text}");
 }
 
+/// Also needs `mutool` or Poppler (both are in the dev container).
+#[test]
+#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
+fn texlive_renders_page_previews() {
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\nPage 1.\\newpage\nPage 2.\\newpage\n\
+         Page 3.\n\\end{document}\n",
+    )]);
+    let (code, doc, stderr) = run_json(dir.path(), &["compile", "--json", "main.tex"]);
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    let preview = &doc["preview"];
+    assert_eq!(preview["status"], "rendered", "{preview:#}");
+    assert_eq!(preview["pdf"]["page_count"], 3);
+    assert_eq!(preview["pages"].as_array().unwrap().len(), 3);
+    let png = dir.path().join("texrun-out/preview/page-003.png");
+    assert!(fs::read(&png).unwrap().starts_with(b"\x89PNG"));
+
+    let (code, doc, _) = run_json(
+        dir.path(),
+        &[
+            "compile",
+            "--json",
+            "--pages",
+            "2",
+            "--preview-dpi",
+            "72",
+            "main.tex",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(doc["preview"]["pages"][0]["page"], 2);
+    assert_eq!(doc["preview"]["pages"][0]["dpi"], 72);
+}
+
 #[test]
 #[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_reports_located_errors() {

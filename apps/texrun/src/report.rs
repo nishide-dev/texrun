@@ -12,6 +12,12 @@
 //!   "elapsed_ms": 1234,
 //!   "diagnostics": [ { "severity", "kind", "message", "file"?, "line"?, "raw_excerpt"? } ],
 //!   "artifacts": [ { "kind": "pdf", "path": "main.pdf", "size_bytes": 1234 } ],
+//!   // After a successful compile, unless --no-preview (texrun_preview::PreviewReport):
+//!   "preview": { "status": "rendered", "backend": "mupdf", "format": "png",
+//!                "pdf": { "page_count": 3, "pages": [ { "page": 1, "width_pt", "height_pt", "rotation" } ] },
+//!                "pages": [ { "kind": "preview", "path": "preview/page-001.png", "page": 1,
+//!                             "size_bytes", "width_px", "height_px", "dpi" } ],
+//!                "notices": [ { "severity", "kind", "message", "page"?, "detail"? } ] },
 //!   // Absolute host directory the artifact paths are relative to (when collected):
 //!   "output_dir": "/abs/texrun-out",
 //!   // Once the entrypoint was resolved; diagnostic files are relative to `root`:
@@ -35,6 +41,7 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use texrun_core::{CompileOutcome, CompileResult, EngineError};
+use texrun_preview::PreviewReport;
 use texrun_workspace::{ExclusionReason, MaterializeReport, WorkspaceError};
 
 /// Exit codes of `texrun` (documented in the help and README).
@@ -63,6 +70,10 @@ pub struct CompileReport {
     /// Absolute host directory that holds the collected artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+    /// Page previews, when they were attempted (after a successful compile,
+    /// unless `--no-preview`). Their images are also in `artifacts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,18 +291,20 @@ pub fn host_path(path: &Path) -> String {
 }
 
 impl CompileReport {
-    /// The process exit code. `signal` is the signal that cancelled the
-    /// compile, if any.
+    /// The process exit code. `signal` is the first termination signal
+    /// received, if any: an interrupted run exits with `128 + signal` even if
+    /// the compile finished (e.g. Ctrl-C while previews were rendered).
     pub fn exit_code(&self, signal: Option<i32>) -> u8 {
         if let Some(error) = &self.error {
             return error.exit_code();
         }
+        if let Some(code) = signal.and_then(|s| u8::try_from(128 + s).ok()) {
+            return code;
+        }
         match self.result.as_ref().map(|r| r.outcome) {
             Some(CompileOutcome::Succeeded) => exit::SUCCESS,
             Some(CompileOutcome::TimedOut) => exit::TIMED_OUT,
-            Some(CompileOutcome::Cancelled) => signal
-                .and_then(|s| u8::try_from(128 + s).ok())
-                .unwrap_or(exit::CANCELLED),
+            Some(CompileOutcome::Cancelled) => exit::CANCELLED,
             // Failed, and any outcome added later.
             Some(_) => exit::COMPILE_FAILED,
             None => exit::RUNTIME,
@@ -332,6 +345,10 @@ mod tests {
         assert_eq!(
             with_outcome(CompileOutcome::Cancelled).exit_code(Some(15)),
             143
+        );
+        assert_eq!(
+            with_outcome(CompileOutcome::Succeeded).exit_code(Some(2)),
+            130
         );
         let mut report = with_outcome(CompileOutcome::Succeeded);
         report.error = Some(ErrorInfo::new(

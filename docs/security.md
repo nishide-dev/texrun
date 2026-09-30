@@ -127,7 +127,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 
 ## 3. 決定事項
 
-各項目の末尾に実装担当 Issue を記す。値は MVP の定数である。timeout 以外を CLI で上書きできるようにするかは #6 で決める。
+各項目の末尾に実装担当 Issue を記す。値は MVP の定数である。CLI（#6）で変えられるのは compile の timeout（`--timeout`）と preview のページ範囲・DPI（`--pages` / `--preview-dpi`、上限は下表のまま）だけで、それ以外の上限は CLI からは変更できない。
 
 ### 3.1 timeout（#5、CLI 露出は #6）
 
