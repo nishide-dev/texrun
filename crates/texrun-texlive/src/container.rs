@@ -37,6 +37,13 @@ pub const GUEST_PATH: &str = "/usr/bin:/bin";
 /// Where the rc directory is mounted in the container.
 const GUEST_RC_DIR: &str = "/texrun/rc";
 
+/// Where the workspace may be mounted in the container
+/// ([`CompileContext::path_mapping`]): [`DEFAULT_GUEST_ROOT`] or below it,
+/// or below one of the other directories here. Anywhere else the untrusted
+/// workspace could hide the image's own programs and configuration (`/usr`,
+/// `/etc`, ...) or texrun's rc, or collide with the runtime's mounts.
+pub const GUEST_ROOT_PARENTS: &[&str] = &["/srv", "/mnt"];
+
 /// Timeout of `latexmk -v` in a container: includes starting the
 /// container (and, on macOS, possibly the runtime's VM).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -168,6 +175,9 @@ pub struct ContainerEngine {
     runtime: Mutex<Option<Runtime>>,
     /// Version string from the last successful probe.
     version: Mutex<Option<String>>,
+    /// ID of the image, so that compiles use the image the probe reported
+    /// even if its tag moves.
+    image_id: Mutex<Option<String>>,
 }
 
 impl Default for ContainerEngine {
@@ -192,6 +202,7 @@ impl ContainerEngine {
             inner: LatexmkEngine::new(engine),
             runtime: Mutex::new(None),
             version: Mutex::new(None),
+            image_id: Mutex::new(None),
         }
     }
 
@@ -211,6 +222,20 @@ impl ContainerEngine {
         Ok(detected)
     }
 
+    /// The ID of the configured image: the one the last probe saw, or
+    /// looked up now.
+    fn image_id(&self, runtime: &Runtime) -> Result<String, EngineError> {
+        let mut cached = self.image_id.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = cached.as_ref() {
+            return Ok(id.clone());
+        }
+        let id = runtime
+            .image_id(&self.config.image)
+            .map_err(sandbox_error)?;
+        *cached = Some(id.clone());
+        Ok(id)
+    }
+
     /// Compiles like [`TypesetEngine::compile`] and also returns the
     /// captured console output (as [`LatexmkEngine::run`]).
     pub fn run(
@@ -219,23 +244,17 @@ impl ContainerEngine {
         request: &CompileRequest,
     ) -> Result<LatexmkRun, EngineError> {
         request.validate()?;
-        let runtime = self.runtime()?;
         let mapping = match &ctx.path_mapping {
             Some(mapping) => mapping.clone(),
             None => PathMapping::new(DEFAULT_GUEST_ROOT).expect("valid constant"),
         };
-        if mapping.guest_root().starts_with(GUEST_RC_DIR)
-            || Path::new(GUEST_RC_DIR).starts_with(mapping.guest_root())
-        {
-            return Err(EngineError::InvalidRequest(format!(
-                "the workspace cannot be mounted at {} in the container: {GUEST_RC_DIR} is \
-                 texrun's",
-                mapping.guest_root().display()
-            )));
-        }
+        check_guest_root(mapping.guest_root())?;
+        let runtime = self.runtime()?;
+        let image = self.image_id(&runtime)?;
         let sandbox = SandboxRun {
             runtime: &runtime,
             config: &self.config,
+            image,
             mapping,
             latexmk: Path::new(GUEST_LATEXMK),
             search_path: OsStr::new(GUEST_PATH),
@@ -268,7 +287,8 @@ impl TypesetEngine for ContainerEngine {
         let image_id = runtime
             .image_id(&self.config.image)
             .map_err(sandbox_error)?;
-        let spec = container_spec(&self.config, PROBE_TIMEOUT);
+        *self.image_id.lock().unwrap_or_else(PoisonError::into_inner) = Some(image_id.clone());
+        let spec = container_spec(&self.config, &image_id, PROBE_TIMEOUT);
         let container = Container::new(&runtime, spec);
         let job = Job {
             program: Path::new(GUEST_LATEXMK),
@@ -282,7 +302,7 @@ impl TypesetEngine for ContainerEngine {
             start: Start::Container(&container),
             cgroups: None,
         };
-        let finished = process::run(&job).map_err(process::engine_error)?;
+        let (finished, _) = finish(&container, process::run(&job))?;
         drop(container);
         let stdout = String::from_utf8_lossy(&finished.stdout.bytes);
         let version = match (finished.stop, engine::parse_version(&stdout)) {
@@ -325,6 +345,8 @@ impl TypesetEngine for ContainerEngine {
 pub(crate) struct SandboxRun<'a> {
     pub(crate) runtime: &'a Runtime,
     pub(crate) config: &'a ContainerConfig,
+    /// The image, by ID.
+    pub(crate) image: String,
     /// Where the workspace is in the container.
     pub(crate) mapping: PathMapping,
     /// latexmk in the container.
@@ -346,7 +368,7 @@ impl SandboxRun<'_> {
         guest: &GuestPaths,
         timeout: Duration,
     ) -> Container<'_> {
-        let spec = container_spec(self.config, timeout)
+        let spec = container_spec(self.config, &self.image, timeout)
             .with_mount(Mount::read_only(root, &guest.root))
             .with_mount(Mount::writable(output_dir, &guest.output_dir))
             .with_mount(Mount::writable(home, &guest.home))
@@ -355,9 +377,46 @@ impl SandboxRun<'_> {
     }
 }
 
-/// The container settings of `config` for a run with `timeout` (no
-/// mounts).
-fn container_spec(config: &ContainerConfig, timeout: Duration) -> ContainerSpec {
+/// How a supervised run in `container` ended: a container the runtime did
+/// not restrict as asked is [`EngineError::Unavailable`] (fail closed);
+/// the runtime's warnings while creating it are returned as notes.
+pub(crate) fn finish(
+    container: &Container<'_>,
+    result: Result<process::Finished, texrun_process::RunError>,
+) -> Result<(process::Finished, Vec<String>), EngineError> {
+    if let Some(reason) = container.refusal() {
+        return Err(unavailable(reason));
+    }
+    let finished = result.map_err(process::engine_error)?;
+    let notes = container
+        .warnings()
+        .into_iter()
+        .map(|w| format!("container: {w}"))
+        .collect();
+    Ok((finished, notes))
+}
+
+/// Refuses a guest mount point outside [`DEFAULT_GUEST_ROOT`] and
+/// [`GUEST_ROOT_PARENTS`].
+pub(crate) fn check_guest_root(guest: &Path) -> Result<(), EngineError> {
+    let below = |parent: &str| guest.starts_with(parent) && guest != Path::new(parent);
+    let allowed =
+        guest.starts_with(DEFAULT_GUEST_ROOT) || GUEST_ROOT_PARENTS.iter().any(|p| below(p));
+    if allowed {
+        Ok(())
+    } else {
+        Err(EngineError::InvalidRequest(format!(
+            "the workspace cannot be mounted at {} in the container: use {DEFAULT_GUEST_ROOT} \
+             (or a directory below it) or a directory below {}",
+            guest.display(),
+            GUEST_ROOT_PARENTS.join(" or ")
+        )))
+    }
+}
+
+/// The container settings of `config` for a run of `image` with `timeout`
+/// (no mounts).
+fn container_spec(config: &ContainerConfig, image: &str, timeout: Duration) -> ContainerSpec {
     let limits = &config.limits;
     let cpu_budget = Limits::CPU_TIME_MARGIN + Limits::CPU_KILL_GRACE + DEADLINE_MARGIN;
     // A timeout too large for `timeout` in the container: no deadline
@@ -366,7 +425,7 @@ fn container_spec(config: &ContainerConfig, timeout: Duration) -> ContainerSpec 
         .checked_add(cpu_budget)
         .filter(|d| u32::try_from(d.as_secs()).is_ok());
     ContainerSpec::new(
-        config.image.clone(),
+        image,
         ContainerLimits::new(
             limits.max_memory_bytes,
             limits.max_processes,
@@ -419,12 +478,55 @@ mod tests {
     #[test]
     fn the_container_deadline_follows_the_timeout() {
         let config = ContainerConfig::default();
-        let spec = container_spec(&config, Duration::from_secs(60));
+        let spec = container_spec(&config, "sha256:0123", Duration::from_secs(60));
         assert_eq!(spec.deadline, Some(Duration::from_secs(60 + 10 + 5 + 30)));
-        assert_eq!(spec.image, texrun_sandbox::DEFAULT_IMAGE);
+        assert_eq!(spec.image, "sha256:0123");
         assert_eq!(spec.limits, ContainerLimits::new(4 << 30, 64, 2));
-        assert_eq!(container_spec(&config, Duration::MAX).deadline, None);
+        assert_eq!(container_spec(&config, "x", Duration::MAX).deadline, None);
         assert!(spec.mounts.is_empty());
+    }
+
+    #[test]
+    fn the_workspace_is_mounted_only_where_it_hides_nothing() {
+        for ok in [
+            "/workspace",
+            "/workspace/project",
+            "/srv/texrun ws/project",
+            "/mnt/ws",
+        ] {
+            assert!(check_guest_root(Path::new(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "/usr",
+            "/usr/bin",
+            "/usr/share/texlive",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/tmp",
+            "/run",
+            "/var",
+            "/home/u",
+            "/texrun",
+            "/texrun/rc/x",
+            "/srv",
+            "/mnt",
+            "/workspace2",
+        ] {
+            assert!(
+                matches!(
+                    check_guest_root(Path::new(bad)),
+                    Err(EngineError::InvalidRequest(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert!(!Path::new(GUEST_RC_DIR).starts_with(DEFAULT_GUEST_ROOT));
     }
 
     #[test]

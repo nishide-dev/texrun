@@ -151,6 +151,11 @@ fn required(var: &str) -> bool {
 /// shown for a passing test. (cargo-nextest captures the whole process
 /// output; use `--no-capture` there to see it.)
 fn report_skip(what: &'static str, var: &str) {
+    report_skip_with(what, &format!("set {var}=1 to fail instead"));
+}
+
+/// [`report_skip`] with another hint in the parentheses.
+fn report_skip_with(what: &'static str, hint: &str) {
     static REPORTED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
     if reported.contains(&what) {
@@ -165,7 +170,7 @@ fn report_skip(what: &'static str, var: &str) {
     let binary = binary.rsplit_once('-').map_or(binary.as_str(), |(b, _)| b);
     let _ = writeln!(
         std::io::stderr(),
-        "texrun-texlive {binary}: SKIPPED {what} (set {var}=1 to fail instead)"
+        "texrun-texlive {binary}: SKIPPED {what} ({hint})"
     );
 }
 
@@ -243,12 +248,22 @@ macro_rules! require_sandbox {
 #[allow(unused_imports)]
 pub(crate) use require_sandbox;
 
+/// Tells (once per test binary) that tests were skipped because they need
+/// TeX Live on the host.
+pub fn report_host_only() {
+    report_skip_with(
+        "host-only tests: they need TeX Live on the host",
+        &format!("they run without {TEST_BACKEND_ENV}=container"),
+    );
+}
+
 /// Returns from the calling test when the default engine is the container
 /// backend: the test needs TeX Live on the host itself.
 #[allow(unused_macros)]
 macro_rules! host_only {
     () => {
         if common::container_backend() {
+            common::report_host_only();
             return;
         }
     };

@@ -72,7 +72,7 @@ mod rc;
 
 pub use container::{
     CONTAINER_ENGINE_NAME, ContainerConfig, ContainerEngine, DEFAULT_GUEST_ROOT, GUEST_LATEXMK,
-    GUEST_PATH,
+    GUEST_PATH, GUEST_ROOT_PARENTS,
 };
 pub use engine::{
     DEFAULT_TIMEOUT, ENGINE_NAME, LATEXMK_PROGRAM, LatexmkConfig, LatexmkEngine, LatexmkRun,

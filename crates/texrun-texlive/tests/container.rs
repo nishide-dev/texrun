@@ -18,8 +18,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use common::{
-    Compile, assert_location, assert_outcome, assert_pdf, container_engine, copy_tree, describe,
-    find, fixture, has, plain_tempdir, require_sandbox,
+    Compile, TestEngine, assert_location, assert_outcome, assert_pdf, container_engine, copy_tree,
+    describe, find, fixture, has, host_only, plain_tempdir, require_sandbox, require_texlive,
 };
 use tempfile::TempDir;
 use texrun_core::{
@@ -86,9 +86,20 @@ fn the_result_names_the_container_backend() {
 /// `P/project` is the `security/sandbox` fixture with `probe-path.tex`
 /// naming `probe_path`; `P/outside-probe.txt` is a host file outside the
 /// workspace.
-/// Returns the directory, the PDF (empty if there is none) and a
-/// description of the run.
-fn embed(probe_path: impl FnOnce(&Path) -> String) -> (TempDir, Vec<u8>, String) {
+struct Embedded {
+    _dir: TempDir,
+    outcome: CompileOutcome,
+    /// The PDF (empty if there is none).
+    pdf: Vec<u8>,
+    /// The main log (empty if there is none).
+    log: String,
+    /// The whole run, for failure messages.
+    run: String,
+}
+
+/// Compiles the `security/sandbox` fixture with `engine`, the probe path
+/// being `probe_path(P)`.
+fn embed(engine: TestEngine, probe_path: impl FnOnce(&Path) -> String) -> Embedded {
     let dir = plain_tempdir();
     let project = dir.path().join("project");
     copy_tree(&fixture("security/sandbox"), &project);
@@ -105,13 +116,26 @@ fn embed(probe_path: impl FnOnce(&Path) -> String) -> (TempDir, Vec<u8>, String)
     .unwrap();
     let (run, ws) = Compile::new(&project, "embed.tex")
         .config(WorkspaceConfig::default().with_temp_parent(dir.path()))
-        .engine(engine())
+        .engine(engine)
         .run();
-    let pdf = fs::read(ws.output_dir().join("embed.pdf")).unwrap_or_default();
-    let summary = describe(&run);
+    let embedded = Embedded {
+        outcome: run.result.outcome,
+        pdf: fs::read(ws.output_dir().join("embed.pdf")).unwrap_or_default(),
+        log: fs::read_to_string(ws.output_dir().join("embed.log")).unwrap_or_default(),
+        run: describe(&run),
+        _dir: dir,
+    };
     drop(ws);
-    (dir, pdf, summary)
+    embedded
 }
+
+/// The absolute host path of the file outside the workspace, and the same
+/// through `..` from the workspace root and from its parent.
+const OUTSIDE_PROBES: [fn(&Path) -> String; 3] = [
+    |dir: &Path| format!("{}/outside-probe.txt", dir.display()),
+    |_| "../outside-probe.txt".to_owned(),
+    |_| "../../outside-probe.txt".to_owned(),
+];
 
 fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack
@@ -124,19 +148,49 @@ fn files_outside_the_workspace_cannot_be_embedded() {
     require_sandbox!();
     let _serial = serial();
     // Control: a file inside the workspace is embedded into the PDF.
-    let (_dir, pdf, run) = embed(|_| "inside-probe.txt".to_owned());
-    assert!(contains(&pdf, "texrun-inside-marker"), "{run}");
+    let inside = embed(engine().into(), |_| "inside-probe.txt".to_owned());
+    assert_eq!(inside.outcome, CompileOutcome::Succeeded, "{}", inside.run);
+    assert!(
+        contains(&inside.pdf, "texrun-inside-marker"),
+        "{}",
+        inside.run
+    );
 
     // The same primitive with a host path outside the workspace, absolute
-    // or through `..`: the host file does not exist in the container.
-    for probe in [
-        (|dir: &Path| format!("{}/outside-probe.txt", dir.display())) as fn(&Path) -> String,
-        |_| "../outside-probe.txt".to_owned(),
-        |_| "../../outside-probe.txt".to_owned(),
-    ] {
-        let (_dir, pdf, run) = embed(probe);
-        assert!(!contains(&pdf, "texrun-outside-marker"), "{run}");
+    // or through `..`: the host file does not exist in the container, so
+    // pdfTeX stops because it cannot open it (and not for another reason).
+    for probe in OUTSIDE_PROBES {
+        let outside = embed(engine().into(), probe);
+        assert!(
+            !contains(&outside.pdf, "texrun-outside-marker"),
+            "{}",
+            outside.run
+        );
+        assert_eq!(outside.outcome, CompileOutcome::Failed, "{}", outside.run);
+        assert!(
+            outside.log.contains("cannot open file for embedding"),
+            "{}\n{}",
+            outside.run,
+            outside.log
+        );
     }
+}
+
+/// Control for the test above: on the host, this primitive is one of the
+/// reads kpathsea's paranoid mode does not check (docs/security.md §2,
+/// "保証しない"), so the same fixture does reach the outside file. This
+/// shows that the test above can tell a leak from a refusal.
+#[test]
+fn the_host_backend_does_not_hide_the_host_from_file_embedding() {
+    host_only!();
+    require_texlive!();
+    let _serial = serial();
+    let leaked = embed(LatexmkEngine::default().into(), OUTSIDE_PROBES[0]);
+    assert!(
+        contains(&leaked.pdf, "texrun-outside-marker"),
+        "{}",
+        leaked.run
+    );
 }
 
 #[test]
@@ -267,11 +321,23 @@ fn diagnostics_are_workspace_relative_with_any_mount_point() {
 }
 
 #[test]
-fn a_mount_point_over_texruns_own_is_refused() {
-    require_sandbox!();
+fn a_mount_point_that_would_hide_the_image_is_refused() {
+    // Refused before the runtime is looked for.
     let compile = Compile::fixture("minimal", "main.tex");
     let ws = compile.workspace();
-    for guest in ["/texrun", "/texrun/rc/x"] {
+    for guest in [
+        "/texrun",
+        "/texrun/rc/x",
+        "/usr",
+        "/usr/bin",
+        "/bin",
+        "/etc",
+        "/lib",
+        "/tmp",
+        "/proc",
+        "/home/u",
+        "/srv",
+    ] {
         let ctx = ws
             .context()
             .with_path_mapping(PathMapping::new(guest).unwrap());

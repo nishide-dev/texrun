@@ -17,8 +17,8 @@
 //! - only the [`Mount`]s given, each read-only unless marked writable:
 //!   nothing else of the host filesystem is visible;
 //! - `--cap-drop ALL`, `--security-opt no-new-privileges`, `--ipc none`;
-//! - a non-root user: the uid / gid of texrun (or 65534 when texrun runs as
-//!   root, which never becomes root in the container either);
+//! - a non-root user: the uid / gid of texrun (or [`ROOT_FALLBACK_ID`], the
+//!   image's own user, when texrun runs as root);
 //! - `--pids-limit`, `--memory` (= `--memory-swap`, no swap) and `--cpus`
 //!   from [`ContainerLimits`], and the [`Spec::rlimits`](texrun_process::Spec::rlimits)
 //!   as `--ulimit` (`RLIMIT_AS`, which the runtimes do not accept, through
@@ -35,7 +35,10 @@
 //! # Lifecycle
 //!
 //! [`Launcher::command`](texrun_process::Launcher::command) creates the
-//! container (`create`, with a unique name and the label [`LABEL`]) and
+//! container (`create`, with a unique name and the label [`LABEL`]), reads
+//! back the restrictions the runtime recorded (`inspect`; a runtime that
+//! dropped one, e.g. a limit its kernel does not support, fails the run
+//! instead of starting a weaker container, [`Container::refusal`]) and
 //! returns `start --attach`, which the supervisor spawns and watches like any
 //! program: its stdout / stderr are the container's, its exit status the
 //! container's. Killing the runtime CLI does not stop a container, so the
@@ -68,6 +71,7 @@ mod runtime;
 
 pub use container::{
     Container, ContainerLimits, ContainerOutcome, ContainerSpec, ContainerUser, Mount,
+    ROOT_FALLBACK_ID,
 };
 pub use error::SandboxError;
 pub use runtime::{RUNTIME_ENV, Runtime, RuntimeKind};

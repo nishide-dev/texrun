@@ -129,7 +129,8 @@ pub struct CompileArgs {
     /// container of the engine image (Docker or Podman) that sees only the
     /// workspace, with no network, a read-only filesystem and no privileges
     /// (docs/security.md §2, §4). Use container for documents you do not
-    /// trust. Page previews are rendered on the host with either backend.
+    /// trust, together with --no-preview: page previews are still rendered on
+    /// the host with either backend.
     #[arg(long, value_enum, value_name = "BACKEND", default_value = "host")]
     pub backend: EngineBackend,
 

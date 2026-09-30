@@ -158,13 +158,36 @@ impl Runtime {
             }
         }
         version.clone_into(&mut runtime.version);
-        if kind == RuntimeKind::Podman {
-            // Rootless Podman maps container uids to subordinate ids of the
-            // user; `--userns keep-id` keeps texrun's uid, so that the
-            // container can write the output directory.
-            runtime.rootless = runtime
-                .query(&["info", "--format", "{{.Host.Security.Rootless}}"])
-                .is_ok_and(|out| out.trim() == "true");
+        match kind {
+            RuntimeKind::Docker => {
+                // Bind mounts name host paths of the daemon's machine: only
+                // a daemon on this machine (a Unix socket; Docker Desktop and
+                // OrbStack forward theirs to their VM) sees texrun's
+                // workspace.
+                let endpoint = runtime
+                    .query(&[
+                        "context",
+                        "inspect",
+                        "--format",
+                        "{{.Endpoints.docker.Host}}",
+                    ])
+                    .map_err(|e| SandboxError::Unavailable(format!("{kind} is not usable: {e}")))?;
+                check_local_endpoint(kind, endpoint.trim())?;
+                if let Some(host) = runtime.env.get("DOCKER_HOST") {
+                    check_local_endpoint(kind, &host.to_string_lossy())?;
+                }
+            }
+            RuntimeKind::Podman => {
+                // `podman version` answers without a usable service (e.g. a
+                // stopped `podman machine`); `podman info` does not.
+                // Rootless Podman maps container uids to subordinate ids of
+                // the user; `--userns keep-id` keeps texrun's uid, so that
+                // the container can write the output directory.
+                let rootless = runtime
+                    .query(&["info", "--format", "{{.Host.Security.Rootless}}"])
+                    .map_err(|e| SandboxError::Unavailable(format!("{kind} is not usable: {e}")))?;
+                runtime.rootless = rootless.trim() == "true";
+            }
         }
         Ok(runtime)
     }
@@ -221,6 +244,16 @@ impl Runtime {
         args: &[OsString],
         timeout: Duration,
     ) -> Result<String, SandboxError> {
+        self.exec_output(args, timeout).map(|(stdout, _)| stdout)
+    }
+
+    /// [`Self::exec`], also returning the stderr of a successful command
+    /// (e.g. the warnings of `create`).
+    pub(crate) fn exec_output(
+        &self,
+        args: &[OsString],
+        timeout: Duration,
+    ) -> Result<(String, String), SandboxError> {
         let command = format!(
             "{} {}",
             self.kind,
@@ -250,7 +283,10 @@ impl Runtime {
                 message.to_owned()
             }));
         }
-        Ok(String::from_utf8_lossy(&finished.stdout.bytes).into_owned())
+        Ok((
+            String::from_utf8_lossy(&finished.stdout.bytes).into_owned(),
+            stderr.into_owned(),
+        ))
     }
 }
 
@@ -282,6 +318,19 @@ fn runtime_env() -> EnvAllowlist {
         }
     }
     env
+}
+
+/// Refuses a Docker endpoint on another machine (`tcp://`, `ssh://`, ...):
+/// its bind mounts would name paths there, not texrun's workspace.
+fn check_local_endpoint(kind: RuntimeKind, endpoint: &str) -> Result<(), SandboxError> {
+    if endpoint.starts_with("unix://") {
+        Ok(())
+    } else {
+        Err(SandboxError::Unavailable(format!(
+            "{kind} uses the daemon at {endpoint:?}; texrun needs a local daemon (a unix:// \
+             socket), because the workspace is mounted by its host path"
+        )))
+    }
 }
 
 /// An executable file called `name` in `path`.
@@ -337,6 +386,27 @@ mod tests {
         assert_eq!(parse_version("4"), None);
         assert!((20, 10) >= RuntimeKind::Docker.min_version());
         assert!((19, 3) < RuntimeKind::Docker.min_version());
+    }
+
+    #[test]
+    fn only_local_docker_endpoints_are_used() {
+        let docker = RuntimeKind::Docker;
+        assert!(check_local_endpoint(docker, "unix:///var/run/docker.sock").is_ok());
+        assert!(check_local_endpoint(docker, "unix:///Users/u/.orbstack/run/docker.sock").is_ok());
+        for remote in [
+            "tcp://10.0.0.1:2376",
+            "ssh://host",
+            "npipe:////./pipe/x",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    check_local_endpoint(docker, remote),
+                    Err(SandboxError::Unavailable(_))
+                ),
+                "{remote}"
+            );
+        }
     }
 
     #[test]

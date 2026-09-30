@@ -148,7 +148,7 @@ fn the_container_is_isolated_and_unprivileged() {
         r#"
 echo "uid=$(id -u)"
 echo "gid=$(id -g)"
-sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
+sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p; s/^Seccomp:\t*/seccomp=/p' /proc/self/status
 echo "net=$(ls /sys/class/net | tr '\n' ' ')"
 if touch /usr/texrun-probe 2>/dev/null; then echo root_fs=writable; else echo root_fs=read-only; fi
 if touch /tmp/probe 2>/dev/null; then echo tmp=writable; else echo tmp=read-only; fi
@@ -179,6 +179,8 @@ echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     assert_eq!(get("uid"), rustix_uid(), "{text}");
     assert_eq!(get("capeff"), "0000000000000000", "{text}");
     assert_eq!(get("nonewprivs"), "1", "{text}");
+    // The runtime's default seccomp profile is in force (filter mode).
+    assert_eq!(get("seccomp"), "2", "{text}");
     assert_eq!(get("net"), "lo", "no network but loopback: {text}");
     assert_eq!(get("root_fs"), "read-only", "{text}");
     assert_eq!(get("tmp"), "writable", "{text}");
@@ -203,7 +205,11 @@ fn rustix_uid() -> &'static str {
     UID.get_or_init(|| {
         let out = Command::new("id").arg("-u").output().unwrap();
         let uid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if uid == "0" { "65534".to_owned() } else { uid }
+        if uid == "0" {
+            texrun_sandbox::ROOT_FALLBACK_ID.to_string()
+        } else {
+            uid
+        }
     })
 }
 

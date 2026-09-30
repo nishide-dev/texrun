@@ -119,18 +119,19 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
    - これは読み込み経路によらない。paranoid mode の検査が及ばない font 関連の読み込みや、PDF object にファイルを直接埋め込む pdfTeX の primitive でも、workspace と image の外は読めない。
    - workspace の入力ファイルも書き換えられない（書き込めるのは output dir と `HOME` だけ）。
 2. **network は無い**（`--network none`。loopback だけ）。compile は network 無しで行われる（#24 の sandbox backend の部分）。
-3. **engine は権限を持たない。** non-root user（texrun を起動したユーザーの uid / gid。texrun が root の場合は 65534）で動き、capability は全て落とし（`--cap-drop ALL`）、`no-new-privileges` で setuid などによる権限の獲得もできない。root filesystem は read-only で、書き込めるのは `/tmp`（`noexec` の小さい tmpfs）と上の mount だけである。
-4. **process tree 全体の memory・プロセス数・CPU を常に制限する**（container の cgroup。§3.10 の値）。委譲された cgroup の有無（in-process 実行の `--cgroup`）に関係なく、macOS でも（runtime の VM の中で）効く。
-5. **timeout / cancel / texrun の終了で container を残さない。** container は texrun が名前と label を付けて作り、停止のたびに `rm --force` で消す。texrun 自身が強制終了された場合も、container の中の `timeout` が compile の timeout + 45 秒で engine を止める（§4）。
-6. **画像・PDF を解析するコードの脆弱性の影響は、container の中に閉じる**（1〜3 の範囲。container runtime と kernel の境界を信頼する）。
+3. **engine は権限を持たない。** non-root user（texrun を起動したユーザーの uid / gid。texrun が root の場合は image の専用 user の 10001）で動き、capability は全て落とし（`--cap-drop ALL`）、`no-new-privileges` で setuid などによる権限の獲得もできない。root filesystem は read-only で、書き込めるのは `/tmp`（`noexec` の小さい tmpfs）と上の mount だけである。
+4. **process tree 全体の memory・プロセス数・CPU を常に制限する**（container の cgroup。§3.10 の値）。委譲された cgroup の有無（in-process 実行の `--cgroup`）に関係なく、macOS でも（runtime の VM の中で）効く。runtime が上限や制限を黙って捨てた場合（kernel が対応していない場合など）は、container を起動せずに `EngineError::Unavailable` で失敗する（fail-closed。`create` の後に runtime の記録を確かめる、§4）。
+5. **timeout / cancel で container を残さない。** container は texrun が名前と label を付けて作り、停止のたびに `rm --force` で消す。texrun 自身が強制終了（`SIGKILL` など）された場合は、container の中の `timeout` が compile の timeout + 45 秒で engine を止める（中の CPU 時間の上限が先に効くこともある）が、**停止した container と runtime の CLI のプロセスは残りうる**。label で見つけて消す（`docker ps -a --filter label=org.texrun.sandbox`、自動の回収は #49）。
+6. **engine（pdfTeX と、それが使う画像ライブラリ）の脆弱性の影響は、container の中に閉じる**（1〜3 の範囲。container runtime と kernel の境界を信頼する）。preview tool は host で動き、engine が作った PDF を解析する（§4「preview」）。engine が侵害された場合、その PDF は攻撃者の管理下にあるとみなす。#46 までは、信頼できない文書では `--no-preview` も併用する。
 
 検証は次の test で行い、CI の `sandbox` job で毎回実行する（[development.md](development.md#container-backend-test)）。#10 の fixture（`scenarios.rs`、`security.rs`）も、`TEXRUN_TEST_BACKEND=container` で sandbox backend を使って全て実行する（host の TeX Live を直接使う 2 件を除く）。
 
 | 保証 | test |
 | --- | --- |
-| 非 root、capability 無し、`no-new-privileges`、network は loopback だけ、root filesystem と workspace が read-only、output dir だけ書き込める、mount していない host のディレクトリが見えない、env が allowlist だけ、cgroup の `pids.max` / `memory.max` / `cpu.max`、rlimit | `crates/texrun-sandbox/tests/container.rs`（TeX を使わない `sh` の script） |
+| 非 root、capability 無し、`no-new-privileges`、runtime の既定の seccomp profile（`Seccomp: 2`）、network は loopback だけ、root filesystem と workspace が read-only、output dir だけ書き込める、mount していない host のディレクトリが見えない、env が allowlist だけ、cgroup の `pids.max` / `memory.max` / `cpu.max`、rlimit | `crates/texrun-sandbox/tests/container.rs`（TeX を使わない `sh` の script） |
 | timeout・cancel・drop で container が消える、container 内の deadline、OOM kill の記録 | 同上 |
-| PDF object への埋め込みでも workspace 外の host のファイルが読めない（絶対パス、`..`。対照: workspace 内のファイルは埋め込める） | `crates/texrun-texlive/tests/container.rs`: `files_outside_the_workspace_cannot_be_embedded` |
+| runtime の記録（`HostConfig`）に上限・制限が無い container は起動せずに消す。`create` が失敗したら名前で消す | `crates/texrun-sandbox/src/container.rs` の unit test（値の違う `inspect` を返す fake runtime） |
+| PDF object への埋め込みでも workspace 外の host のファイルが読めない（絶対パス、`..`。ファイルを開けずに失敗したことも確認する。対照: workspace 内のファイルは埋め込め、host backend では同じ fixture で外のファイルに届く） | `crates/texrun-texlive/tests/container.rs`: `files_outside_the_workspace_cannot_be_embedded`、`the_host_backend_does_not_hide_the_host_from_file_embedding`（host backend、`integration` job） |
 | texmf ツリーは image のもの | 同: `the_texmf_tree_is_the_images` |
 | container 内でも CPU 時間・address space の上限で `resource_limit` になる、timeout / cancel で container が残らない | 同: `the_cpu_time_limit_applies_in_the_container` など |
 | diagnostics の path が、mount 先（既定の `/workspace`、任意の path）によらず workspace 相対になる | 同: `diagnostics_are_workspace_relative_with_any_mount_point`、`apps/texrun/tests/container.rs` |
@@ -163,6 +164,7 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 - **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。sandbox backend では、破れても上の 1〜4 の範囲に留まる。
 - **sandbox backend でも保証しないもの:**
   - container runtime・OCI runtime（runc など）・Linux kernel の脆弱性による container からの脱出。より強い隔離（gVisor の `runsc`、microVM）は §4 の比較に留める。
+  - preview tool の脆弱性（preview は host で動く、上の 6・§4「preview」。#46）。
   - workspace と output dir の中身は container から読める・書ける（in-process 実行と同じ。入力は read-only だが、書き込める場所は §3.2 のサイズ上限だけで、ファイル数は制限しない）。
   - プロセス数の上限（`pids.max`）に達したことの判定。container の cgroup の event を texrun は読まないので、fork の失敗を perl が再試行し続けた場合は timeout として報告される（memory の上限は OOM kill の記録で判定する。#49）。
   - rootless mode の Docker（`dockerd-rootless`）は想定していない（#47）。container の uid が host の subordinate uid に写るので、output dir に書けずに compile が失敗する（安全側には倒れる）。
@@ -578,7 +580,8 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 | microVM（Firecracker 等） | VM 境界による強い隔離 | image と起動の管理が複雑で、KVM が必須 | 比較に留める |
 
 - **runtime は CLI で呼ぶ。** `docker` / `podman` の実行ファイルを PATH（絶対パスの entry だけ）から探し、shell を使わず argv の配列で起動する。runtime の CLI は、daemon に接続するための変数（`DOCKER_HOST`、`XDG_RUNTIME_DIR` など、`texrun_sandbox::RUNTIME_ENV`）だけを持つ allowlist の環境で動く。engine に渡す環境とは別である。
-- **runtime の検出と version の確認。** `--container-runtime auto`（既定）は Docker、次に Podman の順に、インストールされていて応答するものを使う。Docker は daemon の version（`Server.Version`）、Podman は client の version を読み、Docker 20.10 / Podman 4.0 未満と、Linux 以外の container を動かす daemon は使わない。runtime か image が無い場合は `EngineError::Unavailable`（CLI は exit 3、`error.stage = "probe"`）で、project をコピーする前に終わる。
+- **runtime の検出と version の確認。** `--container-runtime auto`（既定）は Docker、次に Podman の順に、インストールされていて応答するものを使う。Docker は daemon の version（`Server.Version`）、Podman は client の version を読み、Docker 20.10 / Podman 4.0 未満と、Linux 以外の container を動かす daemon は使わない。
+- **runtime は local のものに限る。** bind mount の source は daemon 側の host の path として解釈されるので、Docker は endpoint（現在の context と `DOCKER_HOST`）が `unix://` の socket の場合だけ使い、`tcp://` / `ssh://` などは `Unavailable` にする（Docker Desktop・OrbStack の socket は local）。Podman は `podman info` が応答することも必須にする（`podman machine` が止まっている場合を probe で検出する）。Podman の remote 接続（`podman machine` の既定）の場合、共有されている host の path だけが mount できる。runtime か image が無い場合は `EngineError::Unavailable`（CLI は exit 3、`error.stage = "probe"`）で、project をコピーする前に終わる。
 - **image は texrun が pull しない**（`--pull never`）。compile 中に network へ出ないこと、使う image を利用者が明示的に用意することのためである。
 
 ### engine image
@@ -586,7 +589,7 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 `docker/engine/Dockerfile`。dev image（`docker/dev`）とは別の、最小の runtime image である。
 
 - base は `debian:trixie-slim` を multi-arch index の digest で固定し、Dependabot が digest を更新する。
-- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview を sandbox 内で動かすとき（#46）のために、MuPDF と Poppler も入れる。Rust toolchain やコンパイラは入れない。
+- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（MuPDF / Poppler）は、preview を sandbox 内で動かす #46 で入れる（それまでは使われず、image の攻撃面と AGPL / GPL の配布条件が増えるだけのため）。Rust toolchain やコンパイラは入れない。
 - 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
 - texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout`（coreutils）、`/usr/bin/prlimit`（util-linux）。
 - CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image 名は `texrun-engine:latest`（`--container-image` で変えられる）。registry への公開は #48 で扱う。
@@ -600,7 +603,7 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
 | network | `--network none` | network 無し（#24） |
 | root filesystem | `--read-only`、`/tmp` だけ `tmpfs`（`noexec,nosuid,nodev`、64 MiB） | image（texmf を含む）を書き換えさせない |
 | mount | workspace を `/workspace` に read-only、output dir と `HOME`（`.texrun/home`）をその位置に書き込み可、rc のディレクトリを `/texrun/rc` に read-only。ほかは何も mount しない | host の filesystem を workspace 以外見せない。入力を書き換えさせない |
-| user | texrun の euid / egid（texrun が root なら 65534。書き込み可の mount はその uid に渡す）。root では動かさない。rootless Podman では `--userns keep-id` も付ける | 非 root。書いたファイルは texrun のユーザーのものになる |
+| user | texrun の euid / egid（texrun が root なら image の `texrun` user の 10001。host の既存の user（`nobody` など）と共有しない。書き込み可の mount はその uid に渡す）。root では動かさない。rootless Podman では `--userns keep-id` も付ける | 非 root。書いたファイルは texrun のユーザーのものになる |
 | 権限 | `--cap-drop ALL`、`--security-opt no-new-privileges`、`--ipc none` | capability と権限の獲得を無くす |
 | 上限 | `--memory` = `--memory-swap`（4 GiB、swap 無し）、`--pids-limit 64`、`--cpus 2`、`--ulimit`（CPU 時間・ファイルサイズ・core）、container 内の `prlimit`（address space） | §3.10 の既定値と揃える |
 | 環境変数 | §3.4 の allowlist を `--env` で渡す（`PATH` は image の `/usr/bin:/bin`、`HOME` は container 内の path）。runtime が付ける `HOSTNAME`（`texrun`）以外は無い | host の環境変数を渡さない |
@@ -613,21 +616,24 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
 ### container のライフサイクル
 
 - texrun は container を `create`（名前 `texrun-<pid>-<n>-<nanos>` と label `org.texrun.sandbox=1`、`org.texrun.sandbox.pid=<pid>`）で作り、`start --attach` を supervisor（§3.6）の子プロセスとして起動する。stdout / stderr と終了コードは container のもので、latexmk の終了（`128 + signal` を含む、§3.10）はそのまま判定に使える。
+- **作った container の制限を確かめる（fail-closed）。** daemon は、kernel や cgroup の構成が対応していない上限（`--memory` など）を、stderr に警告を出すだけで捨てて `create` に成功する。そのため texrun は `create` の後に `inspect` で `HostConfig` を読み、memory / memory+swap / pids / CPU、`--ulimit`、network mode、read-only の root、capability、`no-new-privileges`、privileged でないこと、seccomp などの profile を無効にしていないことを、要求と照合する。一つでも違えば container を起動せずに消し、`EngineError::Unavailable`（CLI は exit 3）にする。`create` の stderr（警告）は、結果の `resource_limits.notes` に `container: ...` として残す。
+- `create` 自体が失敗・timeout した場合も、daemon 側で作られている可能性があるので、texrun が付けた名前で `rm --force` を 1 回試みる。
+- compile は、probe で確かめた image の ID（`sha256:...`）で `create` する。probe と compile の間に tag が付け替えられても、`engine.version` で報告した image が使われる。
 - runtime の CLI を kill しても container は止まらない。そのため supervisor の kill のたび（timeout、cancel、出力上限、正常終了の後の念のための kill）に、container の状態（OOM kill、終了コード）を読んでから `rm --force` で消す（中で動いているものも kill される）。消せなかった場合は、reap の後と texrun 側の値の drop で再試行する。`create` した container は、`start` しなかった場合も含めて、texrun の全ての経路で消える。
-- texrun 自身が `SIGKILL` などで終了した場合は、container が残りうる。その場合も、container の中の `timeout --signal=KILL` が compile の timeout + 45 秒（CPU 時間の余裕 15 秒 + 30 秒）で engine を止め、container は終了する。残った container は label で見つけて消せる（`docker ps -a --filter label=org.texrun.sandbox`）。次回の起動時に自動で回収することは #49 で扱う。
+- texrun 自身が `SIGKILL` などで終了した場合は、container（と `start --attach` の runtime の CLI）が残る。その場合も、container の中の `timeout --signal=KILL` が compile の timeout + 45 秒（CPU 時間の余裕 15 秒 + 30 秒）で engine を止め（中の CPU 時間の上限が先に効くこともある）、container は停止した状態で残る。残った container は label で見つけて消せる（`docker ps -a --filter label=org.texrun.sandbox`）。次回の起動時に自動で回収することは #49 で扱う。
 - 実測（OrbStack、macOS、arm64）: 1 ページの文書で CLI 全体が約 1.4 秒（probe の `latexmk -v` の container、compile の container の作成・削除を含む）、そのうち container の中の latexmk の実行は約 0.2 秒だった。
 
 ### path mapping と diagnostics
 
 - `CompileRequest` と `CompileResult` は `WorkspacePath`（workspace root 相対）だけでファイルを参照するので、backend によらず同じである。
-- container の中で workspace が見える場所は、`CompileContext::path_mapping`（`texrun_core::PathMapping`）で表す。`ContainerEngine` は、context に mapping が無ければ `/workspace` を使い、あればその path に mount する（`/texrun` と重なる path は `InvalidRequest`）。host で latexmk を動かす `LatexmkEngine` は、mapping のある context を `Unsupported` で拒否する。
+- container の中で workspace が見える場所は、`CompileContext::path_mapping`（`texrun_core::PathMapping`）で表す。`ContainerEngine` は、context に mapping が無ければ `/workspace` を使い、あればその path に mount する。mount 先は `/workspace`（とその下）か、`/srv` / `/mnt` の下だけを許し（`texrun_texlive::GUEST_ROOT_PARENTS`）、それ以外は `InvalidRequest` にする。`/usr` や `/etc` などに mount すると、信頼できない workspace が image の実行ファイルや設定（latexmk、`timeout`、`prlimit`、pdflatex）を覆い隠し、§3 の層が container の中で意味を持たなくなるためである（`/texrun` の rc、runtime の mount する `/proc` / `/dev` / `/tmp` などとの衝突も防ぐ）。host で latexmk を動かす `LatexmkEngine` は、mapping のある context を `Unsupported` で拒否する。
 - engine は、latexmk に渡す path だけを mapping で container の path にし、workspace の読み書き（出力の収集、log と source の読み込み）は host の path で行う。log の parser には、TeX が見ていた working directory（container の path）を root として渡すので、log の中の絶対パスも workspace 相対の `Diagnostic::file` になる。mount 先を変えても diagnostics が同じになることを test で確認している。
 
 ### preview
 
 - preview（#8）は、どちらの backend でも **host で** 動かす（exec gate、rlimit、`--cgroup`、§3.2・3.10）。
 - 理由: preview tool の起動は 1 回の preview で最大数百回あり（ページごとの描画）、container の起動のオーバーヘッドがそのまま掛かる。また、preview の出力先と tool の path の対応を、engine と同じ path mapping で扱う設計（`texrun-preview` への launcher の導入）が別に要る。MVP では compile の隔離を優先した。
-- そのため、sandbox backend でも preview tool（poppler / MuPDF）の脆弱性と network は、in-process 実行と同じ扱いである（§2 の「保証しない」）。engine image には preview tool を入れてあり、sandbox 内での preview は #46 で扱う。
+- そのため、sandbox backend でも preview tool（poppler / MuPDF）の脆弱性と network は、in-process 実行と同じ扱いである（§2 の「保証しない」）。sandbox 内での preview は #46 で扱う（engine image にも preview tool をそこで入れる）。#46 までは、信頼できない文書では `--no-preview` も併用する（README）。
 
 ### CLI
 

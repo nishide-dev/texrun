@@ -29,8 +29,9 @@ const PRLIMIT: &str = "/usr/bin/prlimit";
 /// [`ContainerSpec::deadline`].
 const TIMEOUT: &str = "/usr/bin/timeout";
 
-/// The uid / gid used when texrun runs as root: `nobody`.
-const NOBODY: u32 = 65534;
+/// The uid / gid used when texrun runs as root: the image's `texrun` user,
+/// not an id that other host processes (e.g. `nobody`) share.
+pub const ROOT_FALLBACK_ID: u32 = 10001;
 
 /// A host directory made visible in the container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,8 +122,9 @@ impl ContainerLimits {
 #[non_exhaustive]
 pub enum ContainerUser {
     /// texrun's effective uid / gid, so that files written to writable
-    /// mounts belong to the user who runs texrun; `65534:65534` if that
-    /// is root (the writable mounts are then handed to that user first).
+    /// mounts belong to the user who runs texrun; [`ROOT_FALLBACK_ID`] if
+    /// that is root (the writable mounts are then handed to that user
+    /// first).
     #[default]
     Host,
     /// This uid / gid (must not be 0).
@@ -223,6 +225,11 @@ struct State {
     removed: bool,
     /// What was read before removing it.
     outcome: Option<ContainerOutcome>,
+    /// What the runtime printed on stderr while creating it (warnings).
+    warnings: Vec<String>,
+    /// Why the created container was not started: the runtime did not
+    /// apply a restriction that was asked for.
+    refusal: Option<String>,
 }
 
 /// One container for one supervised run: pass it to
@@ -271,6 +278,20 @@ impl<'r> Container<'r> {
     /// removed; `None` if it was never created or could not be inspected.
     pub fn outcome(&self) -> Option<ContainerOutcome> {
         self.lock().outcome
+    }
+
+    /// What the runtime printed on stderr while creating the container
+    /// (e.g. that the kernel does not support a limit), one line each.
+    pub fn warnings(&self) -> Vec<String> {
+        self.lock().warnings.clone()
+    }
+
+    /// Why the container was created but not started: the runtime's own
+    /// record of it (`inspect`) lacks a restriction that was asked for,
+    /// e.g. a limit that the runtime dropped. [`Launcher::command`] then
+    /// fails with [`RunError::Unsupported`] and the container is removed.
+    pub fn refusal(&self) -> Option<String> {
+        self.lock().refusal.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -381,20 +402,14 @@ impl<'r> Container<'r> {
                 .rlimits
                 .get_soft_hard(resource)
                 .expect("listed by iter");
-            let name = match resource {
-                Resource::FileSize => "fsize",
-                Resource::Core => "core",
-                Resource::Cpu => "cpu",
-                Resource::Processes => "nproc",
-                Resource::AddressSpace => {
-                    address_space = Some((soft, hard));
-                    continue;
-                }
-                other => {
-                    return Err(SandboxError::Invalid(format!(
-                        "{other:?} cannot be limited in a container"
-                    )));
-                }
+            if resource == Resource::AddressSpace {
+                address_space = Some((soft, hard));
+                continue;
+            }
+            let Some(name) = ulimit_name(resource) else {
+                return Err(SandboxError::Invalid(format!(
+                    "{resource:?} cannot be limited in a container"
+                )));
             };
             args.extend(["--ulimit".into(), format!("{name}={soft}:{hard}").into()]);
         }
@@ -442,6 +457,36 @@ impl<'r> Container<'r> {
         args.push(c.image.clone().into());
         args.extend(rest.iter().cloned());
         Ok(args)
+    }
+
+    /// What `inspect` must show for a container created for `spec`.
+    fn expected(&self, spec: &Spec<'_>) -> Expected {
+        let limits = &self.spec.limits;
+        let ulimits = spec
+            .rlimits
+            .iter()
+            .filter_map(|(resource, _)| {
+                let name = ulimit_name(resource)?;
+                let (soft, hard) = spec.rlimits.get_soft_hard(resource)?;
+                Some((name.to_owned(), soft, hard))
+            })
+            .collect();
+        Expected {
+            memory: limits.memory_bytes,
+            processes: limits.processes,
+            cpus: limits.cpus,
+            ulimits,
+        }
+    }
+
+    /// Removes a container of this name that `create` may have left
+    /// (best effort; "no such container" is the normal case).
+    fn remove_by_name(&self) {
+        let args: Vec<OsString> = ["rm", "--force", "--", &self.name]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let _ = self.runtime.exec(&args, REMOVE_TIMEOUT);
     }
 
     /// Reads the container's state and removes it (killing what still
@@ -497,7 +542,7 @@ impl<'r> Container<'r> {
         let root = host.0 == 0;
         let user = match self.spec.user {
             ContainerUser::Id(uid, gid) => (uid, gid),
-            ContainerUser::Host if root => (NOBODY, NOBODY),
+            ContainerUser::Host if root => (ROOT_FALLBACK_ID, ROOT_FALLBACK_ID),
             ContainerUser::Host => host,
         };
         (user, root)
@@ -530,21 +575,52 @@ impl Launcher for Container<'_> {
                 ));
             }
         }
-        let id = self
-            .runtime
-            .exec(&args, CREATE_TIMEOUT)
-            .map_err(|e| RunError::Spawn {
+        let create_failed = |message: String| {
+            // The daemon may have created it anyway (e.g. after a timeout
+            // of the CLI): remove it by its name, best effort.
+            self.remove_by_name();
+            RunError::Spawn {
                 program: format!("{} create", self.runtime.kind()),
-                source: io::Error::other(e.to_string()),
-            })?;
+                source: io::Error::other(message),
+            }
+        };
+        let (id, stderr) = self
+            .runtime
+            .exec_output(&args, CREATE_TIMEOUT)
+            .map_err(|e| create_failed(e.to_string()))?;
         let id = id.trim().to_owned();
         if id.is_empty() {
-            return Err(RunError::Spawn {
-                program: format!("{} create", self.runtime.kind()),
-                source: io::Error::other("no container ID was reported"),
-            });
+            return Err(create_failed("no container ID was reported".to_owned()));
         }
-        self.lock().id = Some(id.clone());
+        {
+            let mut state = self.lock();
+            state.id = Some(id.clone());
+            state.warnings = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+
+        // Fail closed: start it only if the runtime recorded every
+        // restriction (a daemon drops unsupported limits with a warning
+        // only).
+        let expected = self.expected(spec);
+        let checked = self
+            .runtime
+            .query(&["inspect", "--format", "{{json .HostConfig}}", "--", &id])
+            .map_err(|e| e.to_string())
+            .and_then(|json| check_host_config(&json, self.runtime.kind(), &expected));
+        if let Err(reason) = checked {
+            let reason = format!(
+                "{} did not apply the container restrictions: {reason}",
+                self.runtime.kind()
+            );
+            self.lock().refusal = Some(reason.clone());
+            self.remove();
+            return Err(RunError::Unsupported(reason));
+        }
 
         let mut cmd = Command::new(self.runtime.program());
         cmd.args(["start", "--attach", "--"])
@@ -574,6 +650,162 @@ impl Launcher for Container<'_> {
 impl Drop for Container<'_> {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+/// The `--ulimit` name of `resource`, for those the runtime sets.
+fn ulimit_name(resource: Resource) -> Option<&'static str> {
+    match resource {
+        Resource::FileSize => Some("fsize"),
+        Resource::Core => Some("core"),
+        Resource::Cpu => Some("cpu"),
+        Resource::Processes => Some("nproc"),
+        _ => None,
+    }
+}
+
+/// The restrictions a created container must show in its `HostConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Expected {
+    memory: u64,
+    processes: u64,
+    cpus: u32,
+    /// `(name, soft, hard)` as in `--ulimit`.
+    ulimits: Vec<(String, u64, u64)>,
+}
+
+/// Checks the `HostConfig` of a created container (`inspect`, JSON)
+/// against what texrun asked for; the error lists every difference.
+///
+/// Field names are Docker's, which Podman's `inspect` also uses. Podman
+/// lists the dropped capabilities one by one instead of `ALL`, and may
+/// record the CPU limit as quota / period.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat list of checks, easier to review in one place"
+)]
+pub(crate) fn check_host_config(
+    json: &str,
+    kind: crate::RuntimeKind,
+    expected: &Expected,
+) -> Result<(), String> {
+    use serde_json::Value;
+
+    let config: Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("unreadable HostConfig: {e}"))?;
+    let int = |key: &str| config.get(key).and_then(Value::as_i64);
+    let text = |key: &str| config.get(key).and_then(Value::as_str).unwrap_or_default();
+    let list = |key: &str| -> Vec<String> {
+        config
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let mut problems = Vec::new();
+    let mut expect = |ok: bool, what: String| {
+        if !ok {
+            problems.push(what);
+        }
+    };
+
+    let memory = as_i64(expected.memory);
+    expect(
+        int("Memory") == Some(memory),
+        format!("memory limit {:?} instead of {memory}", int("Memory")),
+    );
+    expect(
+        int("MemorySwap") == Some(memory),
+        format!(
+            "memory+swap limit {:?} instead of {memory}",
+            int("MemorySwap")
+        ),
+    );
+    let pids = as_i64(expected.processes);
+    expect(
+        int("PidsLimit") == Some(pids),
+        format!("process limit {:?} instead of {pids}", int("PidsLimit")),
+    );
+    let cpus = i64::from(expected.cpus);
+    let nano = int("NanoCpus").unwrap_or(0);
+    let (quota, period) = (int("CpuQuota").unwrap_or(0), int("CpuPeriod").unwrap_or(0));
+    expect(
+        nano == cpus * 1_000_000_000 || (nano == 0 && period > 0 && quota == cpus * period),
+        format!("CPU limit {nano} nano-CPUs (quota {quota} / period {period}) instead of {cpus}"),
+    );
+    expect(
+        text("NetworkMode") == "none",
+        format!("network mode {:?} instead of none", text("NetworkMode")),
+    );
+    expect(
+        config.get("ReadonlyRootfs").and_then(Value::as_bool) == Some(true),
+        "the root filesystem is not read-only".to_owned(),
+    );
+    expect(
+        config.get("Privileged").and_then(Value::as_bool) != Some(true),
+        "the container is privileged".to_owned(),
+    );
+    let cap_drop = list("CapDrop");
+    let all_dropped = cap_drop.iter().any(|c| c.eq_ignore_ascii_case("ALL"))
+        || (kind == crate::RuntimeKind::Podman && !cap_drop.is_empty());
+    expect(
+        all_dropped && list("CapAdd").is_empty(),
+        format!(
+            "capabilities not all dropped (drop {cap_drop:?}, add {:?})",
+            list("CapAdd")
+        ),
+    );
+    let security = list("SecurityOpt");
+    let no_new_privileges = security
+        .iter()
+        .any(|o| o.starts_with("no-new-privileges") && !o.ends_with("false"));
+    let unconfined = security.iter().find(|o| o.contains("unconfined"));
+    expect(
+        no_new_privileges,
+        format!("no-new-privileges is not set (security options {security:?})"),
+    );
+    expect(
+        unconfined.is_none(),
+        format!("a security profile is disabled ({unconfined:?})"),
+    );
+
+    let ulimits: Vec<(String, i64, i64)> = config
+        .get("Ulimits")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|u| {
+                    let name = u.get("Name")?.as_str()?.to_ascii_lowercase();
+                    let name = name.strip_prefix("rlimit_").unwrap_or(&name).to_owned();
+                    Some((name, u.get("Soft")?.as_i64()?, u.get("Hard")?.as_i64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, soft, hard) in &expected.ulimits {
+        let want = (as_i64(*soft), as_i64(*hard));
+        let got = ulimits
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|&(_, s, h)| (s, h));
+        expect(
+            got == Some(want),
+            format!("ulimit {name} {got:?} instead of {want:?}"),
+        );
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
     }
 }
 
@@ -727,5 +959,180 @@ mod tests {
         // To ourselves: always allowed, and the walk must not descend into
         // the symlink to `/`.
         chown_tree(dir.path(), me).unwrap();
+    }
+
+    /// A `HostConfig` as Docker records it for [`expected`].
+    fn host_config(memory: i64) -> String {
+        serde_json::json!({
+            "Memory": memory,
+            "MemorySwap": 4096,
+            "PidsLimit": 64,
+            "NanoCpus": 2_000_000_000_i64,
+            "CpuQuota": 0,
+            "CpuPeriod": 0,
+            "NetworkMode": "none",
+            "ReadonlyRootfs": true,
+            "Privileged": false,
+            "CapDrop": ["ALL"],
+            "CapAdd": null,
+            "SecurityOpt": ["no-new-privileges"],
+            "Ulimits": [
+                { "Name": "core", "Soft": 0, "Hard": 0 },
+                { "Name": "cpu", "Soft": 70, "Hard": 75 },
+            ],
+        })
+        .to_string()
+    }
+
+    fn expected() -> Expected {
+        Expected {
+            memory: 4096,
+            processes: 64,
+            cpus: 2,
+            ulimits: vec![("core".to_owned(), 0, 0), ("cpu".to_owned(), 70, 75)],
+        }
+    }
+
+    #[test]
+    fn host_config_must_show_every_restriction() {
+        use crate::RuntimeKind::{Docker, Podman};
+        let ok = host_config(4096);
+        assert_eq!(check_host_config(&ok, Docker, &expected()), Ok(()));
+
+        let mut value: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        let changed = |key: &str, v: serde_json::Value| {
+            let mut value = value.clone();
+            value[key] = v;
+            value.to_string()
+        };
+        // A limit the daemon dropped reads as 0.
+        for (key, v, what) in [
+            ("Memory", serde_json::json!(0), "memory limit"),
+            ("MemorySwap", serde_json::json!(-1), "memory+swap"),
+            ("PidsLimit", serde_json::json!(0), "process limit"),
+            ("NanoCpus", serde_json::json!(0), "CPU limit"),
+            ("NetworkMode", serde_json::json!("bridge"), "network mode"),
+            ("ReadonlyRootfs", serde_json::json!(false), "read-only"),
+            ("Privileged", serde_json::json!(true), "privileged"),
+            ("CapDrop", serde_json::json!([]), "capabilities"),
+            ("CapAdd", serde_json::json!(["NET_RAW"]), "capabilities"),
+            ("SecurityOpt", serde_json::json!([]), "no-new-privileges"),
+            (
+                "SecurityOpt",
+                serde_json::json!(["no-new-privileges", "seccomp=unconfined"]),
+                "security profile",
+            ),
+            (
+                "Ulimits",
+                serde_json::json!([{ "Name": "core", "Soft": 0, "Hard": 0 }]),
+                "ulimit cpu",
+            ),
+        ] {
+            let err = check_host_config(&changed(key, v), Docker, &expected()).unwrap_err();
+            assert!(err.contains(what), "{key}: {err}");
+        }
+        assert!(check_host_config("not json", Docker, &expected()).is_err());
+
+        // Podman's way of recording the same restrictions.
+        value["CapDrop"] = serde_json::json!(["CAP_CHOWN", "CAP_KILL"]);
+        value["NanoCpus"] = serde_json::json!(0);
+        value["CpuQuota"] = serde_json::json!(200_000);
+        value["CpuPeriod"] = serde_json::json!(100_000);
+        value["Ulimits"] = serde_json::json!([
+            { "Name": "RLIMIT_CORE", "Soft": 0, "Hard": 0 },
+            { "Name": "RLIMIT_CPU", "Soft": 70, "Hard": 75 },
+            { "Name": "RLIMIT_NOFILE", "Soft": 1024, "Hard": 1024 },
+        ]);
+        let podman = value.to_string();
+        assert_eq!(check_host_config(&podman, Podman, &expected()), Ok(()));
+        // Listing capabilities one by one is not `ALL` for Docker.
+        assert!(check_host_config(&podman, Docker, &expected()).is_err());
+    }
+
+    /// A fake `docker` that answers like a daemon which accepted `create`
+    /// but recorded `hostconfig.json`, and logs its calls.
+    fn fake_runtime(dir: &Path, hostconfig: &str) -> Runtime {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("docker");
+        std::fs::write(dir.join("hostconfig.json"), hostconfig).unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+here=$(dirname "$0")
+echo "$*" >> "$here/calls"
+case "$1" in
+  version) echo "29.0.0 linux" ;;
+  context) echo "unix:///var/run/docker.sock" ;;
+  create) echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
+  inspect)
+    if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json"; else echo "false false 0"; fi ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Runtime::with_program(crate::RuntimeKind::Docker, script).unwrap()
+    }
+
+    fn limited_run() -> Spec<'static> {
+        Spec::new("/bin/true", Cwd::Path(Path::new("/"))).with_rlimits(
+            Rlimits::new()
+                .with(Resource::Core, 0)
+                .with_soft_hard(Resource::Cpu, 70, 75),
+        )
+    }
+
+    #[test]
+    fn a_container_without_its_limits_is_not_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fake_runtime(dir.path(), &host_config(0));
+        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let err = container.command(&limited_run()).unwrap_err();
+        assert!(
+            matches!(&err, RunError::Unsupported(r) if r.contains("memory limit")),
+            "{err:?}"
+        );
+        assert!(container.refusal().unwrap().contains("memory limit"));
+        assert_eq!(
+            container.warnings(),
+            ["WARNING: this kernel does not support a limit"]
+        );
+        // Removed, never started.
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(calls.contains("rm --force -- fake-id"), "{calls}");
+        assert!(!calls.contains("start"), "{calls}");
+    }
+
+    #[test]
+    fn a_container_with_its_limits_is_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fake_runtime(dir.path(), &host_config(4096));
+        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let command = container.command(&limited_run()).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args, ["start", "--attach", "--", "fake-id"]);
+        assert_eq!(container.refusal(), None);
+    }
+
+    #[test]
+    fn a_failed_create_removes_the_container_by_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fake_runtime(dir.path(), &host_config(4096));
+        // From now on `create` fails.
+        let script = dir.path().join("docker");
+        let text = std::fs::read_to_string(&script)
+            .unwrap()
+            .replace("echo fake-id", "exit 1");
+        std::fs::write(&script, text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let err = container.command(&limited_run()).unwrap_err();
+        assert!(matches!(err, RunError::Spawn { .. }), "{err:?}");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(
+            calls.contains(&format!("rm --force -- {}", container.name())),
+            "{calls}"
+        );
     }
 }

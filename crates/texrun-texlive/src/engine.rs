@@ -327,10 +327,13 @@ impl LatexmkEngine {
                 (finished, used)
             }
             Some(sandbox) => {
-                let finished = self.supervise_in(sandbox, &plan, &latexmk, timeout, &ctx.cancel)?;
+                let (finished, notes) =
+                    self.supervise_in(sandbox, &plan, &latexmk, timeout, &ctx.cancel)?;
                 // The runtime set the rlimits and the container's cgroup
-                // limits before latexmk started.
-                (finished, ResourceLimits::new(true, true))
+                // limits before latexmk started (checked after `create`).
+                let mut used = ResourceLimits::new(true, true);
+                used.notes = notes;
+                (finished, used)
             }
         };
 
@@ -450,7 +453,7 @@ impl LatexmkEngine {
         latexmk: &Path,
         timeout: Duration,
         cancel: &CancelToken,
-    ) -> Result<process::Finished, EngineError> {
+    ) -> Result<(process::Finished, Vec<String>), EngineError> {
         let (rc_dir, rc_path) = self.write_rc(&plan.root, false)?;
         let rc_host_dir = rc_path.parent().expect("the rc is in its directory");
         crate::container::share_rc(rc_host_dir, &rc_path)?;
@@ -486,11 +489,11 @@ impl LatexmkEngine {
             start: Start::Container(&container),
             cgroups: None,
         };
-        let finished = process::run(&job);
+        let finished = crate::container::finish(&container, process::run(&job));
         // Removes the container if the supervisor's hooks could not.
         drop(container);
         let _ = rc_dir.close();
-        finished.map_err(process::engine_error)
+        finished
     }
 
     /// How latexmk is started with its limits in place: through the exec

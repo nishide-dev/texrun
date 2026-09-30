@@ -17,8 +17,10 @@
 # - nothing of its own at /workspace or /texrun (texrun mounts there).
 #
 # The TeX Live packages are the same as in the dev image, so the #10
-# fixtures behave the same with both backends. MuPDF and Poppler are
-# included for running the preview in the sandbox as well (#46).
+# fixtures behave the same with both backends. No preview tools: previews
+# are rendered on the host until #46 moves them into the sandbox (which
+# adds MuPDF / Poppler here then), so they would only add attack surface
+# and AGPL / GPL distribution terms to the image now.
 
 # Pinned by digest (multi-arch index); Dependabot (docker ecosystem)
 # updates it.
@@ -42,13 +44,12 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          latexmk \
          texlive-latex-base \
          texlive-latex-recommended \
-         mupdf-tools \
-         poppler-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/log/apt/* /var/log/dpkg.log
 
-# The user when texrun does not pass one (it passes the host user's uid
-# and gid, or 65534 when texrun runs as root): never root.
+# The user when texrun does not pass one, and the one texrun passes when it
+# runs as root itself (otherwise it passes the host user's uid and gid):
+# never root.
 RUN useradd --uid 10001 --user-group --no-create-home --home-dir /nonexistent \
       --shell /usr/sbin/nologin texrun
 

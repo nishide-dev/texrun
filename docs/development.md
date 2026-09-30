@@ -11,7 +11,7 @@ CI の `integration` job も同じ image を build して使い、TeX distributi
 | --- | --- |
 | `docker/dev/Dockerfile` | dev image の定義 |
 | `compose.yaml` | service `dev`、bind mount と cache volume の定義 |
-| `docker/engine/Dockerfile` | container backend（`--backend container`）の engine image。dev image とは別の最小の runtime image（TeX Live + latexmk、MuPDF / Poppler。Rust toolchain は含まない）。base（`debian:trixie-slim`）は digest で固定し、TeX Live のパッケージは dev image と揃える。[container backend test](#container-backend-test) |
+| `docker/engine/Dockerfile` | container backend（`--backend container`）の engine image。dev image とは別の最小の runtime image（TeX Live + latexmk。Rust toolchain と preview tool は含まない）。base（`debian:trixie-slim`）は digest で固定し、TeX Live のパッケージは dev image と揃える。[container backend test](#container-backend-test) |
 
 image に含まれるもの:
 
@@ -205,7 +205,7 @@ TEXRUN_REQUIRE_SANDBOX=1 TEXRUN_REQUIRE_TEXLIVE=1 TEXRUN_TEST_BACKEND=container 
 TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 ```
 
-- `TEXRUN_TEST_BACKEND=container` にすると、`crates/texrun-texlive/tests/common` の既定の engine（`Compile::new`）が `ContainerEngine` になる。host の TeX Live に依存する test（`PATH` の wrapper、pdflatex の直接実行）は `host_only!()` で skip する。
+- `TEXRUN_TEST_BACKEND=container` にすると、`crates/texrun-texlive/tests/common` の既定の engine（`Compile::new`）が `ContainerEngine` になる。host の TeX Live に依存する test（`PATH` の wrapper、pdflatex の直接実行、host backend での対照）は `host_only!()` で skip し、binary ごとに `SKIPPED host-only tests` を 1 行出す。これらは `integration` job（host backend）で実行される。
 - `TEXRUN_SANDBOX_IMAGE` で image を変えられる（既定は `texrun-engine:latest`）。CI の `sandbox` job は `texrun-engine:ci` を build して使う。
 - runtime や image が無い環境（dev コンテナ、`test (macos)`、image を build していない `test (linux)`）では、これらの test は `SKIPPED` を出して何もしない。CI の `sandbox` job は `TEXRUN_REQUIRE_SANDBOX=1` で実行し、最後に label `org.texrun.sandbox` の container が残っていないことも確認する。
 - texrun が強制終了された場合などに残った container は、`docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる。container 内の `timeout` により、残っても compile の timeout + 45 秒で終了する。

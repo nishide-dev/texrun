@@ -257,14 +257,22 @@ removes the workspace and then exits.
 | Memory / processes / CPUs of the whole compile | only with a delegated cgroup (`--cgroup`) | always (the container's cgroup) |
 | Needs | TeX Live + latexmk on the host | Docker 20.10+ or Podman 4+, and the engine image |
 
-Use `--backend container` for documents you do not trust. The default stays
-`host` because the container backend needs a container runtime and the
-image. Build the image once from this repository:
+Use `--backend container` for documents you do not trust. Until
+[#46](https://github.com/nishide-dev/texrun/issues/46), page previews are
+still rendered on the host from the PDF that TeX produced, so add
+`--no-preview` for such documents too. The default stays `host` because the
+container backend needs a container runtime and the image. Build the image
+once from this repository:
 
 ```bash
 docker build -t texrun-engine:latest docker/engine
-texrun compile --backend container main.tex
+texrun compile --backend container --no-preview main.tex
 ```
+
+The runtime must be local (a Unix socket; Docker Desktop and OrbStack are).
+If it does not apply every restriction texrun asks for (for example a memory
+limit the kernel does not support), texrun refuses to start the container
+(exit 3) instead of running TeX with fewer restrictions.
 
 Page previews are rendered on the host with either backend (with the
 per-process limits of `--cgroup`); running them in the container too is
@@ -282,8 +290,7 @@ what each backend guarantees.
 - **Container runtime (optional):** Docker 20.10+ (including Docker Desktop
   and OrbStack on macOS) or Podman 4+, and the engine image
   (`docker/engine/Dockerfile`), for `--backend container`. Only Docker is
-  tested in CI. The engine image also contains MuPDF (AGPL) and Poppler
-  (GPL); the note below on distributing images applies to it too.
+  tested in CI.
 - **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
   page previews. MuPDF is used when both are installed; without either,
   compiling still works and the result says that previews were skipped.

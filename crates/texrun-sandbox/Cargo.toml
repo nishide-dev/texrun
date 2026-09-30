@@ -13,6 +13,8 @@ texrun-core.workspace = true
 # (`Launcher`), and the runtime CLI is run through the same supervisor.
 texrun-process.workspace = true
 thiserror.workspace = true
+# Reading back the container's `HostConfig` (`inspect`).
+serde_json.workspace = true
 # `geteuid` / `getegid` for the container user (Unix only).
 rustix = { workspace = true, features = ["process"] }
 
