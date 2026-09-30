@@ -913,3 +913,121 @@ fn error_kinds_are_stable() {
     assert!(!WorkspaceErrorKind::Io.is_input_error());
     assert!(!WorkspaceErrorKind::InputChanged.is_input_error());
 }
+
+// --- follow-ups of the second review (#28) ----------------------------------
+
+/// #28 (review N1): excluded extensions only apply to files and symlinks, so
+/// directories such as `data.base/` are copied with their contents.
+#[test]
+fn excluded_extensions_do_not_apply_to_directories() {
+    let f = Fixture::new();
+    write(f.root(), "data.base/table.csv", "1,2");
+    write(f.root(), "fig.fmt/plot.tex", "plot");
+    write(f.root(), "memo.mem", "format");
+    write(f.root(), "sub/x.base", "format");
+    symlink("memo.mem", f.root().join("link.tex"));
+    symlink("data.base", f.root().join("data-link"));
+    symlink("main.tex", f.root().join("alias.fmt"));
+
+    let ws = f.create("main.tex").unwrap();
+    assert_eq!(read(ws.path(), "data.base/table.csv"), "1,2");
+    assert_eq!(read(ws.path(), "fig.fmt/plot.tex"), "plot");
+    assert_eq!(read(ws.path(), "data-link/table.csv"), "1,2");
+    for gone in ["memo.mem", "sub/x.base", "alias.fmt", "link.tex"] {
+        assert!(
+            fs::symlink_metadata(ws.path().join(gone)).is_err(),
+            "{gone} should not be copied"
+        );
+    }
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedExtension),
+        ["alias.fmt", "memo.mem", "sub/x.base"].map(PathBuf::from)
+    );
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::SymlinkToExcluded),
+        [PathBuf::from("link.tex")]
+    );
+    assert_eq!(ws.report().vanished, 0);
+}
+
+/// #28 (review N2): the output directory is reached from the workspace root
+/// component by component, so a symlink swapped in for an ancestor of the
+/// output directory (`.texrun`) cannot redirect collection.
+#[test]
+fn collection_refuses_a_symlinked_output_dir_ancestor() {
+    let f = Fixture::new();
+    let dest = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(outside.path(), "out/main.pdf", "secret");
+
+    let ws = f.create("main.tex").unwrap();
+    assert_eq!(ws.request().options.output_dir.as_str(), ".texrun/out");
+    fs::remove_dir_all(ws.path().join(".texrun")).unwrap();
+    symlink(outside.path(), ws.path().join(".texrun"));
+    // The path-based view does lead outside.
+    assert_eq!(read(&ws.output_dir(), "main.pdf"), "secret");
+
+    let artifact = [Artifact::new(ArtifactKind::Pdf, wp("main.pdf"))];
+    let err = ws
+        .collect_artifacts(&artifact, dest.path(), OverwritePolicy::Replace)
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::ArtifactNotFile(_)), "{err:?}");
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+
+    // A missing output directory makes the artifact missing.
+    fs::remove_file(ws.path().join(".texrun")).unwrap();
+    let err = ws
+        .collect_artifacts(&artifact, dest.path(), OverwritePolicy::Replace)
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::ArtifactMissing(_)), "{err:?}");
+    // With nothing to collect, nothing needs to be reached.
+    assert!(
+        ws.collect_artifacts(&[], dest.path(), OverwritePolicy::Replace)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// #28 (review N2): a workspace directory replaced after creation (same
+/// path, different directory) is not collected from.
+#[test]
+fn collection_refuses_a_replaced_workspace_directory() {
+    let f = Fixture::new();
+    let dest = tempfile::tempdir().unwrap();
+    let ws = f.create("main.tex").unwrap();
+    let moved = ws.path().with_extension("moved");
+    fs::rename(ws.path(), &moved).unwrap();
+    write(ws.path(), ".texrun/out/main.pdf", "impostor");
+
+    let artifact = [Artifact::new(ArtifactKind::Pdf, wp("main.pdf"))];
+    let err = ws
+        .collect_artifacts(&artifact, dest.path(), OverwritePolicy::Replace)
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::ArtifactNotFile(_)), "{err:?}");
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+
+    fs::remove_dir_all(ws.path()).unwrap();
+    fs::rename(&moved, ws.path()).unwrap();
+}
+
+/// #28 (review N3): the message of `KeptAfterFailure` does not repeat its
+/// source, which is still available through `Error::source`.
+#[test]
+fn kept_after_failure_message_shows_the_cause_once() {
+    use std::error::Error as _;
+    let f = Fixture::new();
+    write(f.root(), "big.bin", &"x".repeat(1000));
+    let err = Workspace::create(
+        &f.input("main.tex"),
+        CompileOptions::default(),
+        &f.config()
+            .with_keep(true)
+            .with_limits(WorkspaceLimits::default().with_max_total_bytes(10)),
+    )
+    .unwrap_err();
+    let cause = err.source().expect("has a source").to_string();
+    assert!(cause.contains("total size"), "{cause}");
+    let msg = err.to_string();
+    assert!(!msg.contains(&cause), "{msg}");
+    assert!(msg.contains("partial workspace kept at"), "{msg}");
+}

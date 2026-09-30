@@ -12,7 +12,7 @@ use rustix::io::Errno;
 use texrun_core::{Artifact, WorkspacePath};
 
 use crate::error::WorkspaceError;
-use crate::fsutil::{DIR_FLAGS, READ_FLAGS, file_type, fstat};
+use crate::fsutil::{DIR_FLAGS, FileId, READ_FLAGS, file_type, fstat};
 
 /// What to do when the destination already has a file with an artifact's
 /// name.
@@ -32,16 +32,21 @@ pub enum OverwritePolicy {
     Refuse,
 }
 
-/// Copies `artifacts` (relative to `out_root`) into `dest`, preserving their
-/// relative paths. See [`Workspace::collect_artifacts`](crate::Workspace::collect_artifacts).
+/// Copies `artifacts` (relative to the output directory `output_dir` of the
+/// workspace at `ws_root`, whose identity was recorded as `ws_root_id`) into
+/// `dest`, preserving their relative paths. See
+/// [`Workspace::collect_artifacts`](crate::Workspace::collect_artifacts).
 pub(crate) fn collect(
-    out_root: &Path,
+    ws_root: &Path,
+    ws_root_id: FileId,
+    output_dir: &WorkspacePath,
     artifacts: &[Artifact],
     dest: &Path,
     policy: OverwritePolicy,
 ) -> Result<Vec<Artifact>, WorkspaceError> {
-    let out_fd = rustix::fs::open(out_root, DIR_FLAGS, Mode::empty())
-        .map_err(|e| WorkspaceError::io("opening", out_root)(e.into()))?;
+    // A failure to reach the output directory is reported against the first
+    // artifact (and not at all when there are none).
+    let out_fd = open_output_dir(ws_root, ws_root_id, output_dir);
     // The destination root is chosen by the caller and may itself be a
     // symlink to a directory; only entries *below* it are checked strictly.
     fs::create_dir_all(dest).map_err(WorkspaceError::io("creating directory", dest))?;
@@ -55,7 +60,11 @@ pub(crate) fn collect(
         if !seen.insert(&artifact.path) {
             continue;
         }
-        let input = open_artifact(&out_fd, &artifact.path)?;
+        let out_fd = match &out_fd {
+            Ok(fd) => fd,
+            Err(e) => return Err(e.to_error(&artifact.path)),
+        };
+        let input = open_artifact(out_fd, &artifact.path)?;
 
         let mut dir = dest.to_path_buf();
         if let Some(parent) = artifact.path.as_path().parent() {
@@ -80,6 +89,62 @@ pub(crate) fn collect(
         collected.push(artifact.clone().with_size_bytes(size));
     }
     Ok(collected)
+}
+
+/// Why the workspace output directory could not be opened.
+#[derive(Debug)]
+enum OutDirError {
+    /// The workspace root was replaced, or a component of the output
+    /// directory is a symlink or not a directory.
+    Unsafe,
+    /// A component of the output directory does not exist.
+    Missing,
+    /// Any other failure.
+    Io(&'static str, PathBuf, Errno),
+}
+
+impl OutDirError {
+    fn from_errno(e: Errno, context: &'static str, path: &Path) -> Self {
+        match e {
+            Errno::NOENT => Self::Missing,
+            Errno::LOOP | Errno::MLINK | Errno::NOTDIR => Self::Unsafe,
+            e => Self::Io(context, path.to_path_buf(), e),
+        }
+    }
+
+    fn to_error(&self, artifact: &WorkspacePath) -> WorkspaceError {
+        match self {
+            Self::Unsafe => WorkspaceError::ArtifactNotFile(artifact.clone()),
+            Self::Missing => WorkspaceError::ArtifactMissing(artifact.clone()),
+            Self::Io(context, path, e) => WorkspaceError::io(context, path.clone())((*e).into()),
+        }
+    }
+}
+
+/// Opens the workspace root (checking that it is still the directory
+/// recorded when the workspace was created) and then the output directory
+/// below it one component at a time with `O_NOFOLLOW`, so neither a replaced
+/// workspace nor a symlink swapped in for an intermediate directory (e.g. by
+/// a process left over from the compile) can make collection read from
+/// outside the workspace.
+fn open_output_dir(
+    ws_root: &Path,
+    ws_root_id: FileId,
+    output_dir: &WorkspacePath,
+) -> Result<OwnedFd, OutDirError> {
+    let root = rustix::fs::open(ws_root, DIR_FLAGS, Mode::empty())
+        .map_err(|e| OutDirError::from_errno(e, "opening", ws_root))?;
+    let st = rustix::fs::fstat(&root)
+        .map_err(|e| OutDirError::Io("inspecting", ws_root.to_path_buf(), e))?;
+    if FileId::of(&st) != ws_root_id {
+        return Err(OutDirError::Unsafe);
+    }
+    let mut dir = root;
+    for comp in output_dir.as_str().split('/') {
+        dir = rustix::fs::openat(&dir, comp, DIR_FLAGS, Mode::empty())
+            .map_err(|e| OutDirError::from_errno(e, "opening", output_dir.as_path()))?;
+    }
+    Ok(dir)
 }
 
 /// Opens the artifact at `path` below the output directory `out_fd`, one

@@ -91,6 +91,11 @@ pub struct MaterializeReport {
     pub hardlinked: Vec<PathBuf>,
     /// Total number of such files.
     pub hardlinked_total: u64,
+    /// Number of entries that were listed but had disappeared by the time
+    /// they were inspected (the project was modified during the copy). They
+    /// are not copied; a nonzero value is a hint that the workspace may not
+    /// match any single state of the project.
+    pub vanished: u64,
 }
 
 impl MaterializeReport {
@@ -185,8 +190,10 @@ impl Exclusions {
         }
     }
 
-    /// Exclusion by (folded) name or extension alone.
-    fn name_reason(&self, folded: &str, at_root: bool) -> Option<ExclusionReason> {
+    /// Exclusion by (folded) name or extension alone. Extensions only apply
+    /// to non-directories (files and symlinks): formats are only ever looked
+    /// up as files, so e.g. a `data.base/` directory is kept.
+    fn name_reason(&self, folded: &str, at_root: bool, is_dir: bool) -> Option<ExclusionReason> {
         if let Some((_, reason)) = self.names.iter().find(|(n, _)| n == folded) {
             return Some(*reason);
         }
@@ -194,7 +201,7 @@ impl Exclusions {
             return Some(ExclusionReason::ExcludedName);
         }
         match folded.rsplit_once('.') {
-            Some((_, ext)) if self.extensions.iter().any(|e| e == ext) => {
+            Some((_, ext)) if !is_dir && self.extensions.iter().any(|e| e == ext) => {
                 Some(ExclusionReason::ExcludedExtension)
             }
             _ => None,
@@ -221,7 +228,7 @@ impl Exclusions {
             return Verdict::Keep { child_out: None };
         };
         if self.lexical
-            && let Some(reason) = self.name_reason(&folded, level.at_root)
+            && let Some(reason) = self.name_reason(&folded, level.at_root, is_dir)
         {
             return Verdict::Exclude(reason);
         }
@@ -286,14 +293,16 @@ impl Exclusions {
         Ok(None)
     }
 
-    /// Whether `rel` (a path of any entry type, e.g. a symlink target or
-    /// the entrypoint) is excluded by any of its components, or touches the
-    /// output directory (is it, is below it, or is one of its ancestors).
-    pub(crate) fn excludes_path(&self, rel: &Path) -> bool {
+    /// Whether `rel` (e.g. a symlink target or the entrypoint) is excluded
+    /// by any of its components, or touches the output directory (is it, is
+    /// below it, or is one of its ancestors). `is_dir` tells whether the last
+    /// component is a directory; all others are.
+    pub(crate) fn excludes_path(&self, rel: &Path, is_dir: bool) -> bool {
         let comps: Vec<Option<String>> = rel.iter().map(|c| c.to_str().map(fold)).collect();
+        let last = comps.len().saturating_sub(1);
         let by_name = comps.iter().enumerate().any(|(i, c)| {
             c.as_deref()
-                .is_some_and(|c| self.name_reason(c, i == 0).is_some())
+                .is_some_and(|c| self.name_reason(c, i == 0, is_dir || i < last).is_some())
         });
         if by_name {
             return true;
@@ -447,12 +456,29 @@ impl<'a> Materializer<'a> {
         depth: usize,
         level: Level,
     ) -> Result<(), WorkspaceError> {
-        for name in self.list(src, rel)? {
+        let names = self.list(src, rel)?;
+        self.copy_entries(src, dst, rel, depth, level, names)
+    }
+
+    /// Copies the listed entries `names` of `src` into `dst`.
+    fn copy_entries(
+        &mut self,
+        src: &OwnedFd,
+        dst: &OwnedFd,
+        rel: &Path,
+        depth: usize,
+        level: Level,
+        names: Vec<OsString>,
+    ) -> Result<(), WorkspaceError> {
+        for name in names {
             let rel_child = rel.join(&name);
             let st = match rustix::fs::statat(src, &name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(st) => st,
                 // Removed since it was listed: nothing to copy.
-                Err(Errno::NOENT) => continue,
+                Err(Errno::NOENT) => {
+                    self.report.vanished += 1;
+                    continue;
+                }
                 Err(e) => return Err(WorkspaceError::io("inspecting", rel_child)(e.into())),
             };
             let id = FileId::of(&st);
@@ -654,7 +680,11 @@ impl<'a> Materializer<'a> {
             .skip
             .as_ref()
             .is_some_and(|(p, _)| resolved.starts_with(p));
-        if in_skipped || self.exclusions.excludes_path(rel_target) {
+        // Whether the target is a directory only affects extension-based
+        // exclusion; `resolved` exists, so a failed stat means it changed
+        // meanwhile and is treated as a file (the stricter choice).
+        let target_is_dir = std::fs::metadata(&resolved).is_ok_and(|m| m.is_dir());
+        if in_skipped || self.exclusions.excludes_path(rel_target, target_is_dir) {
             self.exclude(rel.clone(), ExclusionReason::SymlinkToExcluded);
             return Ok(());
         }
@@ -788,17 +818,73 @@ mod tests {
     fn excludes_path_checks_every_component_and_output_relation() {
         let config = WorkspaceConfig::default();
         let ex = Exclusions::new(&config, &wp("build/out"));
-        assert!(ex.excludes_path(Path::new(".git/config")));
-        assert!(ex.excludes_path(Path::new("a/latexmkrc")));
-        assert!(ex.excludes_path(Path::new("a/LATEXM\u{212A}RC")));
-        assert!(ex.excludes_path(Path::new("target/x")));
-        assert!(!ex.excludes_path(Path::new("figures/target/x")));
-        assert!(ex.excludes_path(Path::new("a/p.fmt")));
-        assert!(ex.excludes_path(Path::new("build/out/x.pdf")));
-        assert!(ex.excludes_path(Path::new("build")));
-        assert!(ex.excludes_path(Path::new("")));
-        assert!(!ex.excludes_path(Path::new("build/other.tex")));
-        assert!(!ex.excludes_path(Path::new("src/main.tex")));
+        assert!(ex.excludes_path(Path::new(".git/config"), false));
+        assert!(ex.excludes_path(Path::new("a/latexmkrc"), false));
+        assert!(ex.excludes_path(Path::new("a/LATEXM\u{212A}RC"), false));
+        assert!(ex.excludes_path(Path::new("target/x"), false));
+        assert!(!ex.excludes_path(Path::new("figures/target/x"), false));
+        assert!(ex.excludes_path(Path::new("a/p.fmt"), false));
+        assert!(ex.excludes_path(Path::new("build/out/x.pdf"), false));
+        assert!(ex.excludes_path(Path::new("build"), false));
+        assert!(ex.excludes_path(Path::new(""), false));
+        assert!(!ex.excludes_path(Path::new("build/other.tex"), false));
+        assert!(!ex.excludes_path(Path::new("src/main.tex"), false));
+        // Extensions only exclude a non-directory last component.
+        assert!(!ex.excludes_path(Path::new("a/data.base"), true));
+        assert!(ex.excludes_path(Path::new("a/data.base"), false));
+        assert!(!ex.excludes_path(Path::new("x.fmt/main.tex"), false));
+        // Names still apply to directories.
+        assert!(ex.excludes_path(Path::new("a/.git"), true));
+    }
+
+    #[test]
+    fn excluded_extensions_apply_to_files_and_symlinks_only() {
+        use ExclusionReason::ExcludedExtension;
+        let config = WorkspaceConfig::default();
+        let ex = Exclusions::new(&config, &wp(".texrun/out"));
+        let keep = Verdict::Keep { child_out: None };
+        assert_eq!(classify(&ex, "data.base", true), keep);
+        assert_eq!(classify(&ex, "sub/x.FMT", true), keep);
+        assert_eq!(classify(&ex, "memo.mem", true), keep);
+        assert_eq!(
+            classify(&ex, "data.base", false),
+            excluded(ExcludedExtension)
+        );
+        assert_eq!(
+            classify(&ex, "memo.mem", false),
+            excluded(ExcludedExtension)
+        );
+    }
+
+    #[test]
+    fn entries_vanished_after_listing_are_counted() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("main.tex"), "x").unwrap();
+        let config = WorkspaceConfig::default();
+        let ex = Exclusions::new(&config, &wp(".texrun/out"));
+        let src_root = std::fs::canonicalize(src.path()).unwrap();
+        let dst_root = std::fs::canonicalize(dst.path()).unwrap();
+        let mut m = Materializer::new(config.limits, &ex, &src_root, &dst_root);
+        let level = Level {
+            at_root: true,
+            out_idx: Some(0),
+        };
+        // As if `gone.tex` had been listed and then removed before `statat`.
+        let names = vec![OsString::from("gone.tex"), OsString::from("main.tex")];
+        m.copy_entries(
+            &open_dir(&src_root),
+            &open_dir(&dst_root),
+            Path::new(""),
+            0,
+            level,
+            names,
+        )
+        .unwrap();
+        assert_eq!(m.report.vanished, 1);
+        assert_eq!(m.report.entries, 1);
+        assert!(dst_root.join("main.tex").is_file());
+        assert!(!dst_root.join("gone.tex").exists());
     }
 
     #[test]

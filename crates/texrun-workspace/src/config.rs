@@ -108,8 +108,9 @@ pub struct WorkspaceConfig {
     /// Names that are not copied when they appear directly in the project
     /// root. Defaults to [`WorkspaceConfig::DEFAULT_EXCLUDED_ROOT_NAMES`].
     pub excluded_root_names: Vec<String>,
-    /// File extensions (without the dot) of entries that are never copied,
-    /// at any depth. Defaults to
+    /// File extensions (without the dot) of files and symlinks that are
+    /// never copied, at any depth. Directories are not matched (a
+    /// `data.base/` directory is copied). Defaults to
     /// [`WorkspaceConfig::DEFAULT_EXCLUDED_EXTENSIONS`].
     pub excluded_extensions: Vec<String>,
     /// Keep the workspace directory on drop instead of deleting it (for
@@ -133,6 +134,12 @@ impl WorkspaceConfig {
     /// working directory takes precedence over the installed one (e.g. via a
     /// `%&name` first line) and may carry engine-specific code such as Lua
     /// bytecode.
+    ///
+    /// `.base` and `.mem` are also used by unrelated files; such files are
+    /// left out too (listed in the [`MaterializeReport`](crate::MaterializeReport)
+    /// as [`ExclusionReason::ExcludedExtension`](crate::ExclusionReason::ExcludedExtension)).
+    /// Replace the list with [`WorkspaceConfig::with_excluded_extensions`]
+    /// if a project needs them.
     pub const DEFAULT_EXCLUDED_EXTENSIONS: &'static [&'static str] = &["fmt", "base", "mem"];
 
     /// Sets the input limits.
