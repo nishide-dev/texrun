@@ -278,6 +278,10 @@ impl<'r> Container<'r> {
     }
 
     /// The `create` arguments for `spec`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat list of options, easier to review in one place"
+    )]
     pub(crate) fn create_args(
         &self,
         spec: &Spec<'_>,
@@ -400,7 +404,8 @@ impl<'r> Container<'r> {
             let name_text = name.to_str().unwrap_or_default();
             if name_text.is_empty() || name_text.contains('=') {
                 return Err(SandboxError::Invalid(format!(
-                    "invalid environment variable name {name:?}"
+                    "invalid environment variable name `{}`",
+                    name.display()
                 )));
             }
             let mut pair = name.to_owned();
@@ -482,13 +487,15 @@ impl<'r> Container<'r> {
     /// The user of the container, and whether texrun runs as root (so that
     /// writable mounts must be handed to that user).
     fn user(&self) -> ((u32, u32), bool) {
-        let euid = rustix::process::geteuid().as_raw();
-        let egid = rustix::process::getegid().as_raw();
-        let root = euid == 0;
+        let host = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        let root = host.0 == 0;
         let user = match self.spec.user {
             ContainerUser::Id(uid, gid) => (uid, gid),
             ContainerUser::Host if root => (NOBODY, NOBODY),
-            ContainerUser::Host => (euid, egid),
+            ContainerUser::Host => host,
         };
         (user, root)
     }

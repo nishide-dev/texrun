@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 
 use common::{
     Compile, assert_outcome, assert_pdf, copy_tree, describe, files_named, find, fixture, has,
-    path_with, plain_tempdir, require_texlive, which,
+    host_only, path_with, plain_tempdir, require_texlive, which,
 };
 use tempfile::TempDir;
 use texrun_core::{CompileOptions, CompileOutcome, DiagnosticKind};
@@ -90,6 +90,8 @@ fn rc_files_in_the_project_are_not_copied_or_read() {
 
 #[test]
 fn format_line_is_ignored() {
+    // The control runs the host's pdflatex.
+    host_only!();
     require_texlive!();
     // The first line names an installed format without LaTeX. Honoured, it
     // would replace the LaTeX format and the document would fail.
@@ -169,6 +171,9 @@ fn recorded_calls(dir: &Path, tool: &str) -> Vec<(String, Vec<String>)> {
 
 #[test]
 fn auxiliary_tools_are_started_without_a_shell() {
+    // Wrappers in the host PATH; the container backend runs the same rc
+    // (tests/container.rs compiles this fixture there).
+    host_only!();
     require_texlive!();
     let tools = plain_tempdir();
     write_recording_wrappers(tools.path());
@@ -319,10 +324,14 @@ fn writing_inside_the_output_directory_works() {
     let paths = OutsidePaths::new(|_| format!("{WRITTEN}.txt"));
     let (run, ws) = paths.compile("write.tex").run();
     assert_outcome(&run, CompileOutcome::Succeeded);
-    assert_eq!(
-        files_named(paths.dir.path(), WRITTEN),
-        [ws.output_dir().join(format!("{WRITTEN}.txt"))]
-    );
+    // Canonical on both sides: the temporary directory may be reached
+    // through a symlink (`/var` -> `/private/var` on macOS).
+    let found: Vec<_> = files_named(paths.dir.path(), WRITTEN)
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap())
+        .collect();
+    let expected = fs::canonicalize(ws.output_dir().join(format!("{WRITTEN}.txt"))).unwrap();
+    assert_eq!(found, [expected]);
 }
 
 fn assert_write_refused(probe_path: impl FnOnce(&Path) -> String) {

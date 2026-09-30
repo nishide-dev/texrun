@@ -15,6 +15,8 @@ texrun-core.workspace = true
 texrun-latex-log.workspace = true
 # Process groups, the poll loop and resource limits (Unix only).
 texrun-process.workspace = true
+# The container backend (`ContainerEngine`).
+texrun-sandbox.workspace = true
 
 [dev-dependencies]
 # `setrlimit` on the test process itself (core dump test).

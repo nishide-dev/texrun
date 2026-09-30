@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use texrun_core::{
     Artifact, ArtifactKind, CancelToken, CompileContext, CompileOutcome, CompileRequest,
-    CompileResult, Diagnostic, DiagnosticKind, EngineError, EngineInfo, ProcessExit,
+    CompileResult, Diagnostic, DiagnosticKind, EngineError, EngineInfo, PathMapping, ProcessExit,
     ResourceLimits, Severity, TypesetEngine, WorkspacePath, WorkspaceRoot,
 };
 use texrun_latex_log::LogParser;
@@ -18,6 +18,7 @@ use texrun_process::{CgroupOutcome, Cgroups, ExecGate, RunError};
 
 use crate::bibtex;
 use crate::command::{self, MAX_PRINT_LINE};
+use crate::container::SandboxRun;
 use crate::layout::{self, HOME_DIR};
 use crate::names::{check_host_path, check_name};
 use crate::process::{self, CapturedOutput, Job, LimitReached, Limits, Start, StopReason};
@@ -45,7 +46,7 @@ pub const MAX_PARSED_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// File name of the rc inside its temporary directory.
-const RC_FILE_NAME: &str = "texrun.latexmkrc";
+pub(crate) const RC_FILE_NAME: &str = "texrun.latexmkrc";
 
 /// Configuration of a [`LatexmkEngine`].
 ///
@@ -266,14 +267,40 @@ impl LatexmkEngine {
     /// latexmk starts, so the reported artifacts are always from this run.
     /// Other files in the output directory are left alone, and latexmk may
     /// reuse them (e.g. `.aux`).
+    ///
+    /// latexmk runs on the host, so a context with a
+    /// [`CompileContext::path_mapping`] is [`EngineError::Unsupported`]; the
+    /// container backend is [`ContainerEngine`](crate::ContainerEngine).
     pub fn run(
         &self,
         ctx: &CompileContext<'_>,
         request: &CompileRequest,
     ) -> Result<LatexmkRun, EngineError> {
+        if ctx.path_mapping.is_some() {
+            request.validate()?;
+            return Err(EngineError::Unsupported(
+                "this engine runs latexmk on the host, where the workspace is at its host path; \
+                 a path mapping needs a sandbox backend (texrun_texlive::ContainerEngine)"
+                    .to_owned(),
+            ));
+        }
+        self.run_in(ctx, request, None)
+    }
+
+    /// [`Self::run`] on the host (`sandbox` is `None`) or in the container
+    /// of `sandbox`.
+    pub(crate) fn run_in(
+        &self,
+        ctx: &CompileContext<'_>,
+        request: &CompileRequest,
+        sandbox: Option<&SandboxRun<'_>>,
+    ) -> Result<LatexmkRun, EngineError> {
         request.validate()?;
-        let plan = Plan::new(ctx.workspace, request)?;
-        let latexmk = self.locate()?;
+        let plan = Plan::new(ctx.workspace, sandbox.map(|s| &s.mapping), request)?;
+        let latexmk = match sandbox {
+            Some(sandbox) => sandbox.latexmk.to_path_buf(),
+            None => self.locate()?,
+        };
 
         if ctx.cancel.is_cancelled() {
             let result = CompileResult::new(CompileOutcome::Cancelled, self.info(), Duration::ZERO);
@@ -292,7 +319,20 @@ impl LatexmkEngine {
             .options
             .timeout
             .unwrap_or(self.config.default_timeout);
-        let (finished, start, notes) = self.supervise(&plan, &latexmk, timeout, &ctx.cancel)?;
+        let (finished, limits_used) = match sandbox {
+            None => {
+                let (finished, start, notes) =
+                    self.supervise(&plan, &latexmk, timeout, &ctx.cancel)?;
+                let used = resource_limits(&start, &finished, notes);
+                (finished, used)
+            }
+            Some(sandbox) => {
+                let finished = self.supervise_in(sandbox, &plan, &latexmk, timeout, &ctx.cancel)?;
+                // The runtime set the rlimits and the container's cgroup
+                // limits before latexmk started.
+                (finished, ResourceLimits::new(true, true))
+            }
+        };
 
         // A file that hit RLIMIT_FSIZE stops the writer without the poll loop
         // noticing; check the sizes once more.
@@ -335,7 +375,7 @@ impl LatexmkEngine {
         result.exit = Some(ProcessExit::from(finished.status));
         result.diagnostics = diagnostics;
         result.artifacts = artifacts;
-        result.resource_limits = Some(resource_limits(&start, &finished, notes));
+        result.resource_limits = Some(limits_used);
         Ok(LatexmkRun {
             result,
             stdout: finished.stdout,
@@ -399,6 +439,60 @@ impl LatexmkEngine {
         }
     }
 
+    /// Writes the rc and runs latexmk for `plan` in the container of
+    /// `sandbox`, which sees the workspace at the plan's guest paths: the
+    /// workspace read-only, the output directory and `HOME` writable, and
+    /// the rc read-only.
+    fn supervise_in(
+        &self,
+        sandbox: &SandboxRun<'_>,
+        plan: &Plan,
+        latexmk: &Path,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<process::Finished, EngineError> {
+        let (rc_dir, rc_path) = self.write_rc(&plan.root, false)?;
+        let rc_host_dir = rc_path.parent().expect("the rc is in its directory");
+        crate::container::share_rc(rc_host_dir, &rc_path)?;
+        let real = |dir: &Path| {
+            fs::canonicalize(dir).map_err(io_error(format!("resolving {}", dir.display())))
+        };
+        let guest = plan
+            .guest
+            .as_ref()
+            .expect("a sandboxed plan has guest paths");
+        let container = sandbox.container(
+            &plan.root,
+            &real(&plan.output_dir)?,
+            &real(&plan.home)?,
+            rc_host_dir,
+            guest,
+            timeout,
+        );
+        let guest_rc = crate::container::guest_rc_path();
+        let job = Job {
+            program: latexmk,
+            args: command::latexmk_args(&guest_rc, &guest.output_dir, &plan.entry_arg),
+            cwd: &guest.cwd,
+            env: command::child_env(
+                sandbox.search_path,
+                &guest.home,
+                self.config.source_date_epoch,
+            ),
+            timeout: Some(timeout),
+            cancel: Some(cancel),
+            size_dirs: vec![plan.output_dir.as_path(), plan.home.as_path()],
+            limits: self.config.limits,
+            start: Start::Container(&container),
+            cgroups: None,
+        };
+        let finished = process::run(&job);
+        // Removes the container if the supervisor's hooks could not.
+        drop(container);
+        let _ = rc_dir.close();
+        finished.map_err(process::engine_error)
+    }
+
     /// How latexmk is started with its limits in place: through the exec
     /// gate if it can be used, otherwise as [`Self::without_gate`].
     fn start(&self, notes: &mut Vec<String>) -> Result<Start<'_>, EngineError> {
@@ -444,7 +538,7 @@ impl LatexmkEngine {
     /// outside the workspace (`workspace_root`, canonical). Returns the
     /// directory, removed when dropped, and the rc path. `stdin_gate`: see
     /// [`RcOptions::stdin_gate`].
-    fn write_rc(
+    pub(crate) fn write_rc(
         &self,
         workspace_root: &Path,
         stdin_gate: bool,
@@ -645,10 +739,30 @@ struct Plan {
     entry_arg: String,
     /// Job name (file stem of the entrypoint).
     stem: String,
+    /// Where latexmk sees the workspace, when it runs in a sandbox.
+    guest: Option<GuestPaths>,
+}
+
+/// The directories of a [`Plan`] as latexmk sees them in a sandbox
+/// ([`PathMapping`]).
+#[derive(Debug)]
+pub(crate) struct GuestPaths {
+    /// The workspace root.
+    pub(crate) root: PathBuf,
+    /// The entrypoint's directory (the working directory).
+    pub(crate) cwd: PathBuf,
+    pub(crate) output_dir: PathBuf,
+    pub(crate) home: PathBuf,
 }
 
 impl Plan {
-    fn new(workspace: &WorkspaceRoot, request: &CompileRequest) -> Result<Self, EngineError> {
+    /// The plan for `request` in `workspace`, with guest paths if latexmk
+    /// sees the workspace through `mapping`.
+    fn new(
+        workspace: &WorkspaceRoot,
+        mapping: Option<&PathMapping>,
+        request: &CompileRequest,
+    ) -> Result<Self, EngineError> {
         let entry = &request.entrypoint;
         let output_dir_rel = request.options.output_dir.clone();
         check_name("entrypoint", entry.as_str())?;
@@ -696,6 +810,29 @@ impl Plan {
         check_host_path("output directory", &output_dir)?;
         let home = root.join(HOME_DIR);
 
+        let guest = match mapping {
+            None => None,
+            Some(mapping) => {
+                let guest_root = mapping.guest_root();
+                let text = guest_root.to_str().ok_or_else(|| {
+                    EngineError::InvalidRequest(format!(
+                        "the guest workspace root {} is not valid UTF-8",
+                        guest_root.display()
+                    ))
+                })?;
+                check_name("guest workspace root", text)?;
+                // The resolved entrypoint directory, relative to the root:
+                // the same place in the guest (symlinks in the workspace
+                // are relative, #4).
+                let rel = cwd.strip_prefix(&root).expect("checked above");
+                Some(GuestPaths {
+                    root: guest_root.to_path_buf(),
+                    cwd: guest_root.join(rel),
+                    output_dir: mapping.to_guest(&output_dir_rel),
+                    home: guest_root.join(HOME_DIR),
+                })
+            }
+        };
         let file_name = WorkspacePath::new(entry.file_name()).expect("file name of a valid path");
         Ok(Self {
             entry_arg: file_name.to_cli_arg(),
@@ -706,6 +843,7 @@ impl Plan {
             cwd,
             output_dir,
             home,
+            guest,
         })
     }
 
@@ -782,8 +920,11 @@ impl Plan {
             return Vec::new();
         };
         // TeX ran in the entrypoint's directory, so the log names files
-        // relative to it; the parser wants TeX's working directory as root.
-        let Ok(tex_cwd) = WorkspaceRoot::new(&self.cwd) else {
+        // relative to it; the parser wants TeX's working directory as root,
+        // as TeX saw it (absolute paths in the log are guest paths in a
+        // sandbox). Sources are still read through the host path.
+        let tex_cwd = self.guest.as_ref().map_or(&self.cwd, |g| &g.cwd);
+        let Ok(tex_cwd) = WorkspaceRoot::new(tex_cwd) else {
             return Vec::new();
         };
         let sources =
@@ -917,7 +1058,7 @@ mod tests {
     #[test]
     fn plan_for_root_entrypoint() {
         let (_dir, root) = workspace_with(&["main.tex"]);
-        let plan = Plan::new(&root, &request("main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("main.tex")).unwrap();
         assert_eq!(plan.cwd, root.path());
         assert_eq!(plan.output_dir, root.path().join(".texrun/out"));
         assert_eq!(plan.home, root.path().join(".texrun/home"));
@@ -929,7 +1070,7 @@ mod tests {
     #[test]
     fn plan_for_subdirectory_and_dash_entrypoint() {
         let (_dir, root) = workspace_with(&["src/-draft.tex"]);
-        let plan = Plan::new(&root, &request("src/-draft.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("src/-draft.tex")).unwrap();
         assert_eq!(plan.cwd, root.path().join("src"));
         assert_eq!(plan.entry_arg, "./-draft.tex");
         assert_eq!(plan.stem, "-draft");
@@ -942,7 +1083,7 @@ mod tests {
     fn plan_rejects_bad_names_and_missing_entrypoints() {
         let (_dir, root) = workspace_with(&["a$b.tex", "main.tex"]);
         for entry in ["a$b.tex", "missing.tex"] {
-            let err = Plan::new(&root, &request(entry)).unwrap_err();
+            let err = Plan::new(&root, None, &request(entry)).unwrap_err();
             assert!(
                 matches!(err, EngineError::InvalidRequest(_)),
                 "{entry}: {err:?}"
@@ -953,7 +1094,7 @@ mod tests {
                 .with_output_dir(WorkspacePath::new("out`x").unwrap()),
         );
         assert!(matches!(
-            Plan::new(&root, &req),
+            Plan::new(&root, None, &req),
             Err(EngineError::InvalidRequest(_))
         ));
         let req = request("main.tex").with_options(
@@ -961,7 +1102,7 @@ mod tests {
                 .with_output_dir(WorkspacePath::new(".texrun/home/out").unwrap()),
         );
         assert!(matches!(
-            Plan::new(&root, &req),
+            Plan::new(&root, None, &req),
             Err(EngineError::InvalidRequest(_))
         ));
     }
@@ -969,7 +1110,7 @@ mod tests {
     #[test]
     fn artifacts_are_pdf_and_log_only() {
         let (_dir, root) = workspace_with(&["main.tex"]);
-        let plan = Plan::new(&root, &request("main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("main.tex")).unwrap();
         plan.prepare_dirs().unwrap();
         for ext in ["pdf", "log", "aux", "fls", "fdb_latexmk"] {
             fs::write(plan.output_dir.join(format!("main.{ext}")), "x").unwrap();
@@ -983,7 +1124,7 @@ mod tests {
     #[test]
     fn log_diagnostics_are_workspace_relative() {
         let (_dir, root) = workspace_with(&["src/main.tex", "src/chapters/intro.tex"]);
-        let plan = Plan::new(&root, &request("src/main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("src/main.tex")).unwrap();
         plan.prepare_dirs().unwrap();
         fs::write(
             plan.output_dir.join("main.log"),
@@ -1000,7 +1141,7 @@ mod tests {
     #[test]
     fn log_diagnostics_of_a_root_entrypoint_keep_their_file() {
         let (_dir, root) = workspace_with(&["main.tex"]);
-        let plan = Plan::new(&root, &request("main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("main.tex")).unwrap();
         plan.prepare_dirs().unwrap();
         fs::write(
             plan.output_dir.join("main.log"),
@@ -1014,7 +1155,7 @@ mod tests {
     #[test]
     fn missing_packages_are_located_in_the_workspace_sources() {
         let (_dir, root) = workspace_with(&["src/main.tex"]);
-        let plan = Plan::new(&root, &request("src/main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("src/main.tex")).unwrap();
         plan.prepare_dirs().unwrap();
         let source = "\\documentclass{article}\n\\usepackage{nopkg}\n\\begin{document}\n";
         fs::write(root.path().join("src/main.tex"), source).unwrap();
@@ -1194,7 +1335,7 @@ mod tests {
     #[test]
     fn stale_pdf_and_log_are_removed_before_the_run() {
         let (_dir, root) = workspace_with(&["main.tex"]);
-        let plan = Plan::new(&root, &request("main.tex")).unwrap();
+        let plan = Plan::new(&root, None, &request("main.tex")).unwrap();
         fs::create_dir_all(&plan.output_dir).unwrap();
         for ext in ["pdf", "log", "aux"] {
             fs::write(plan.output_dir.join(format!("main.{ext}")), "old").unwrap();

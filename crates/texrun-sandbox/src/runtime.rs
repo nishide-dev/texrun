@@ -42,7 +42,7 @@ const MAX_OUTPUT: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RuntimeKind {
-    /// Docker (Docker Engine, Docker Desktop, OrbStack, ...).
+    /// Docker (Docker Engine, Docker Desktop, `OrbStack`, ...).
     Docker,
     /// Podman, typically rootless.
     Podman,

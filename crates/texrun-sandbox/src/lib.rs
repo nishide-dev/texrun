@@ -55,7 +55,7 @@
 //! # Platform support
 //!
 //! Unix only, like `texrun-process`. The container runs Linux; on macOS the
-//! runtime runs it in a VM (Docker Desktop, OrbStack, `podman machine`),
+//! runtime runs it in a VM (Docker Desktop, `OrbStack`, `podman machine`),
 //! and the mounted directories must be shared with that VM (the system
 //! temporary directory is by default).
 

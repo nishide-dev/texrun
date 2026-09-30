@@ -506,6 +506,7 @@ dependencies = [
  "texrun-latex-log",
  "texrun-preview",
  "texrun-process",
+ "texrun-sandbox",
  "texrun-workspace",
 ]
 
