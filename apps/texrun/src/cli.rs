@@ -40,19 +40,19 @@ Output:
   errors, and stderr may still carry human-readable warnings.
 
   The project root (by default the entrypoint's directory) is copied into a
-  temporary workspace, without VCS metadata, texrun-out/, .texrun/ and tool
-  configuration such as latexmkrc (which texrun never reads). Files above
-  the entrypoint's directory (e.g. \\input{../common/macros}) cannot be read
-  by TeX; put the entrypoint in the project root instead.
+  temporary workspace, without VCS metadata, texrun-out/, .texrun/, an
+  --output directory inside the project (unless it contains the entrypoint)
+  and tool configuration such as latexmkrc (which texrun never reads). Files
+  above the entrypoint's directory (e.g. \\input{../common/macros}) cannot
+  be read by TeX; put the entrypoint in the project root instead.
 
   The PDF, the log and, after a successful compile, PNG previews of the
   first pages (preview/page-NNN.png) are copied to the output directory,
   replacing files of the same name. Symlinks inside the project are never
   followed on the way to the output directory (the default texrun-out/ is
-  inside the project); put an --output below the project directly in its
-  top level, or it is copied into the next workspace. Files from an earlier run (a PDF when
-  the compile now fails, previews of pages no longer rendered) are not
-  removed; rely on the exit code and the reported artifacts.
+  inside the project). Files from an earlier run (a PDF when the compile now
+  fails, previews of pages no longer rendered) are not removed; rely on the
+  exit code and the reported artifacts.
 ";
 
 /// Compile LaTeX documents and report structured results.

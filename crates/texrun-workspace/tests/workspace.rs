@@ -393,6 +393,140 @@ fn custom_output_dir_is_excluded_and_other_names_configurable() {
     );
 }
 
+fn create_excluding(f: &Fixture, entry: &str, paths: &[&str]) -> Result<Workspace, WorkspaceError> {
+    let config = f.config().with_excluded_paths(paths.iter().map(|p| wp(p)));
+    Workspace::create(&f.input(entry), CompileOptions::default(), &config)
+}
+
+#[test]
+fn excluded_paths_leave_out_only_that_subtree() {
+    let f = Fixture::new();
+    // A deep output directory of an earlier run.
+    write(f.root(), "a/b/c/pdf/main.pdf", "old pdf");
+    write(f.root(), "a/b/c/pdf/preview/page-001.png", "old png");
+    // Ancestors and siblings of the excluded path.
+    write(f.root(), "a/notes.tex", "notes");
+    write(f.root(), "a/b/c/figures/plot.pdf", "plot");
+    write(f.root(), "a/b/c/pdf2/x.tex", "prefix-like sibling");
+    write(f.root(), "a/b/c/pdf.tex", "file next to it");
+    // The same names elsewhere in the tree.
+    write(f.root(), "pdf/y.tex", "top-level pdf");
+    write(
+        f.root(),
+        "other/a/b/c/pdf/z.tex",
+        "same path below another directory",
+    );
+    // A file where an ancestor of an excluded path would be.
+    write(f.root(), "data", "a file, not a directory");
+
+    let ws = create_excluding(&f, "main.tex", &["a/b/c/pdf", "data/deep"]).unwrap();
+    assert!(fs::symlink_metadata(ws.path().join("a/b/c/pdf")).is_err());
+    for (rel, contents) in [
+        ("a/notes.tex", "notes"),
+        ("a/b/c/figures/plot.pdf", "plot"),
+        ("a/b/c/pdf2/x.tex", "prefix-like sibling"),
+        ("a/b/c/pdf.tex", "file next to it"),
+        ("pdf/y.tex", "top-level pdf"),
+        ("other/a/b/c/pdf/z.tex", "same path below another directory"),
+        ("data", "a file, not a directory"),
+    ] {
+        assert_eq!(read(ws.path(), rel), contents, "{rel}");
+    }
+    // The excluded directory counts once; its contents are not listed.
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedPath),
+        [PathBuf::from("a/b/c/pdf")]
+    );
+    assert_eq!(ws.report().excluded_total, 1, "{:?}", ws.report());
+}
+
+#[test]
+fn excluded_paths_match_case_and_normalization_variants() {
+    let f = Fixture::new();
+    // Separate parents: on APFS some of these spellings collide.
+    write(f.root(), "c1/Build/PDF/stale.pdf", "upper case");
+    write(f.root(), "c2/build/p\u{FF44}f/stale.pdf", "fullwidth d");
+    // NFD on disk, NFC in the configuration (and vice versa).
+    write(f.root(), "c3/re\u{301}sume\u{301}/out/stale.pdf", "nfd");
+    write(f.root(), "c4/r\u{e9}sum\u{e9}/out/stale.pdf", "nfc");
+    write(f.root(), "c1/Build/keep.tex", "kept");
+
+    let ws = create_excluding(
+        &f,
+        "main.tex",
+        &[
+            "c1/build/pdf",
+            "c2/build/pdf",
+            "c3/r\u{e9}sum\u{e9}/out",
+            "c4/re\u{301}sume\u{301}/out",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedPath),
+        [
+            "c1/Build/PDF",
+            "c2/build/p\u{FF44}f",
+            "c3/re\u{301}sume\u{301}/out",
+            "c4/r\u{e9}sum\u{e9}/out",
+        ]
+        .map(PathBuf::from)
+    );
+    for rel in [
+        "c1/Build/PDF",
+        "c1/build/pdf",
+        "c2/build/pdf",
+        "c2/build/p\u{FF44}f",
+        "c3/re\u{301}sume\u{301}/out",
+        "c3/r\u{e9}sum\u{e9}/out",
+        "c4/r\u{e9}sum\u{e9}/out",
+    ] {
+        assert!(fs::symlink_metadata(ws.path().join(rel)).is_err(), "{rel}");
+    }
+    assert_eq!(read(ws.path(), "c1/Build/keep.tex"), "kept");
+}
+
+#[test]
+fn excluded_paths_apply_to_symlinks_and_the_entrypoint() {
+    let f = Fixture::new();
+    write(f.root(), "build/pdf/main.tex", "x");
+    write(f.root(), "build/pdf/old.pdf", "old");
+    write(f.root(), "build/keep.tex", "keep");
+    symlink("build/pdf/old.pdf", f.root().join("old.pdf"));
+    symlink("build/PDF", f.root().join("pdf-dir"));
+    symlink("build/keep.tex", f.root().join("keep.tex"));
+    // A symlink at the excluded path itself.
+    write(f.root(), "other/target.tex", "t");
+    symlink("../other", f.root().join("build/out"));
+
+    let ws = create_excluding(&f, "main.tex", &["build/pdf", "build/out"]).unwrap();
+    assert!(fs::symlink_metadata(ws.path().join("old.pdf")).is_err());
+    assert!(fs::symlink_metadata(ws.path().join("build/out")).is_err());
+    assert_eq!(read(ws.path(), "keep.tex"), "keep");
+    assert!(
+        excluded_paths(&ws, ExclusionReason::SymlinkToExcluded).contains(&PathBuf::from("old.pdf"))
+    );
+    assert_eq!(
+        excluded_paths(&ws, ExclusionReason::ExcludedPath),
+        ["build/out", "build/pdf"].map(PathBuf::from)
+    );
+    // `pdf-dir -> build/PDF` resolves (to the excluded directory) only
+    // where the filesystem folds case, and dangles elsewhere; either way it
+    // is left out.
+    assert!(fs::symlink_metadata(ws.path().join("pdf-dir")).is_err());
+    drop(ws);
+
+    assert!(matches!(
+        create_excluding(&f, "build/pdf/main.tex", &["build/pdf"]),
+        Err(WorkspaceError::EntrypointExcluded(_))
+    ));
+    assert!(matches!(
+        create_excluding(&f, "build/pdf/main.tex", &["Build"]),
+        Err(WorkspaceError::EntrypointExcluded(_))
+    ));
+    assert_eq!(f.leftover_workspaces(), 0);
+}
+
 #[test]
 fn special_files_are_skipped() {
     let f = Fixture::new();

@@ -56,6 +56,8 @@ pub enum ExclusionReason {
     /// The directory containing the workspace itself (only when workspaces
     /// are created below the project root).
     WorkspaceDirectory,
+    /// The entry is at one of [`WorkspaceConfig::excluded_paths`].
+    ExcludedPath,
 }
 
 /// An entry of the project that was left out of the workspace. Entries
@@ -111,35 +113,110 @@ impl MaterializeReport {
     }
 }
 
-/// Where in the tree a directory is, for name-based decisions about its
-/// entries.
-#[derive(Debug, Clone, Copy)]
+/// Where in the tree a directory is, for name- and path-based decisions
+/// about its entries.
+#[derive(Debug, Clone)]
 struct Level {
     /// The directory is the project root.
     at_root: bool,
-    /// `Some(i)` if the directory corresponds to the first `i` components of
-    /// the output directory, so an entry matching component `i` is on the
-    /// output path.
-    out_idx: Option<usize>,
+    /// Number of components of the directory's path below the root (0 for
+    /// the root), i.e. the index of the path component its entries are
+    /// compared with.
+    depth: usize,
+    /// Path rules ([`Exclusions::paths`]) whose first `depth` components
+    /// are this directory, so an entry matching component `depth` is on
+    /// their path.
+    paths: Vec<usize>,
+}
+
+impl Level {
+    fn root(exclusions: &Exclusions) -> Self {
+        Self {
+            at_root: true,
+            depth: 0,
+            paths: (0..exclusions.paths.len()).collect(),
+        }
+    }
+
+    /// The level of a subdirectory kept with `paths` from its [`Verdict`].
+    fn child(&self, paths: Vec<usize>) -> Self {
+        Self {
+            at_root: false,
+            depth: self.depth + 1,
+            paths,
+        }
+    }
 }
 
 /// Decision about one entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
     Exclude(ExclusionReason),
-    /// Copy it. For a directory on the output path, `child_out` is the
-    /// [`Level::out_idx`] of its contents.
+    /// Copy it. For a directory on the path of some path rules, `paths` are
+    /// the [`Level::paths`] of its contents.
     Keep {
-        child_out: Option<usize>,
+        paths: Vec<usize>,
     },
+}
+
+impl Verdict {
+    /// Copy it; not on any rule's path.
+    fn keep() -> Self {
+        Self::Keep { paths: Vec::new() }
+    }
+}
+
+/// What a root-relative path rule stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    /// The workspace output directory. A non-directory where one of its
+    /// ancestors has to be is excluded too, since it would shadow it.
+    Output,
+    /// One of [`WorkspaceConfig::excluded_paths`]. Only the path itself (and
+    /// so everything below it) is excluded; its ancestors and siblings are
+    /// not affected.
+    Excluded,
+}
+
+/// A path relative to the project root, split into components.
+#[derive(Debug)]
+struct PathRule {
+    kind: PathKind,
+    /// Components as given, for the filesystem alias check.
+    raw: Vec<String>,
+    /// Folded components.
+    folded: Vec<String>,
+}
+
+impl PathRule {
+    fn new(kind: PathKind, path: &WorkspacePath) -> Self {
+        let raw: Vec<String> = path.as_str().split('/').map(str::to_owned).collect();
+        Self {
+            kind,
+            folded: raw.iter().map(|c| fold(c)).collect(),
+            raw,
+        }
+    }
+}
+
+/// What an entry matching component `i` of a path rule means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathStep {
+    Exclude(ExclusionReason),
+    /// A directory on the path: its contents are compared with the next
+    /// component.
+    Descend,
+    /// A non-directory where an ancestor of an excluded path would be: the
+    /// rule does not apply to it.
+    Unaffected,
 }
 
 /// What a protected spelling stands for.
 #[derive(Debug, Clone, Copy)]
 enum Protected {
     Reason(ExclusionReason),
-    /// Component `i` of the output directory.
-    Output(usize),
+    /// The current component of path rule `i`.
+    Path(usize),
 }
 
 /// Decides which entries never enter the workspace.
@@ -150,12 +227,12 @@ pub(crate) struct Exclusions {
     root_names: Vec<String>,
     /// Folded extensions.
     extensions: Vec<String>,
-    /// Folded output dir components.
-    output: Vec<String>,
+    /// Root-relative paths: the output directory first, then
+    /// [`WorkspaceConfig::excluded_paths`].
+    paths: Vec<PathRule>,
     /// Spellings asked of the workspace filesystem after creating an entry.
     raw_names: Vec<(String, ExclusionReason)>,
     raw_root_names: Vec<String>,
-    raw_output: Vec<String>,
     /// Name folding is on; only switched off in tests of the filesystem
     /// alias check.
     lexical: bool,
@@ -173,7 +250,14 @@ impl Exclusions {
                     .map(|n| (n.clone(), ExclusionReason::ExcludedName)),
             )
             .collect();
-        let raw_output: Vec<String> = output_dir.as_str().split('/').map(str::to_owned).collect();
+        let paths = std::iter::once(PathRule::new(PathKind::Output, output_dir))
+            .chain(
+                config
+                    .excluded_paths
+                    .iter()
+                    .map(|p| PathRule::new(PathKind::Excluded, p)),
+            )
+            .collect();
         Self {
             names: raw_names.iter().map(|(n, r)| (fold(n), *r)).collect(),
             root_names: config.excluded_root_names.iter().map(|n| fold(n)).collect(),
@@ -182,10 +266,9 @@ impl Exclusions {
                 .iter()
                 .map(|e| fold(e.trim_start_matches('.')))
                 .collect(),
-            output: raw_output.iter().map(|c| fold(c)).collect(),
+            paths,
             raw_names,
             raw_root_names: config.excluded_root_names.clone(),
-            raw_output,
             lexical: true,
         }
     }
@@ -208,43 +291,70 @@ impl Exclusions {
         }
     }
 
-    fn output_verdict(&self, idx: usize, is_dir: bool) -> Verdict {
-        if idx + 1 == self.output.len() || !is_dir {
+    /// What an entry matching component `i` of path rule `rule` means.
+    fn path_step(&self, rule: usize, i: usize, is_dir: bool) -> PathStep {
+        let rule = &self.paths[rule];
+        let last = i + 1 == rule.folded.len();
+        match rule.kind {
             // The output directory itself, or a non-directory where one of
             // its ancestors has to be (e.g. a `.texrun` file or symlink).
-            Verdict::Exclude(ExclusionReason::OutputDirectory)
-        } else {
-            Verdict::Keep {
-                child_out: Some(idx + 1),
+            PathKind::Output if last || !is_dir => {
+                PathStep::Exclude(ExclusionReason::OutputDirectory)
             }
+            // Any kind of entry at the excluded path itself.
+            PathKind::Excluded if last => PathStep::Exclude(ExclusionReason::ExcludedPath),
+            _ if is_dir => PathStep::Descend,
+            _ => PathStep::Unaffected,
         }
     }
 
+    /// Combines the steps of the path rules `rules`, all matched by an entry
+    /// in a directory at `level`: the first exclusion wins (the output
+    /// directory comes first), otherwise the entry is kept with the rules it
+    /// descends into.
+    fn path_verdict(
+        &self,
+        level: &Level,
+        is_dir: bool,
+        rules: impl IntoIterator<Item = usize>,
+    ) -> Verdict {
+        let mut paths = Vec::new();
+        for rule in rules {
+            match self.path_step(rule, level.depth, is_dir) {
+                PathStep::Exclude(reason) => return Verdict::Exclude(reason),
+                PathStep::Descend => paths.push(rule),
+                PathStep::Unaffected => {}
+            }
+        }
+        Verdict::Keep { paths }
+    }
+
     /// Lexical decision for an entry named `name` in a directory at `level`.
-    fn classify(&self, name: &OsStr, level: Level, is_dir: bool) -> Verdict {
+    fn classify(&self, name: &OsStr, level: &Level, is_dir: bool) -> Verdict {
         // Non-UTF-8 names never match lexically; the filesystem alias check
         // still applies to them.
-        let Some(folded) = name.to_str().map(fold) else {
-            return Verdict::Keep { child_out: None };
+        let Some(raw) = name.to_str() else {
+            return Verdict::keep();
         };
+        let folded = fold(raw);
         if self.lexical
             && let Some(reason) = self.name_reason(&folded, level.at_root, is_dir)
         {
             return Verdict::Exclude(reason);
         }
-        match level.out_idx {
-            Some(i)
-                if (!self.lexical && name.to_str() == Some(&self.raw_output[i]))
-                    || (self.lexical && folded == self.output[i]) =>
-            {
-                self.output_verdict(i, is_dir)
+        let on_path = level.paths.iter().copied().filter(|&r| {
+            let rule = &self.paths[r];
+            if self.lexical {
+                rule.folded[level.depth] == folded
+            } else {
+                rule.raw[level.depth] == raw
             }
-            _ => Verdict::Keep { child_out: None },
-        }
+        });
+        self.path_verdict(level, is_dir, on_path)
     }
 
     /// Spellings that must not be reachable in a directory at `level`.
-    fn protected(&self, level: Level) -> Vec<(&str, Protected)> {
+    fn protected(&self, level: &Level) -> Vec<(&str, Protected)> {
         let mut out: Vec<(&str, Protected)> = self
             .raw_names
             .iter()
@@ -257,46 +367,54 @@ impl Exclusions {
                     .map(|n| (n.as_str(), Protected::Reason(ExclusionReason::ExcludedName))),
             );
         }
-        if let Some(i) = level.out_idx {
-            out.push((self.raw_output[i].as_str(), Protected::Output(i)));
-        }
+        out.extend(
+            level
+                .paths
+                .iter()
+                .map(|&r| (self.paths[r].raw[level.depth].as_str(), Protected::Path(r))),
+        );
         out
     }
 
     /// Asks the workspace filesystem whether the entry just created as
     /// `name` in `dst` (identity `created`) is also reachable under a
     /// protected spelling, e.g. because the filesystem folds case or
-    /// normalizes Unicode. Returns the resulting verdict, if any.
+    /// normalizes Unicode. Returns the resulting verdict, if any: an
+    /// exclusion, or the path rules the directory turns out to be on (in
+    /// addition to those found by [`Exclusions::classify`]).
     fn alias_verdict(
         &self,
         dst: &OwnedFd,
         name: &OsStr,
         created: FileId,
-        level: Level,
+        level: &Level,
         is_dir: bool,
     ) -> io::Result<Option<Verdict>> {
+        let mut rules = Vec::new();
         for (spelling, protected) in self.protected(level) {
             if spelling.as_bytes() == name.as_bytes() {
                 continue;
             }
             match rustix::fs::statat(dst, spelling, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(st) if FileId::of(&st) == created => {
-                    return Ok(Some(match protected {
-                        Protected::Reason(r) => Verdict::Exclude(r),
-                        Protected::Output(i) => self.output_verdict(i, is_dir),
-                    }));
-                }
+                Ok(st) if FileId::of(&st) == created => match protected {
+                    Protected::Reason(r) => return Ok(Some(Verdict::Exclude(r))),
+                    Protected::Path(r) => rules.push(r),
+                },
                 Ok(_) | Err(Errno::NOENT | Errno::NOTDIR | Errno::NAMETOOLONG | Errno::ILSEQ) => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(None)
+        if rules.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.path_verdict(level, is_dir, rules)))
     }
 
     /// Whether `rel` (e.g. a symlink target or the entrypoint) is excluded
-    /// by any of its components, or touches the output directory (is it, is
-    /// below it, or is one of its ancestors). `is_dir` tells whether the last
-    /// component is a directory; all others are.
+    /// by any of its components, is at or below an excluded path, or
+    /// touches the output directory (is it, is below it, or is one of its
+    /// ancestors). `is_dir` tells whether the last component is a
+    /// directory; all others are.
     pub(crate) fn excludes_path(&self, rel: &Path, is_dir: bool) -> bool {
         let comps: Vec<Option<String>> = rel.iter().map(|c| c.to_str().map(fold)).collect();
         let last = comps.len().saturating_sub(1);
@@ -307,12 +425,17 @@ impl Exclusions {
         if by_name {
             return true;
         }
-        let common = comps
-            .iter()
-            .zip(&self.output)
-            .take_while(|(a, b)| a.as_deref() == Some(b.as_str()))
-            .count();
-        common == comps.len() || common == self.output.len()
+        self.paths.iter().any(|rule| {
+            let common = comps
+                .iter()
+                .zip(&rule.folded)
+                .take_while(|(a, b)| a.as_deref() == Some(b.as_str()))
+                .count();
+            match rule.kind {
+                PathKind::Output => common == comps.len() || common == rule.folded.len(),
+                PathKind::Excluded => common == rule.folded.len(),
+            }
+        })
     }
 }
 
@@ -350,7 +473,7 @@ struct Entry<'n> {
     rel: PathBuf,
     id: FileId,
     /// Level of the directory containing the entry.
-    level: Level,
+    level: &'n Level,
 }
 
 /// Copies a project root into a workspace directory.
@@ -398,11 +521,8 @@ impl<'a> Materializer<'a> {
         src: &OwnedFd,
         dst: &OwnedFd,
     ) -> Result<MaterializeReport, WorkspaceError> {
-        let level = Level {
-            at_root: true,
-            out_idx: Some(0),
-        };
-        self.copy_dir(src, dst, Path::new(""), 0, level)?;
+        let level = Level::root(self.exclusions);
+        self.copy_dir(src, dst, Path::new(""), 0, &level)?;
         Ok(self.report)
     }
 
@@ -454,7 +574,7 @@ impl<'a> Materializer<'a> {
         dst: &OwnedFd,
         rel: &Path,
         depth: usize,
-        level: Level,
+        level: &Level,
     ) -> Result<(), WorkspaceError> {
         let names = self.list(src, rel)?;
         self.copy_entries(src, dst, rel, depth, level, names)
@@ -467,7 +587,7 @@ impl<'a> Materializer<'a> {
         dst: &OwnedFd,
         rel: &Path,
         depth: usize,
-        level: Level,
+        level: &Level,
         names: Vec<OsString>,
     ) -> Result<(), WorkspaceError> {
         for name in names {
@@ -487,16 +607,17 @@ impl<'a> Materializer<'a> {
                 self.exclude(rel_child, ExclusionReason::WorkspaceDirectory);
                 continue;
             }
-            let child_out = match self
-                .exclusions
-                .classify(&name, level, ft == FileType::Directory)
-            {
-                Verdict::Exclude(reason) => {
-                    self.exclude(rel_child, reason);
-                    continue;
-                }
-                Verdict::Keep { child_out } => child_out,
-            };
+            let child_paths =
+                match self
+                    .exclusions
+                    .classify(&name, level, ft == FileType::Directory)
+                {
+                    Verdict::Exclude(reason) => {
+                        self.exclude(rel_child, reason);
+                        continue;
+                    }
+                    Verdict::Keep { paths } => paths,
+                };
             if !matches!(
                 ft,
                 FileType::Directory | FileType::RegularFile | FileType::Symlink
@@ -518,7 +639,7 @@ impl<'a> Materializer<'a> {
                 level,
             };
             match ft {
-                FileType::Directory => self.copy_subdir(src, dst, &entry, depth, child_out)?,
+                FileType::Directory => self.copy_subdir(src, dst, &entry, depth, child_paths)?,
                 FileType::RegularFile => self.copy_file(src, dst, &entry, &st)?,
                 _ => self.copy_symlink(src, dst, &entry)?,
             }
@@ -547,7 +668,7 @@ impl<'a> Materializer<'a> {
         dst: &OwnedFd,
         entry: &Entry<'_>,
         depth: usize,
-        mut child_out: Option<usize>,
+        mut child_paths: Vec<usize>,
     ) -> Result<(), WorkspaceError> {
         let rel = &entry.rel;
         let sub_src = open_dir_checked(src, entry.name, entry.id, rel)?;
@@ -565,15 +686,17 @@ impl<'a> Materializer<'a> {
                 drop(sub_dst);
                 return self.undo(dst, entry, AtFlags::REMOVEDIR, reason);
             }
-            Some(Verdict::Keep { child_out: c }) => child_out = c,
+            Some(Verdict::Keep { paths }) => {
+                // Also on the paths of the rules found by the filesystem.
+                child_paths.extend(paths);
+                child_paths.sort_unstable();
+                child_paths.dedup();
+            }
             None => {}
         }
         self.count_entry()?;
-        let level = Level {
-            at_root: false,
-            out_idx: child_out,
-        };
-        self.copy_dir(&sub_src, &sub_dst, rel, depth + 1, level)
+        let level = entry.level.child(child_paths);
+        self.copy_dir(&sub_src, &sub_dst, rel, depth + 1, &level)
     }
 
     fn copy_file(
@@ -753,21 +876,15 @@ mod tests {
 
     fn classify(ex: &Exclusions, rel: &str, is_dir: bool) -> Verdict {
         // Walk the parents like the materializer does.
-        let mut level = Level {
-            at_root: true,
-            out_idx: Some(0),
-        };
+        let mut level = Level::root(ex);
         let comps: Vec<&str> = rel.split('/').collect();
         for parent in &comps[..comps.len() - 1] {
-            let Verdict::Keep { child_out } = ex.classify(OsStr::new(parent), level, true) else {
+            let Verdict::Keep { paths } = ex.classify(OsStr::new(parent), &level, true) else {
                 panic!("{parent} excluded");
             };
-            level = Level {
-                at_root: false,
-                out_idx: child_out,
-            };
+            level = level.child(paths);
         }
-        ex.classify(OsStr::new(comps[comps.len() - 1]), level, is_dir)
+        ex.classify(OsStr::new(comps[comps.len() - 1]), &level, is_dir)
     }
 
     fn excluded(reason: ExclusionReason) -> Verdict {
@@ -779,7 +896,7 @@ mod tests {
         use ExclusionReason::{ExcludedExtension, ExcludedName, OutputDirectory, ToolConfig};
         let config = WorkspaceConfig::default();
         let ex = Exclusions::new(&config, &wp(".texrun/out"));
-        let keep = Verdict::Keep { child_out: None };
+        let keep = Verdict::keep();
         assert_eq!(classify(&ex, "latexmkrc", false), excluded(ToolConfig));
         assert_eq!(classify(&ex, "sub/.LatexMkRc", false), excluded(ToolConfig));
         assert_eq!(
@@ -805,7 +922,7 @@ mod tests {
         let ex = Exclusions::new(&config, &wp("build/out"));
         assert_eq!(
             classify(&ex, "build", true),
-            Verdict::Keep { child_out: Some(1) }
+            Verdict::Keep { paths: vec![0] }
         );
         assert_eq!(classify(&ex, "build", false), excluded(OutputDirectory));
         assert_eq!(classify(&ex, "build/out", true), excluded(OutputDirectory));
@@ -838,11 +955,57 @@ mod tests {
     }
 
     #[test]
+    fn classify_by_excluded_path() {
+        use ExclusionReason::{ExcludedPath, OutputDirectory};
+        let config = WorkspaceConfig::default().with_excluded_paths([wp("build/pdf"), wp("a/b/c")]);
+        let ex = Exclusions::new(&config, &wp("build/out"));
+        let keep = Verdict::keep();
+        assert_eq!(classify(&ex, "build/pdf", true), excluded(ExcludedPath));
+        assert_eq!(classify(&ex, "build/pdf", false), excluded(ExcludedPath));
+        assert_eq!(
+            classify(&ex, "Build/P\u{FF24}F", true),
+            excluded(ExcludedPath)
+        );
+        assert_eq!(classify(&ex, "build/out", true), excluded(OutputDirectory));
+        // `build` is on the path of both the output directory and `build/pdf`.
+        assert_eq!(
+            classify(&ex, "build", true),
+            Verdict::Keep { paths: vec![0, 1] }
+        );
+        assert_eq!(classify(&ex, "a/b", true), Verdict::Keep { paths: vec![2] });
+        assert_eq!(classify(&ex, "a/b/c", true), excluded(ExcludedPath));
+        assert_eq!(classify(&ex, "A/B/C", false), excluded(ExcludedPath));
+        // Ancestors that are not directories, siblings, and the same names
+        // elsewhere are not affected.
+        assert_eq!(classify(&ex, "a", false), keep);
+        assert_eq!(classify(&ex, "a/b", false), keep);
+        assert_eq!(classify(&ex, "a/b/d", true), keep);
+        assert_eq!(classify(&ex, "a/b/cc", true), keep);
+        assert_eq!(classify(&ex, "build/figures", true), keep);
+        assert_eq!(classify(&ex, "pdf", true), keep);
+        assert_eq!(classify(&ex, "x/build/pdf", true), keep);
+        assert_eq!(classify(&ex, "b/c", true), keep);
+    }
+
+    #[test]
+    fn excludes_path_checks_excluded_paths() {
+        let config = WorkspaceConfig::default().with_excluded_paths([wp("build/pdf")]);
+        let ex = Exclusions::new(&config, &wp(".texrun/out"));
+        assert!(ex.excludes_path(Path::new("build/pdf"), true));
+        assert!(ex.excludes_path(Path::new("build/pdf/main.pdf"), false));
+        assert!(ex.excludes_path(Path::new("BUILD/Pdf/x"), false));
+        assert!(!ex.excludes_path(Path::new("build"), true));
+        assert!(!ex.excludes_path(Path::new("build/pdf2/x"), false));
+        assert!(!ex.excludes_path(Path::new("build/figures/x.pdf"), false));
+        assert!(!ex.excludes_path(Path::new("x/build/pdf"), true));
+    }
+
+    #[test]
     fn excluded_extensions_apply_to_files_and_symlinks_only() {
         use ExclusionReason::ExcludedExtension;
         let config = WorkspaceConfig::default();
         let ex = Exclusions::new(&config, &wp(".texrun/out"));
-        let keep = Verdict::Keep { child_out: None };
+        let keep = Verdict::keep();
         assert_eq!(classify(&ex, "data.base", true), keep);
         assert_eq!(classify(&ex, "sub/x.FMT", true), keep);
         assert_eq!(classify(&ex, "memo.mem", true), keep);
@@ -866,10 +1029,7 @@ mod tests {
         let src_root = std::fs::canonicalize(src.path()).unwrap();
         let dst_root = std::fs::canonicalize(dst.path()).unwrap();
         let mut m = Materializer::new(config.limits, &ex, &src_root, &dst_root);
-        let level = Level {
-            at_root: true,
-            out_idx: Some(0),
-        };
+        let level = Level::root(&ex);
         // As if `gone.tex` had been listed and then removed before `statat`.
         let names = vec![OsString::from("gone.tex"), OsString::from("main.tex")];
         m.copy_entries(
@@ -877,7 +1037,7 @@ mod tests {
             &open_dir(&dst_root),
             Path::new(""),
             0,
-            level,
+            &level,
             names,
         )
         .unwrap();
@@ -954,8 +1114,11 @@ mod tests {
         std::fs::create_dir(src.path().join(".GIT")).unwrap();
         std::fs::create_dir_all(src.path().join("BUILD/OUT")).unwrap();
         std::fs::write(src.path().join("BUILD/OUT/stale.pdf"), "stale").unwrap();
+        std::fs::create_dir_all(src.path().join("BUILD/PDF")).unwrap();
+        std::fs::write(src.path().join("BUILD/PDF/old.pdf"), "old").unwrap();
+        std::fs::write(src.path().join("BUILD/keep.tex"), "keep").unwrap();
 
-        let config = WorkspaceConfig::default();
+        let config = WorkspaceConfig::default().with_excluded_paths([wp("build/pdf")]);
         let mut ex = Exclusions::new(&config, &wp("build/out"));
         ex.lexical = false;
         let src_root = std::fs::canonicalize(src.path()).unwrap();
@@ -970,7 +1133,9 @@ mod tests {
             assert!(!exists("latexmkrc"));
             assert!(!exists(".git"));
             assert!(!exists("build/out"));
+            assert!(!exists("build/pdf"));
             assert!(exists("build"));
+            assert!(exists("build/keep.tex"));
             let reasons: Vec<_> = report.excluded.iter().map(|e| e.reason).collect();
             assert!(reasons.contains(&ExclusionReason::ToolConfig), "{report:?}");
             assert!(
@@ -979,6 +1144,10 @@ mod tests {
             );
             assert!(
                 reasons.contains(&ExclusionReason::OutputDirectory),
+                "{report:?}"
+            );
+            assert!(
+                reasons.contains(&ExclusionReason::ExcludedPath),
                 "{report:?}"
             );
         } else {

@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use texrun_core::WorkspacePath;
+
 /// Upper bounds applied while copying a project into a workspace.
 ///
 /// Exceeding any of them aborts materialization with
@@ -83,11 +85,12 @@ impl Default for WorkspaceLimits {
 
 /// How a [`Workspace`](crate::Workspace) is created and cleaned up.
 ///
-/// Name and extension matching is done on a folded form of the name
-/// (Unicode NFKC + lowercase), so `LATEXM\u{212A}RC` (with a Kelvin sign)
+/// Name, extension and path-component matching is done on a folded form of
+/// the name (Unicode NFKC + lowercase), so `LATEXM\u{212A}RC` (with a Kelvin sign)
 /// matches `latexmkrc`. In addition, after each entry is created in the
 /// workspace, the workspace filesystem itself is asked whether the new entry
-/// is reachable under one of the protected names (e.g. because the
+/// is reachable under one of the protected names or path components (e.g.
+/// because the
 /// filesystem is case- or normalization-insensitive); such entries are
 /// removed again and reported as excluded.
 ///
@@ -113,6 +116,19 @@ pub struct WorkspaceConfig {
     /// `data.base/` directory is copied). Defaults to
     /// [`WorkspaceConfig::DEFAULT_EXCLUDED_EXTENSIONS`].
     pub excluded_extensions: Vec<String>,
+    /// Paths relative to the project root that are never copied (with
+    /// everything below them), e.g. a nested output directory such as
+    /// `build/pdf`. Empty by default.
+    ///
+    /// Each component is matched like a name in
+    /// [`WorkspaceConfig::excluded_names`] (folded, and checked again on the
+    /// workspace filesystem), so `Build/PDF` also matches `build/pdf`. Only
+    /// the path itself is excluded: its ancestors (`build/`) and siblings
+    /// (`build/figures/`) are copied, and a file named like one of its
+    /// ancestors is not affected. Excluded entries are reported as
+    /// [`ExclusionReason::ExcludedPath`](crate::ExclusionReason::ExcludedPath);
+    /// an entrypoint at or below one of these paths is rejected.
+    pub excluded_paths: Vec<WorkspacePath>,
     /// Keep the workspace directory on drop instead of deleting it (for
     /// debugging), and also when creating it fails. Can also be changed
     /// later with [`Workspace::set_keep`](crate::Workspace::set_keep).
@@ -182,6 +198,16 @@ impl WorkspaceConfig {
         self
     }
 
+    /// Replaces [`WorkspaceConfig::excluded_paths`].
+    #[must_use]
+    pub fn with_excluded_paths<I>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = WorkspacePath>,
+    {
+        self.excluded_paths = paths.into_iter().collect();
+        self
+    }
+
     /// Sets whether the workspace is kept on drop (and on failure).
     #[must_use]
     pub fn with_keep(mut self, keep: bool) -> Self {
@@ -208,6 +234,7 @@ impl Default for WorkspaceConfig {
             excluded_names: owned(Self::DEFAULT_EXCLUDED_NAMES),
             excluded_root_names: owned(Self::DEFAULT_EXCLUDED_ROOT_NAMES),
             excluded_extensions: owned(Self::DEFAULT_EXCLUDED_EXTENSIONS),
+            excluded_paths: Vec::new(),
             keep: false,
             temp_parent: None,
         }

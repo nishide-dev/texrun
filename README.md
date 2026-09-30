@@ -104,7 +104,12 @@ previews to the output directory. See `texrun compile --help` for details.
 
 The workspace never contains VCS metadata, `texrun-out/`, `.texrun/`,
 precompiled formats or tool configuration such as `latexmkrc` (texrun never
-runs it; a warning is printed when one is left out). TeX cannot read files
+runs it; a warning is printed when one is left out). An `--output` directory
+inside the project is left out too, at any depth (reported with reason
+`excluded_path`; any other files kept there are not copied either), unless
+it contains the entrypoint (also through a symlink): then it is copied with
+the project, including the output of earlier runs, and an info note
+`output_contains_entrypoint` says so. TeX cannot read files
 above the entrypoint's directory (`\input{../x}`); keep the entrypoint in the
 project root.
 
@@ -182,8 +187,9 @@ without changing `schema_version`.
 `notes[].kind` is one of `parent_directory_input` (a file above the
 entrypoint's directory was not found; `--root` does not help),
 `broad_project_root` (an explicit `--root` is `$HOME` or a temporary
-directory) and `output_inside_project` (the output directory is nested in
-the project and will be copied into the next workspace).
+directory) and `output_contains_entrypoint` (the output directory contains
+the entrypoint, so it is not left out of the workspace and earlier outputs
+are copied into it).
 
 ### Exit codes
 

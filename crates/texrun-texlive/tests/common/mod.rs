@@ -4,9 +4,10 @@
 //!
 //! Tests that need TeX Live start with [`require_texlive!`]. When `latexmk`
 //! is not on `PATH` they return early and print a `SKIPPED` line on the real
-//! stderr (not captured by the test harness), so `cargo test --workspace`
-//! passes on machines without TeX Live. Set `TEXRUN_REQUIRE_TEXLIVE=1` to
-//! turn a missing TeX Live into a failure instead; CI and the dev container
+//! stderr (not captured by the test harness), so
+//! `cargo test --workspace --all-features` passes on machines without TeX
+//! Live. Set `TEXRUN_REQUIRE_TEXLIVE=1` to turn a missing TeX Live into a
+//! failure instead; CI and the dev container
 //! do (docs/development.md):
 //!
 //! ```text

@@ -115,15 +115,6 @@ fn real_dir(parent: &Path, next: PathBuf) -> Result<PathBuf, OutputDirError> {
     }
 }
 
-/// Whether `output` (canonical) is below `project_root` but not directly in
-/// it: such a directory is copied into the next workspace (only
-/// `texrun-out` and direct children of the root are excluded).
-pub fn is_nested_in(output: &Path, project_root: &Path) -> bool {
-    output.starts_with(project_root)
-        && output != project_root
-        && output.parent() != Some(project_root)
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -259,14 +250,5 @@ mod tests {
         // stored spelling.
         let out = walk(&base.join("PROJ/SRC"), &root, true).unwrap().unwrap();
         assert_eq!(out, root.join("src"));
-    }
-
-    #[test]
-    fn nested_outputs() {
-        let root = Path::new("/p");
-        assert!(is_nested_in(Path::new("/p/a/b"), root));
-        assert!(!is_nested_in(Path::new("/p/a"), root));
-        assert!(!is_nested_in(Path::new("/p"), root));
-        assert!(!is_nested_in(Path::new("/q/a/b"), root));
     }
 }

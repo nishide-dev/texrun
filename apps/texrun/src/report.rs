@@ -127,7 +127,7 @@ pub struct Note {
     /// `warning` or `info`.
     pub severity: Severity,
     /// Stable code: `parent_directory_input`, `broad_project_root`,
-    /// `output_inside_project`.
+    /// `output_contains_entrypoint`.
     pub kind: &'static str,
     pub message: String,
     /// Already printed on stderr when it happened (human mode).
@@ -196,6 +196,7 @@ pub fn exclusion_reason(reason: ExclusionReason) -> &'static str {
         ExclusionReason::UnresolvableSymlink => "unresolvable_symlink",
         ExclusionReason::SpecialFile => "special_file",
         ExclusionReason::WorkspaceDirectory => "workspace_directory",
+        ExclusionReason::ExcludedPath => "excluded_path",
         _ => "other",
     }
 }
@@ -407,7 +408,7 @@ mod tests {
             kind::SIGNAL_SETUP,
             "parent_directory_input",
             "broad_project_root",
-            "output_inside_project",
+            "output_contains_entrypoint",
         ] {
             assert!(
                 readme.contains(&format!("`{code}`")),
