@@ -35,7 +35,6 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          texlive-latex-recommended \
          mupdf-tools \
          poppler-utils \
-         ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/log/apt/* /var/log/dpkg.log
 
@@ -48,10 +47,8 @@ RUN rustup component add rustfmt clippy \
     && cargo clippy --version \
     && rm -rf /usr/local/rustup/downloads/* /usr/local/rustup/tmp/*
 
-# Keep container build output separate from the host `target/` directory.
-ENV CARGO_TARGET_DIR=/cargo-target \
-    CARGO_TERM_COLOR=always
-
+# CARGO_TARGET_DIR is set in compose.yaml because it depends on the mount
+# layout (the repo is bind-mounted at /workspace).
 WORKDIR /workspace
 
 CMD ["bash"]

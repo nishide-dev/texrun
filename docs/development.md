@@ -61,22 +61,28 @@ host に Rust toolchain がある場合は host で直接実行してもよい�
 
 ## Cache
 
-再 build を速くするため、以下を named volume に保持している。
-
-| volume | mount 先 | 内容 |
+| 対象 | 保存先 | 共有範囲 |
 | --- | --- | --- |
-| `texrun_cargo-registry` | `/usr/local/cargo/registry` | crates.io の index / crate |
-| `texrun_cargo-git` | `/usr/local/cargo/git` | git 依存 |
-| `texrun_cargo-target` | `/cargo-target` | build 成果物（`CARGO_TARGET_DIR`） |
+| build 成果物（`CARGO_TARGET_DIR`） | `target/docker/`（bind mount 内、コンテナからは `/workspace/target/docker`） | checkout ごと |
+| cargo registry（crates.io の index / crate） | named volume `texrun_cargo-registry`（`/usr/local/cargo/registry`） | 全 checkout で共有 |
+| cargo git 依存 | named volume `texrun_cargo-git`（`/usr/local/cargo/git`） | 全 checkout で共有 |
 
-コンテナ内では `CARGO_TARGET_DIR=/cargo-target` を設定しているため、host の `target/`（macOS 向け build）とコンテナの build 成果物（Linux 向け）は混ざらない。
-成果物のパスは `/cargo-target/debug/...` になる点に注意する。
+- build 成果物は checkout ごとに分離している。cargo は local package の鮮度を mtime で判定し、どの checkout もコンテナ内では同じ `/workspace` に見えるため、target を checkout 間で共有すると別 worktree の古い成果物で test が通ってしまう（偽 green）おそれがある
+- `target/docker/` は `.gitignore` の `/target/` で無視される。host で build した `target/debug/` などとは別ディレクトリなので、macOS 向けと Linux 向けの成果物は混ざらない
+- registry / git の cache は内容で識別されるため共有しても安全。`compose.yaml` で project 名を `texrun` に固定しているので、どの checkout から実行しても同じ volume を使う
+- bind mount 上の target でも build 時間の差は小さい。OrbStack（macOS, Apple Silicon）で clean な `cargo clippy` + `cargo test` を測ると、named volume では約 2.4 秒、bind mount では約 2.6 秒だった（現状の小さな workspace で計測）
 
-cache を消したい場合:
+cache の消し方:
 
 ```bash
+# この checkout のコンテナ用 build 成果物だけを消す
+docker compose run --rm dev cargo clean
+
+# registry / git の cache volume も消す
 docker compose down --volumes
 ```
+
+`docker compose down --volumes` は project 名が固定なので、どの checkout で実行しても全 checkout 共有の registry / git cache が消える（次回は再ダウンロードになる）。各 checkout の `target/docker/` は消えない。
 
 ## TeX Live integration test
 
@@ -85,5 +91,10 @@ TeX Live を必要とする integration test の実行方法（`#[ignore]` + `--
 
 ## 注意事項
 
-- コンテナ内の process は root で動く。Docker Desktop / OrbStack（macOS）では bind mount 上に作られたファイルは host ユーザーの所有になるが、Linux の Docker Engine では root 所有になる。build 成果物は volume に出力されるため通常は問題にならない
+- コンテナ内の process は root で動く。Docker Desktop / OrbStack（macOS）では bind mount 上に作られたファイルは host ユーザーの所有になるが、Linux の Docker Engine では root 所有になる。Linux では `target/docker/` も root 所有になるため、消すときは `docker compose run --rm dev cargo clean` を使う。integration test（#10）の出力先は repo 内ではなく tempdir にする
+- image tag `texrun-dev:latest` は全 checkout で共有している。`Dockerfile` を変更した checkout で build すると、ほかの checkout が使う image も置き換わる。変更前の image に戻すときは、元の checkout で `docker compose build dev` をやり直す
+- base image は tag 指定（digest 固定なし）で、apt パッケージも version を固定していない。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）
+  - `texlive-binaries` 2024.20240313.70630+ds-6（pdfTeX 1.40.26）
+  - `texlive-latex-base` / `texlive-latex-recommended` 2024.20250309-1
+  - `latexmk` 4.86、`mupdf-tools` 1.25.1、`poppler-utils` 25.03.0
 - この image は開発・テスト用であり、本番の sandbox worker としての container 実行（#9 の post-MVP 範囲）は対象外
