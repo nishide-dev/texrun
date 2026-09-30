@@ -21,6 +21,11 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout of `rm --force`.
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often, and how far apart, the state of a container killed with
+/// `SIGKILL` is read again for a late OOM flag (at most 1 s in all).
+const OOM_EVENT_POLLS: usize = 10;
+const OOM_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Where `prlimit` is expected in the image (util-linux), for
 /// `RLIMIT_AS`.
 const PRLIMIT: &str = "/usr/bin/prlimit";
@@ -499,7 +504,7 @@ impl<'r> Container<'r> {
             return;
         }
         if state.outcome.is_none() {
-            state.outcome = self.inspect(&id);
+            state.outcome = self.inspect_after_exit(&id);
         }
         let args: Vec<OsString> = ["rm", "--force", "--"]
             .into_iter()
@@ -509,6 +514,24 @@ impl<'r> Container<'r> {
         if self.runtime.exec(&args, REMOVE_TIMEOUT).is_ok() {
             state.removed = true;
         }
+    }
+
+    /// [`Self::inspect`], waiting a little for the OOM flag of a container
+    /// whose main process was killed (exit 137): the runtime records the
+    /// OOM event asynchronously and may not have done so when the
+    /// container's exit is already visible.
+    fn inspect_after_exit(&self, id: &str) -> Option<ContainerOutcome> {
+        let mut outcome = self.inspect(id);
+        for _ in 0..OOM_EVENT_POLLS {
+            match outcome {
+                Some(o) if !o.oom_killed && o.exit_code == Some(128 + 9) => {
+                    std::thread::sleep(OOM_EVENT_INTERVAL);
+                    outcome = self.inspect(id).or(outcome);
+                }
+                _ => break,
+            }
+        }
+        outcome
     }
 
     fn inspect(&self, id: &str) -> Option<ContainerOutcome> {
@@ -1063,7 +1086,9 @@ echo "$*" >> "$here/calls"
 case "$1" in
   version) echo "29.0.0 linux" ;;
   context) echo "unix:///var/run/docker.sock" ;;
-  create) echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
+  create)
+    if [ -e "$here/create-fails" ]; then exit 1; fi
+    echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
   inspect)
     if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json"; else echo "false false 0"; fi ;;
 esac
@@ -1071,7 +1096,19 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Runtime::with_program(crate::RuntimeKind::Docker, script).unwrap()
+        // A child forked by another test while the script was open for
+        // writing keeps it busy until that child `exec`s (ETXTBSY).
+        let mut tries = 0;
+        loop {
+            match Runtime::with_program(crate::RuntimeKind::Docker, script.clone()) {
+                Ok(runtime) => return runtime,
+                Err(e) if e.to_string().contains("Text file busy") && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
     }
 
     /// A container without mounts: the fake daemon mounts nothing, and a
@@ -1123,16 +1160,10 @@ esac
 
     #[test]
     fn a_failed_create_removes_the_container_by_name() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let rt = fake_runtime(dir.path(), &host_config(4096));
         // From now on `create` fails.
-        let script = dir.path().join("docker");
-        let text = std::fs::read_to_string(&script)
-            .unwrap()
-            .replace("echo fake-id", "exit 1");
-        std::fs::write(&script, text).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("create-fails"), "").unwrap();
         let container = Container::new(&rt, unmounted());
         let err = container.command(&limited_run()).unwrap_err();
         assert!(matches!(err, RunError::Spawn { .. }), "{err:?}");
