@@ -13,8 +13,8 @@ environments as well as by people.
 **日本語概要:** texrun は、AI エージェントや自動化環境から安全かつ一貫した
 インターフェースで TeX 文書を compile / inspect するための Rust 製 CLI です。
 TeX Live + latexmk を backend とし、compile の成否に加えて構造化 diagnostics・
-PDF・ページ preview を返すことを MVP の目標としています（現在は初期開発段階で、
-`texrun compile` は動作しますが、インターフェースは変わる可能性があります）。
+PDF・ページ preview を返します（MVP 実装済み。初回リリース前のため、
+インターフェースは変わる可能性があります）。
 
 ## Goal
 
@@ -216,7 +216,7 @@ removes the workspace and then exits.
   - Licensing: MuPDF is AGPL and Poppler is GPL. texrun only starts an
     installed binary as a separate process; it neither links nor ships them.
     To avoid MuPDF entirely, select the Poppler backend
-    (`BackendChoice::Poppler`; a CLI option follows with #6) or do not install
+    (`--preview-backend poppler`, or `BackendChoice::Poppler` in the library) or do not install
     `mutool`.
   - The development Docker image below contains `mupdf-tools` and
     `poppler-utils`. If that image is ever distributed, the AGPL / GPL terms
@@ -232,7 +232,7 @@ same checks):
 cargo check --workspace --all-targets --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo test --workspace --all-features
 ```
 
 CI runs the tests with [cargo-nextest](https://nexte.st/) and also checks the
@@ -264,7 +264,8 @@ kpathsea allows it, passes a minimal environment and enforces a timeout and
 output limits. In-process execution is **not** a complete sandbox, though (for
 example, parts of the host such as the TeX Live tree remain readable); a
 container-based backend is tracked in
-[#26](https://github.com/nishide-dev/texrun/issues/26).
+[#26](https://github.com/nishide-dev/texrun/issues/26). Network access is not
+blocked yet ([#24](https://github.com/nishide-dev/texrun/issues/24)).
 
 See [docs/security.md](docs/security.md) for the trust boundary, guarantees,
 limitations and execution limits (Japanese), and [SECURITY.md](SECURITY.md) for
