@@ -4,7 +4,7 @@ use std::path::Path;
 
 use texrun_core::{Diagnostic, DiagnosticKind, Severity, WorkspacePath, WorkspaceRoot};
 
-use crate::lines::Line;
+use crate::lines::Lines;
 use crate::patterns::{self, ErrorHeader};
 use crate::stack::FileStack;
 
@@ -26,20 +26,38 @@ pub(crate) struct Config<'a> {
     /// Lines of exactly this many bytes may have been wrapped by TeX (only
     /// set when wrapped lines were not already joined).
     pub suspect_wrap_width: Option<usize>,
+    /// See [`LogParser::with_max_diagnostics`](crate::LogParser::with_max_diagnostics).
+    pub max_diagnostics: usize,
 }
 
-pub(crate) fn parse(lines: &[Line], config: &Config<'_>) -> Vec<Diagnostic> {
+/// The result of parsing a log.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ParsedLog {
+    /// The diagnostics in log order. When some were omitted because of
+    /// [`LogParser::with_max_diagnostics`](crate::LogParser::with_max_diagnostics),
+    /// the last entry is a [`Severity::Info`] / [`DiagnosticKind::Other`]
+    /// notice saying how many (it does not count towards the limit).
+    pub diagnostics: Vec<Diagnostic>,
+    /// Number of recognized diagnostics that were dropped because of the
+    /// limit.
+    pub omitted: usize,
+}
+
+pub(crate) fn parse(lines: &Lines, config: &Config<'_>) -> ParsedLog {
     let mut parser = Parser {
         lines,
         config,
         stack: FileStack::default(),
-        out: Vec::new(),
+        out: Collector::new(config.max_diagnostics),
         stopped: false,
+        undefined_reported: false,
     };
     let mut i = 0;
     while i < lines.len() {
         let consumed = parser
-            .error(i)
+            .runaway(i)
+            .or_else(|| parser.error(i, i))
             .or_else(|| parser.overfull_or_underfull(i))
             .or_else(|| parser.warning(i));
         if let Some(end) = consumed {
@@ -47,33 +65,33 @@ pub(crate) fn parse(lines: &[Line], config: &Config<'_>) -> Vec<Diagnostic> {
         } else {
             // Only lines that are not part of a recognized message reach the
             // file stack: messages may contain unbalanced parentheses.
-            parser.stack.feed(&lines[i].text, parser.may_continue(i));
+            parser.stack.feed(lines.text(i), parser.may_continue(i));
             i += 1;
         }
     }
-    parser.out
+    parser.out.finish()
 }
 
 struct Parser<'a> {
-    lines: &'a [Line],
+    lines: &'a Lines,
     config: &'a Config<'a>,
     stack: FileStack,
-    out: Vec<Diagnostic>,
+    out: Collector,
     /// An emergency stop has been reported.
     stopped: bool,
+    /// An undefined reference or citation has been reported.
+    undefined_reported: bool,
 }
 
 impl<'a> Parser<'a> {
     fn text(&self, i: usize) -> &'a str {
-        let lines: &'a [Line] = self.lines;
-        lines.get(i).map_or("", |l| l.text.as_str())
+        let lines: &'a Lines = self.lines;
+        lines.text(i)
     }
 
     /// Whether line `i` might continue on the next line because of wrapping.
     fn may_continue(&self, i: usize) -> bool {
-        self.lines
-            .get(i)
-            .is_some_and(|l| self.config.suspect_wrap_width == Some(l.raw_len))
+        i < self.lines.len() && self.config.suspect_wrap_width == Some(self.lines.raw_len(i))
     }
 
     fn is_block_start(&self, i: usize) -> bool {
@@ -92,9 +110,22 @@ impl<'a> Parser<'a> {
         normalize_path(printed, self.config.workspace_root)
     }
 
-    /// Handles a TeX error starting at line `i`; returns the index of the
-    /// first line after it.
-    fn error(&mut self, i: usize) -> Option<usize> {
+    /// `Runaway argument?` and the argument text precede the error they
+    /// explain (e.g. `Paragraph ended before \textbf was complete.`); they
+    /// become part of that error's excerpt instead of being fed to the file
+    /// stack.
+    fn runaway(&mut self, i: usize) -> Option<usize> {
+        let t = self.text(i);
+        if !(t.starts_with("Runaway ") && t.trim_end().ends_with('?')) {
+            return None;
+        }
+        let header = (i + 1..=i + 2).find(|&h| patterns::error_header(self.text(h)).is_some())?;
+        self.error(header, i)
+    }
+
+    /// Handles a TeX error whose header is line `i` and whose excerpt starts
+    /// at `excerpt_start`; returns the index of the first line after it.
+    fn error(&mut self, i: usize, excerpt_start: usize) -> Option<usize> {
         let header = patterns::error_header(self.text(i))?;
         let class = patterns::classify_error(header.text);
 
@@ -120,11 +151,15 @@ impl<'a> Parser<'a> {
         let mut line = header.line;
         let mut excerpt_end = end;
         if let Some(ctx) = context {
-            line = line.or(Some(ctx.line));
             if !ctx.crossed_stop {
+                line = line.or(Some(ctx.line));
                 // `l.<n> <before>` is followed by the rest of the line.
                 excerpt_end = (ctx.index + 2).min(self.lines.len());
                 end = self.skip_trailing(excerpt_end);
+            } else if class.kind != DiagnosticKind::MissingFile
+                || self.stop_context_is_request(header.text, ctx.index)
+            {
+                line = line.or(Some(ctx.line));
             }
         }
 
@@ -149,9 +184,25 @@ impl<'a> Parser<'a> {
             &message,
             file,
             line,
-            i..excerpt_end,
+            excerpt_start..excerpt_end,
         );
         Some(end)
+    }
+
+    /// For a missing file reported through the following `Emergency stop.`:
+    /// whether the stop's context line (at `index`) is where the file was
+    /// requested.
+    ///
+    /// For `\input` it is. For packages and classes LaTeX has already looked
+    /// ahead for an optional `[date]` argument, so TeX usually reports the
+    /// next line; the line is only trusted when it shows the loading command.
+    fn stop_context_is_request(&self, error_text: &str, index: usize) -> bool {
+        let package = patterns::missing_file_name(error_text).is_some_and(|f| {
+            Path::new(f).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("sty") || ext.eq_ignore_ascii_case("cls")
+            })
+        });
+        !package || patterns::loads_package_or_class(self.text(index))
     }
 
     /// Handles `Overfull \hbox ...` / `Underfull \vbox ...`.
@@ -181,13 +232,7 @@ impl<'a> Parser<'a> {
         }
 
         if let Some(kind) = patterns::undefined_summary(&body) {
-            let reported = self.out.iter().any(|d| {
-                matches!(
-                    d.kind,
-                    DiagnosticKind::UndefinedReference | DiagnosticKind::UndefinedCitation
-                )
-            });
-            if !reported {
+            if !self.undefined_reported {
                 let file = self.current_file();
                 self.push(Severity::Warning, kind, &message, file, None, i..end);
             }
@@ -223,8 +268,8 @@ impl<'a> Parser<'a> {
     /// Finds the `l.<n>` line of an error whose message ends before `start`.
     ///
     /// In nonstop mode a fatal error (e.g. a missing file) is immediately
-    /// followed by `Emergency stop.`, whose context is where the file was
-    /// requested; the scan continues past one such line and reports it.
+    /// followed by `Emergency stop.`, whose context is where TeX was reading;
+    /// the scan continues past one such line and reports that it did.
     fn find_context(&self, start: usize) -> Option<Context> {
         let mut crossed_stop = false;
         let limit = start.saturating_add(MAX_CONTEXT_SCAN).min(self.lines.len());
@@ -278,6 +323,15 @@ impl<'a> Parser<'a> {
         line: Option<u32>,
         excerpt: std::ops::Range<usize>,
     ) {
+        if matches!(
+            kind,
+            DiagnosticKind::UndefinedReference | DiagnosticKind::UndefinedCitation
+        ) {
+            self.undefined_reported = true;
+        }
+        if !self.out.accepts(severity) {
+            return;
+        }
         let mut d = Diagnostic::new(severity, kind, sanitize(message, MAX_MESSAGE_BYTES));
         if let Some(file) = file {
             d = d.with_file(file);
@@ -292,19 +346,94 @@ impl<'a> Parser<'a> {
     fn excerpt(&self, range: std::ops::Range<usize>) -> String {
         let end = range.end.min(self.lines.len());
         let start = range.start.min(end);
-        let lines = &self.lines[start..end];
         let mut out = String::new();
-        for (n, line) in lines.iter().take(MAX_EXCERPT_LINES).enumerate() {
+        for (n, i) in (start..end).take(MAX_EXCERPT_LINES).enumerate() {
             if n > 0 {
                 out.push('\n');
             }
-            out.push_str(&line.text);
+            let budget = MAX_EXCERPT_BYTES.saturating_sub(out.len());
+            out.push_str(prefix(self.text(i), budget));
             if out.len() >= MAX_EXCERPT_BYTES {
                 break;
             }
         }
-        truncate(&mut out, MAX_EXCERPT_BYTES);
+        let keep = prefix(&out, MAX_EXCERPT_BYTES).len();
+        out.truncate(keep);
         out
+    }
+}
+
+/// Collects diagnostics up to a limit, keeping errors in preference to
+/// warnings / info.
+///
+/// Errors and the rest are stored separately, each up to the limit (so
+/// memory stays bounded however long the log is, and warnings never push
+/// out a later error); [`Collector::finish`] then lets errors fill the limit
+/// first and restores log order.
+struct Collector {
+    limit: usize,
+    seen: usize,
+    errors: Vec<(usize, Diagnostic)>,
+    others: Vec<(usize, Diagnostic)>,
+}
+
+impl Collector {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            seen: 0,
+            errors: Vec::new(),
+            others: Vec::new(),
+        }
+    }
+
+    /// Counts one diagnostic of `severity` and returns whether it may be
+    /// kept, so that callers skip building dropped ones.
+    fn accepts(&mut self, severity: Severity) -> bool {
+        self.seen += 1;
+        let bucket = if severity == Severity::Error {
+            &self.errors
+        } else {
+            &self.others
+        };
+        bucket.len() < self.limit
+    }
+
+    fn push(&mut self, d: Diagnostic) {
+        let seq = self.seen;
+        if d.severity == Severity::Error {
+            self.errors.push((seq, d));
+        } else {
+            self.others.push((seq, d));
+        }
+    }
+
+    fn finish(self) -> ParsedLog {
+        let Self {
+            limit,
+            seen,
+            errors,
+            mut others,
+        } = self;
+        others.truncate(limit.saturating_sub(errors.len()));
+        let mut kept: Vec<_> = errors.into_iter().chain(others).collect();
+        kept.sort_by_key(|(seq, _)| *seq);
+        let mut diagnostics: Vec<_> = kept.into_iter().map(|(_, d)| d).collect();
+        let omitted = seen - diagnostics.len();
+        if omitted > 0 {
+            diagnostics.push(Diagnostic::new(
+                Severity::Info,
+                DiagnosticKind::Other,
+                format!(
+                    "{omitted} more diagnostics omitted (limit: {limit}, errors are kept \
+                     first); see the full log"
+                ),
+            ));
+        }
+        ParsedLog {
+            diagnostics,
+            omitted,
+        }
     }
 }
 
@@ -335,28 +464,34 @@ pub(crate) fn normalize_path(
 }
 
 /// Replaces tabs by spaces and other control characters by U+FFFD (so a
-/// message is safe to print on a terminal), and bounds the length.
+/// message is safe to print on a terminal), and bounds the length. Stops
+/// reading at the bound, so a huge line costs no more than `max` bytes.
 fn sanitize(text: &str, max: usize) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| match c {
+    let mut out = String::with_capacity(text.len().min(max));
+    for c in text.chars() {
+        let c = match c {
             '\t' => ' ',
             c if c.is_control() => '\u{FFFD}',
             c => c,
-        })
-        .collect();
-    truncate(&mut out, max);
+        };
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
     out
 }
 
-fn truncate(text: &mut String, max: usize) {
-    if text.len() > max {
-        let mut cut = max;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
+/// The longest prefix of `text` of at most `max` bytes.
+fn prefix(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
     }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
 }
 
 #[cfg(test)]
@@ -387,8 +522,64 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_and_truncate() {
+    fn sanitize_and_prefix() {
         assert_eq!(sanitize("a\u{1b}[31mb", 100), "a\u{FFFD}[31mb");
         assert_eq!(sanitize("ééé", 3), "é");
+        assert_eq!(sanitize("a\tb", 3), "a b");
+        assert_eq!(prefix("ééé", 5), "éé");
+        assert_eq!(prefix("abc", 10), "abc");
+    }
+
+    fn diag(severity: Severity, n: u32) -> Diagnostic {
+        Diagnostic::new(severity, DiagnosticKind::Other, "m").with_line(n)
+    }
+
+    fn collect(limit: usize, items: &[(Severity, u32)]) -> ParsedLog {
+        let mut c = Collector::new(limit);
+        for &(severity, n) in items {
+            if c.accepts(severity) {
+                c.push(diag(severity, n));
+            }
+        }
+        c.finish()
+    }
+
+    #[test]
+    fn collector_keeps_everything_under_the_limit() {
+        let log = collect(3, &[(Severity::Warning, 1), (Severity::Error, 2)]);
+        assert_eq!(log.omitted, 0);
+        assert_eq!(log.diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn collector_prefers_errors_and_keeps_log_order() {
+        use Severity::{Error, Info, Warning};
+        let log = collect(
+            3,
+            &[
+                (Warning, 1),
+                (Warning, 2),
+                (Info, 3),
+                (Warning, 4),
+                (Error, 5),
+                (Error, 6),
+            ],
+        );
+        let lines: Vec<_> = log.diagnostics.iter().map(|d| d.line).collect();
+        // Two errors + the first warning, in log order, then the notice.
+        assert_eq!(lines, [Some(1), Some(5), Some(6), None]);
+        assert_eq!(log.omitted, 3);
+        let notice = log.diagnostics.last().unwrap();
+        assert_eq!(
+            (notice.severity, notice.kind),
+            (Info, DiagnosticKind::Other)
+        );
+        assert!(notice.message.starts_with("3 more diagnostics omitted"));
+
+        // More errors than the limit: the first ones are kept.
+        let log = collect(2, &[(Error, 1), (Warning, 2), (Error, 3), (Error, 4)]);
+        let lines: Vec<_> = log.diagnostics.iter().map(|d| d.line).collect();
+        assert_eq!(lines, [Some(1), Some(3), None]);
+        assert_eq!(log.omitted, 2);
     }
 }

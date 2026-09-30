@@ -25,6 +25,7 @@ fn parse(name: &str) -> Vec<Diagnostic> {
     LogParser::new()
         .with_max_print_line(ENGINE_MAX_PRINT_LINE)
         .parse(&read(name))
+        .diagnostics
 }
 
 fn kinds(diagnostics: &[Diagnostic]) -> Vec<K> {
@@ -97,12 +98,14 @@ fn missing_package() {
     let d = parse("missing-package");
     assert_eq!(kinds(&d), [K::MissingFile, K::EmergencyStop]);
     // TeX reports the position where it stopped reading, which is the line
-    // after `\usepackage{...}` (LaTeX looks ahead for an optional argument).
+    // after `\usepackage{...}` (`l.4 \begin`, LaTeX looked ahead for an
+    // optional argument). That would point at the wrong line, so the missing
+    // package has no line; its name is in the message.
     assert_at(
         &d[0],
         Severity::Error,
         K::MissingFile,
-        (Some("main.tex"), Some(4)),
+        (Some("main.tex"), None),
     );
     assert!(
         d[0].message
@@ -268,7 +271,8 @@ fn wrapped_log_degrades_gracefully() {
 fn wrapped_log_with_known_width_is_rejoined() {
     let d = LogParser::new()
         .with_max_print_line(79)
-        .parse(&read("wrapped"));
+        .parse(&read("wrapped"))
+        .diagnostics;
     let expected = "some-rather-long-directory-name/another-nested-directory-level/\
                     a-chapter-file-with-a-long-name.tex";
     assert_eq!(
@@ -304,6 +308,10 @@ fn installed_files_are_never_attributed() {
         "traditional",
         "wrapped",
         "rerun",
+        "missing-class",
+        "unusual-names",
+        "unusual-names-traditional",
+        "unbalanced-parens",
     ] {
         let log = read(name);
         for parser in [
@@ -311,7 +319,7 @@ fn installed_files_are_never_attributed() {
             LogParser::new().with_max_print_line(79),
             LogParser::new().with_max_print_line(ENGINE_MAX_PRINT_LINE),
         ] {
-            for d in parser.parse(&log) {
+            for d in parser.parse(&log).diagnostics {
                 let f = file(&d).unwrap_or_default();
                 assert!(
                     !f.contains("texmf") && !f.contains("usr/"),
@@ -321,4 +329,107 @@ fn installed_files_are_never_attributed() {
             }
         }
     }
+}
+
+#[test]
+fn missing_class() {
+    let d = parse("missing-class");
+    assert_eq!(kinds(&d), [K::MissingFile, K::EmergencyStop]);
+    // `l.2 \begin`: the class was requested on line 1, so no line.
+    assert_at(
+        &d[0],
+        Severity::Error,
+        K::MissingFile,
+        (Some("main.tex"), None),
+    );
+    assert!(d[0].message.contains("texrunnonexistentclass.cls"));
+    assert_at(
+        &d[1],
+        Severity::Error,
+        K::EmergencyStop,
+        (Some("main.tex"), Some(2)),
+    );
+}
+
+/// pdfTeX prints `(./my dir/chap one.tex` and `(./a(1).tex` unquoted, so the
+/// end of such a name cannot be told from the following output. Diagnostics
+/// inside those files get no file rather than a wrong one (`my`, `a`).
+#[test]
+fn file_names_with_spaces_and_parentheses() {
+    let d = parse("unusual-names");
+    let at: Vec<_> = d.iter().map(|d| (d.kind, file(d), d.line)).collect();
+    assert_eq!(
+        at,
+        [
+            (K::UndefinedReference, None, Some(2)),
+            (K::OverfullBox, None, Some(3)),
+            // `)` closed `my dir/chap one.tex`: back in main.tex.
+            (K::UndefinedReference, Some("main.tex"), Some(4)),
+            (K::UndefinedReference, None, Some(1)),
+            (K::OverfullBox, None, Some(2)),
+            // The file-line-error prefix names the file exactly.
+            (K::UndefinedControlSequence, Some("a(1).tex"), Some(3)),
+            (K::EmergencyStop, Some("a(1).tex"), Some(3)),
+        ]
+    );
+    assert_eq!(
+        d[5].message,
+        "Undefined control sequence \\undefinedinparen"
+    );
+}
+
+#[test]
+fn file_names_with_parentheses_in_classic_format() {
+    let d = parse("unusual-names-traditional");
+    assert_eq!(
+        kinds(&d),
+        [
+            K::UndefinedReference,
+            K::OverfullBox,
+            K::UndefinedReference,
+            K::UndefinedReference,
+            K::OverfullBox,
+            K::UndefinedControlSequence,
+            K::EmergencyStop
+        ]
+    );
+    assert_eq!(file(&d[2]), Some("main.tex"));
+    // No file-line-error prefix: the error is not attributed to `a`.
+    assert_at(
+        &d[5],
+        Severity::Error,
+        K::UndefinedControlSequence,
+        (None, Some(3)),
+    );
+}
+
+/// `\typeout{Note (unbalanced open}` in chapters/c.tex must not keep c.tex
+/// open; `\typeout{A stray ) close}` in main.tex degrades to no file.
+#[test]
+fn unbalanced_parentheses_in_document_output() {
+    let d = parse("unbalanced-parens");
+    let at: Vec<_> = d.iter().map(|d| (d.kind, file(d), d.line)).collect();
+    assert_eq!(
+        at,
+        [
+            (K::UndefinedReference, Some("main.tex"), Some(4)),
+            (K::OverfullBox, Some("main.tex"), Some(5)),
+            (K::UndefinedReference, None, Some(8)),
+        ]
+    );
+}
+
+#[test]
+fn max_diagnostics_applies_to_real_logs() {
+    let parsed = LogParser::new()
+        .with_max_print_line(ENGINE_MAX_PRINT_LINE)
+        .with_max_diagnostics(2)
+        .parse(&read("multi-file"));
+    // The two errors are kept over the two earlier warnings.
+    assert_eq!(parsed.omitted, 2);
+    assert_eq!(
+        kinds(&parsed.diagnostics),
+        [K::UndefinedControlSequence, K::EmergencyStop, K::Other]
+    );
+    assert_eq!(parsed.diagnostics[2].severity, Severity::Info);
 }

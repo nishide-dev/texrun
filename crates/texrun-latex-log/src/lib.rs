@@ -33,17 +33,34 @@
 //! # Locations
 //!
 //! - `line`: the `file:line:` prefix, the `l.<n>` context line, `on input
-//!   line <n>` or `at line(s) <n>`.
+//!   line <n>` or `at line(s) <n>`. For a missing package or class, TeX
+//!   reports the position after LaTeX looked ahead for an optional argument
+//!   (usually the next line); that line is only used when it shows the
+//!   `\usepackage` / `\documentclass` / ... command, otherwise `line = None`
+//!   (the file name is in the message).
 //! - `file`: the `file:line:` prefix, otherwise the innermost file of the
 //!   `(./chapter1.tex ... )` file stack TeX prints while reading. The stack is
-//!   tracked heuristically and may be wrong for logs with unbalanced
-//!   parentheses in unrecognized output.
+//!   tracked heuristically. Whenever the innermost name is uncertain, `file`
+//!   is `None` rather than a guess: names with spaces or parentheses (which
+//!   pdfTeX prints unquoted), names that may be cut by line wrapping, and
+//!   stacks thrown off by stray `)` in document output (e.g. `\typeout`).
+//!   A `(` of document output that is not closed on its line is ignored.
+//! - The file is the one TeX was reading, which may be a generated file:
+//!   e.g. ``Label `x' multiply defined`` is reported while reading `main.aux`.
 //! - File names are converted to workspace paths. Relative names are taken to
 //!   be relative to TeX's working directory, which must be the workspace root
 //!   (the TeX Live engine runs TeX there). Absolute names are kept only when
 //!   they are inside the root given to [`LogParser::with_workspace_root`];
 //!   everything else (e.g. installed packages under `texmf-dist`) yields
 //!   `file = None`.
+//!
+//! # Volume
+//!
+//! Diagnostics are not merged: a line with 60 unsupported Unicode characters
+//! yields 60 errors. At most [`LogParser::with_max_diagnostics`] (default
+//! [`DEFAULT_MAX_DIAGNOSTICS`]) are returned, errors first, followed by a
+//! notice with the number omitted. Aggregating similar diagnostics for
+//! display is left to the caller (the CLI).
 //!
 //! # Assumed engine settings
 //!
@@ -74,29 +91,47 @@ mod parser;
 mod patterns;
 mod stack;
 
+pub use parser::ParsedLog;
 use texrun_core::WorkspaceRoot;
 pub use texrun_core::{Diagnostic, DiagnosticKind, Severity};
 
 /// TeX's default `max_print_line`.
 const TEX_DEFAULT_MAX_PRINT_LINE: usize = 79;
 
+/// Default of [`LogParser::with_max_diagnostics`].
+pub const DEFAULT_MAX_DIAGNOSTICS: usize = 1000;
+
 /// Configurable log parser. [`parse_log`] is a shortcut for the default
 /// configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LogParser {
     workspace_root: Option<WorkspaceRoot>,
     max_print_line: Option<usize>,
+    max_diagnostics: usize,
+}
+
+impl Default for LogParser {
+    fn default() -> Self {
+        Self {
+            workspace_root: None,
+            max_print_line: None,
+            max_diagnostics: DEFAULT_MAX_DIAGNOSTICS,
+        }
+    }
 }
 
 impl LogParser {
     /// A parser with the default configuration: no workspace root (absolute
-    /// file names are never attributed) and unknown `max_print_line`.
+    /// file names are never attributed), unknown `max_print_line` and at
+    /// most [`DEFAULT_MAX_DIAGNOSTICS`] diagnostics.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The absolute workspace root as TeX saw it. Absolute file names in the
-    /// log below it are converted to workspace paths.
+    /// The absolute workspace root as TeX saw it (i.e. TeX's working
+    /// directory, spelled the same way: if the engine canonicalizes the root
+    /// before running TeX, pass the canonical path). Absolute file names in
+    /// the log below it are converted to workspace paths.
     #[must_use]
     pub fn with_workspace_root(mut self, root: &WorkspaceRoot) -> Self {
         self.workspace_root = Some(root.clone());
@@ -112,9 +147,19 @@ impl LogParser {
         self
     }
 
+    /// The maximum number of diagnostics returned. Errors are kept in
+    /// preference to warnings and info; beyond the limit, diagnostics are
+    /// dropped (later ones first) and a single notice with the number
+    /// omitted is appended (see [`ParsedLog`]).
+    #[must_use]
+    pub fn with_max_diagnostics(mut self, max_diagnostics: usize) -> Self {
+        self.max_diagnostics = max_diagnostics;
+        self
+    }
+
     /// Parses a log. Never fails: unrecognized or malformed input (including
     /// invalid UTF-8) yields fewer diagnostics, not an error.
-    pub fn parse(&self, log: &[u8]) -> Vec<Diagnostic> {
+    pub fn parse(&self, log: &[u8]) -> ParsedLog {
         let lines = lines::split(log, self.max_print_line);
         let config = parser::Config {
             workspace_root: self.workspace_root.as_ref(),
@@ -122,12 +167,14 @@ impl LogParser {
                 Some(_) => None,
                 None => Some(TEX_DEFAULT_MAX_PRINT_LINE),
             },
+            max_diagnostics: self.max_diagnostics,
         };
         parser::parse(&lines, &config)
     }
 }
 
-/// Parses a log with the default [`LogParser`] configuration.
+/// Parses a log with the default [`LogParser`] configuration and returns the
+/// diagnostics (including the notice about omitted ones, if any).
 pub fn parse_log(log: &[u8]) -> Vec<Diagnostic> {
-    LogParser::new().parse(log)
+    LogParser::new().parse(log).diagnostics
 }

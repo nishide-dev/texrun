@@ -70,7 +70,8 @@ fn absolute_paths_inside_and_outside_the_workspace() {
     let root = WorkspaceRoot::new("/work/space").unwrap();
     let d = LogParser::new()
         .with_workspace_root(&root)
-        .parse(log.as_bytes());
+        .parse(log.as_bytes())
+        .diagnostics;
     assert_eq!(
         d.iter().map(at).collect::<Vec<_>>(),
         [
@@ -242,4 +243,90 @@ fn diagnostics_serialize_with_the_core_schema() {
     assert_eq!(json["file"], "sub/a.tex");
     assert_eq!(json["line"], 3);
     assert!(json["raw_excerpt"].as_str().unwrap().contains("l.3 \\x"));
+}
+
+#[test]
+fn runaway_argument_is_part_of_the_excerpt() {
+    let d = parse(concat!(
+        "(./main.tex\n",
+        "Runaway argument?\n",
+        "{unterminated (paren \\par paragraph two. \n",
+        "./main.tex:5: Paragraph ended before \\textbf was complete.\n",
+        "<to be read again> \n",
+        "                   \\par \n",
+        "l.5 \n",
+        "    \n",
+        "\n",
+        "LaTeX Warning: Reference `a' on page 1 undefined on input line 7.\n",
+    ));
+    assert_eq!(
+        d.iter().map(at).collect::<Vec<_>>(),
+        [
+            (K::Other, Some("main.tex"), Some(5)),
+            // The `(` in the argument text did not reach the file stack.
+            (K::UndefinedReference, Some("main.tex"), Some(7)),
+        ]
+    );
+    assert_eq!(
+        d[0].message,
+        "Paragraph ended before \\textbf was complete."
+    );
+    let excerpt = d[0].raw_excerpt.as_deref().unwrap();
+    assert!(
+        excerpt.starts_with("Runaway argument?\n{unterminated"),
+        "{excerpt}"
+    );
+}
+
+#[test]
+fn missing_package_line_is_kept_when_the_context_shows_usepackage() {
+    let d = parse(concat!(
+        "(./main.tex\n",
+        "! LaTeX Error: File `tikz.sty' not found.\n",
+        "\n",
+        "Enter file name: \n",
+        "./main.tex:7: Emergency stop.\n",
+        "<read *> \n",
+        "         \n",
+        "l.7 \\usepackage{tikz}\n",
+        "                      ^^M\n",
+    ));
+    assert_eq!(at(&d[0]), (K::MissingFile, Some("main.tex"), Some(7)));
+}
+
+/// Summaries after many diagnostics must not rescan them (this was
+/// quadratic: ~3 s for 80k + 80k lines in release builds).
+#[test]
+fn many_undefined_summaries_are_linear() {
+    let mut log = String::from("(./main.tex\n");
+    for _ in 0..50_000 {
+        log.push_str("Overfull \\hbox (1.0pt too wide) detected at line 3\n\n");
+    }
+    for _ in 0..50_000 {
+        log.push_str("LaTeX Warning: There were undefined references.\n\n");
+    }
+    let start = std::time::Instant::now();
+    let parsed = LogParser::new()
+        .with_max_diagnostics(usize::MAX)
+        .parse(log.as_bytes());
+    let elapsed = start.elapsed();
+    // Only the first summary is reported: afterwards it repeats itself.
+    assert_eq!(parsed.diagnostics.len(), 50_001);
+    assert_eq!(parsed.omitted, 0);
+    // Generous for unoptimized builds on slow CI runners.
+    assert!(elapsed.as_secs() < 10, "{elapsed:?}");
+}
+
+#[test]
+fn default_limit_bounds_the_output() {
+    let log = "! x\n".repeat(5_000);
+    let parsed = LogParser::new().parse(log.as_bytes());
+    assert_eq!(
+        parsed.diagnostics.len(),
+        texrun_latex_log::DEFAULT_MAX_DIAGNOSTICS + 1
+    );
+    assert_eq!(
+        parsed.omitted,
+        5_000 - texrun_latex_log::DEFAULT_MAX_DIAGNOSTICS
+    );
 }

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Regenerates the LaTeX log fixtures in `logs/` from the documents in `src/`.
 #
-# Run inside the dev container (see docs/development.md), from the repo root:
+# Run inside the dev container (see docs/development.md; use `docker compose`
+# instead of `docker-compose` if that is what your Docker provides), from the
+# repo root:
 #
-#   docker compose run --rm dev crates/texrun-latex-log/tests/fixtures/regenerate.sh
+#   docker-compose run --rm dev crates/texrun-latex-log/tests/fixtures/regenerate.sh
 #
 # Every document is compiled in a temporary directory (the document root is
 # the working directory, as the TeX Live engine #5 does) with the latexmk
@@ -16,7 +18,8 @@
 # A few fixtures deliberately deviate to check that the parser degrades
 # gracefully:
 #
-# - `traditional`: without `-file-line-error` (`! ...` + `l.N` form);
+# - `traditional`, `unusual-names-traditional`: without `-file-line-error`
+#   (`! ...` + `l.N` form);
 # - `wrapped`: without `max_print_line` (TeX's default 79-column wrapping);
 # - `rerun`: a single `pdflatex` pass with the same options, because latexmk
 #   reruns until the "Rerun to get cross-references right" warning is gone.
@@ -32,11 +35,12 @@ mkdir -p "$out"
 
 common=(-interaction=nonstopmode -halt-on-error -no-shell-escape)
 
+# compile <log name> <mode> [<document dir in src/, default: log name>]
 compile() {
-  local name="$1" mode="$2"
+  local name="$1" mode="$2" doc="${3:-$1}"
   local work
   work="$(mktemp -d)"
-  cp -R "$src/$name/." "$work/"
+  cp -R "$src/$doc/." "$work/"
   (
     cd "$work"
     case "$mode" in
@@ -50,6 +54,11 @@ compile() {
         max_print_line=10000 pdflatex "${common[@]}" -file-line-error main.tex ;;
     esac
   ) >/dev/null 2>&1 || true
+  if [[ ! -f "$work/main.log" ]]; then
+    echo "error: $name ($mode): TeX produced no main.log" >&2
+    rm -rf "$work"
+    return 1
+  fi
   cp "$work/main.log" "$out/$name.log"
   rm -rf "$work"
   echo "generated logs/$name.log ($mode)"
@@ -65,3 +74,7 @@ compile warnings default
 compile traditional traditional
 compile wrapped wrapped
 compile rerun single-pass
+compile missing-class default
+compile unusual-names default
+compile unusual-names-traditional traditional unusual-names
+compile unbalanced-parens default

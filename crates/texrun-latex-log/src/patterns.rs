@@ -51,9 +51,11 @@ fn file_line_header(line: &str) -> Option<ErrorHeader<'_>> {
     })
 }
 
+/// TeX prints errors at the start of a line, so the path may contain
+/// parentheses (`./a(1).tex:3:`) but cannot start with a file-stack `(`.
 fn looks_like_header_path(path: &str) -> bool {
     !path.starts_with(char::is_whitespace)
-        && !path.contains(['(', ')'])
+        && !path.starts_with('(')
         && (path.contains('/') || has_extension(path))
 }
 
@@ -117,11 +119,28 @@ pub(crate) fn classify_error(text: &str) -> ErrorClass<'_> {
 
 /// `File `x.sty' not found` (LaTeX) or `I can't find file `x'` (TeX).
 fn is_missing_file(text: &str) -> bool {
-    let latex = ["File `", "File '"].iter().any(|open| {
-        text.find(open)
-            .is_some_and(|i| text[i..].contains("' not found"))
-    });
-    latex || text.starts_with("I can't find file")
+    missing_file_name(text).is_some() || text.starts_with("I can't find file")
+}
+
+/// The file name of LaTeX's ``File `x.sty' not found``.
+pub(crate) fn missing_file_name(text: &str) -> Option<&str> {
+    ["File `", "File '"].iter().find_map(|open| {
+        let start = text.find(open)? + open.len();
+        let len = text[start..].find("' not found")?;
+        Some(&text[start..start + len])
+    })
+}
+
+/// Whether a context line shows a command that loads a package or class.
+pub(crate) fn loads_package_or_class(context: &str) -> bool {
+    [
+        "\\usepackage",
+        "\\RequirePackage",
+        "\\documentclass",
+        "\\LoadClass",
+    ]
+    .iter()
+    .any(|cmd| context.contains(cmd))
 }
 
 /// Recognizes `LaTeX <what>: `, `LaTeX Font <what>: `, `Package <name>
@@ -323,6 +342,21 @@ mod tests {
                 .line
                 .is_none()
         );
+        // Parentheses inside the path are fine.
+        let h = error_header("./a(1).tex:3: Undefined control sequence.").unwrap();
+        assert_eq!((h.file, h.line), (Some("./a(1).tex"), Some(3)));
+    }
+
+    #[test]
+    fn missing_file_names_and_loaders() {
+        assert_eq!(
+            missing_file_name("LaTeX Error: File `tikz.sty' not found."),
+            Some("tikz.sty")
+        );
+        assert_eq!(missing_file_name("LaTeX Error: File `x"), None);
+        assert!(loads_package_or_class("l.7 \\usepackage{tikz}"));
+        assert!(loads_package_or_class("l.1 \\documentclass"));
+        assert!(!loads_package_or_class("l.8 \\begin"));
     }
 
     #[test]

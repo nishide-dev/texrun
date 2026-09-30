@@ -16,12 +16,16 @@ fn parsers() -> Vec<LogParser> {
         LogParser::new()
             .with_max_print_line(10_000)
             .with_workspace_root(&root),
+        LogParser::new().with_max_diagnostics(3),
     ]
 }
 
 fn check(log: &[u8]) {
     for parser in parsers() {
-        for d in parser.parse(log) {
+        let parsed = parser.parse(log);
+        // `DEFAULT_MAX_DIAGNOSTICS` or 3, plus the "omitted" notice.
+        assert!(parsed.diagnostics.len() <= texrun_latex_log::DEFAULT_MAX_DIAGNOSTICS + 1);
+        for d in parsed.diagnostics {
             check_diagnostic(&d);
         }
     }
@@ -30,8 +34,11 @@ fn check(log: &[u8]) {
 fn check_diagnostic(d: &Diagnostic) {
     assert!(d.message.len() <= 2048, "{d:?}");
     assert!(!d.message.chars().any(char::is_control), "{d:?}");
+    // Only the "omitted" notice has no excerpt.
     assert!(
-        d.raw_excerpt.as_ref().is_some_and(|e| e.len() <= 4096),
+        d.raw_excerpt
+            .as_ref()
+            .map_or(d.message.contains("omitted"), |e| e.len() <= 4096),
         "{d:?}"
     );
     assert_ne!(d.line, Some(0), "{d:?}");
