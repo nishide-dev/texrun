@@ -108,6 +108,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+CI runs the tests with [cargo-nextest](https://nexte.st/) and also checks the
+dependency policy in `deny.toml`. If you add or update dependencies, run:
+
+```bash
+cargo deny check
+```
+
 A Docker-based environment with the Rust toolchain, TeX Live, latexmk and a
 preview tool is provided for running commands that need TeX, for example:
 
