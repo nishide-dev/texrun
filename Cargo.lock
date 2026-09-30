@@ -438,6 +438,7 @@ dependencies = [
  "tempfile",
  "texrun-core",
  "texrun-preview",
+ "texrun-process",
  "texrun-texlive",
  "texrun-workspace",
 ]

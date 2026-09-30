@@ -7,6 +7,7 @@ mod cli;
 mod compile;
 mod duration;
 mod escape;
+mod gate;
 mod human;
 mod output;
 mod report;
@@ -24,6 +25,12 @@ use crate::cli::{Cli, Command};
 use crate::report::{Category, CompileReport, ErrorInfo, Stage, exit, kind};
 
 fn main() -> ExitCode {
+    // The exec gate (hidden, internal): handled before clap, which must
+    // never see the program's arguments.
+    let mut args = std::env::args_os();
+    if args.nth(1).is_some_and(|a| a == gate::SUBCOMMAND) {
+        return texrun_process::run_gate(args);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return usage_error(&e),

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use texrun_core::{Artifact, ArtifactKind, WorkspacePath};
+use texrun_process::ExecGate;
 
 use crate::backend::Invocation;
 use crate::error::PreviewError;
@@ -32,12 +33,26 @@ const PIXEL_SLACK: u32 = 2;
 #[derive(Debug, Clone)]
 pub struct Previewer {
     tools: Toolset,
+    gate: Option<ExecGate>,
 }
 
 impl Previewer {
     /// Uses the tools of `tools`.
     pub fn new(tools: Toolset) -> Self {
-        Self { tools }
+        Self { tools, gate: None }
+    }
+
+    /// Starts the tools through `gate`, which sets their resource limits
+    /// before they start (docs/security.md §3.2; see
+    /// [`StartMode::ExecGate`](texrun_process::StartMode::ExecGate)).
+    ///
+    /// Without a gate, or if `gate` cannot be run, the limits are set with
+    /// `prlimit(2)` right after each tool was spawned (Linux only, best
+    /// effort).
+    #[must_use]
+    pub fn with_exec_gate(mut self, gate: ExecGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Uses the tools found on this process's `PATH`.
@@ -103,6 +118,7 @@ impl Previewer {
         report.backend = Some(backend.kind());
         let mut run = Run {
             backend,
+            gate: self.gate.as_ref(),
             options,
             deadline: Instant::now() + options.timeout,
             report,
@@ -116,6 +132,7 @@ impl Previewer {
 
 struct Run<'a> {
     backend: Backend<'a>,
+    gate: Option<&'a ExecGate>,
     options: &'a PreviewOptions,
     deadline: Instant,
     report: PreviewReport,
@@ -253,6 +270,7 @@ impl Run<'_> {
             env,
             watch.is_none(),
             Limits {
+                gate: self.gate,
                 deadline: self.deadline,
                 cancel: &self.options.cancel,
                 watch,

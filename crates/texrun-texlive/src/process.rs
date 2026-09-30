@@ -162,6 +162,9 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, EngineError> {
     let finished = texrun_process::run(&spec, watch).map_err(|e| match e {
         RunError::Spawn { program, source } => EngineError::Spawn { program, source },
         RunError::Io { context, source } => EngineError::Io { context, source },
+        // E.g. the start gate required without `prlimit(2)`, as before the
+        // shared supervisor.
+        RunError::Unsupported(reason) => EngineError::Unsupported(reason),
         other => EngineError::Io {
             context: "running latexmk".to_owned(),
             source: std::io::Error::other(other.to_string()),
@@ -243,6 +246,28 @@ mod tests {
         };
         let err = run(&job).unwrap_err();
         assert!(matches!(err, EngineError::Spawn { .. }), "{err:?}");
+    }
+
+    /// The gate needs `prlimit(2)`; without it the run is refused as
+    /// unsupported, not as an I/O error.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn a_gate_without_prlimit_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = Job {
+            program: Path::new("/bin/sh"),
+            args: vec!["-c".into(), "touch ran".into()],
+            cwd: dir.path(),
+            env: EnvAllowlist::new(),
+            timeout: None,
+            cancel: None,
+            size_dirs: Vec::new(),
+            limits: Limits::default(),
+            file_size_gate: true,
+        };
+        let err = run(&job).unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        assert!(!dir.path().join("ran").exists());
     }
 
     #[test]

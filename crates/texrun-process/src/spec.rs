@@ -8,6 +8,7 @@ use std::process::Command;
 
 use crate::env::EnvAllowlist;
 use crate::error::RunError;
+use crate::gate::ExecGate;
 use crate::rlimit::Rlimits;
 
 /// Working directory of the child.
@@ -65,9 +66,8 @@ pub enum StartMode {
     /// So use it only for a single-process program that starts no children,
     /// and treat the limits as a best-effort layer: the primary bounds must
     /// come from elsewhere (e.g. the caller's check hook and input limits).
-    /// A gate for programs that cannot wait on stdin themselves (a texrun
-    /// helper that waits for the token, sets the limits on itself with
-    /// `setrlimit` and then `exec`s the program) is tracked in #41.
+    /// For a program that cannot wait on stdin itself, prefer
+    /// [`StartMode::ExecGate`].
     Immediate,
     /// stdin is a pipe. The limits are set while the child waits for `token`
     /// on stdin (the program, or a wrapper such as the latexmk rc, must
@@ -83,6 +83,20 @@ pub enum StartMode {
         /// Bytes written to stdin once the limits are in place.
         token: Vec<u8>,
     },
+    /// The program is started through an exec gate
+    /// ([`run_gate`](crate::run_gate)): the gate waits until
+    /// [`Launcher::on_spawn`] has run, sets [`Spec::rlimits`] on itself with
+    /// `setrlimit(2)` and then `exec`s the program, which therefore runs
+    /// limited from its first instruction, and so does every descendant.
+    /// This works on macOS too (except [`Resource::AddressSpace`](crate::Resource::AddressSpace)).
+    /// The program's stdin is `/dev/null`, as with [`StartMode::Immediate`].
+    ///
+    /// If the gate cannot be used (see [`ExecGate`]; checked before
+    /// spawning), the run fails with [`RunError::Unsupported`] when
+    /// [`Spec::require_rlimits`] is set, and otherwise falls back to
+    /// [`StartMode::Immediate`], recorded in
+    /// [`Finished::gate_fallback`](crate::Finished::gate_fallback).
+    ExecGate(ExecGate),
 }
 
 impl StartMode {
@@ -113,13 +127,16 @@ pub struct Spec<'a> {
     pub stderr: Capture,
     /// Resource limits.
     ///
-    /// Only applied where `prlimit(2)` exists
-    /// ([`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED), Linux). Elsewhere
-    /// they are skipped, and [`Finished::rlimits_applied`](crate::Finished::rlimits_applied)
-    /// is `false`, unless [`Spec::require_rlimits`] is set.
+    /// With [`StartMode::ExecGate`] the gate sets them on every Unix
+    /// platform. Otherwise they are only applied where `prlimit(2)` exists
+    /// ([`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED), Linux). A limit
+    /// that cannot be applied is skipped, and
+    /// [`Finished::rlimits_applied`](crate::Finished::rlimits_applied) is
+    /// `false`, unless [`Spec::require_rlimits`] is set.
     pub rlimits: Rlimits,
     /// Fail with [`RunError::Unsupported`] (before spawning) instead of
-    /// running without the [`Spec::rlimits`] where they cannot be applied.
+    /// running without the [`Spec::rlimits`] where they cannot be applied
+    /// (including an unusable [`StartMode::ExecGate`]).
     /// Default: `false` (best effort).
     pub require_rlimits: bool,
     /// How the child is started.
@@ -211,7 +228,10 @@ impl<'a> Spec<'a> {
 /// [`Launcher::command`], then sets stdin / stdout / stderr and
 /// `process_group(0)` itself, spawns, calls [`Launcher::on_spawn`], applies
 /// [`Spec::rlimits`] (if [`Launcher::apply_rlimits`]) and releases the start
-/// gate. Every time it kills the process group it also calls
+/// gate. With [`StartMode::ExecGate`], [`Launcher::command`] is given a
+/// spec for the gate (program and arguments of the gate, everything else
+/// unchanged), and the limits are passed to the gate instead of being set
+/// with `prlimit`. Every time it kills the process group it also calls
 /// [`Launcher::on_kill`], and after reaping the leader
 /// [`Launcher::on_reaped`].
 ///
@@ -225,9 +245,9 @@ pub trait Launcher {
     /// set by the supervisor.
     fn command(&self, spec: &Spec<'_>) -> Result<Command, RunError>;
 
-    /// Whether the supervisor sets [`Spec::rlimits`] on the spawned process
-    /// with `prlimit(2)`. A launcher that hands them to a container runtime
-    /// instead returns `false`.
+    /// Whether the supervisor applies [`Spec::rlimits`] (with `prlimit(2)`,
+    /// or through the exec gate). A launcher that hands them to a container
+    /// runtime instead returns `false`.
     fn apply_rlimits(&self) -> bool {
         true
     }
@@ -239,8 +259,8 @@ pub trait Launcher {
     /// With [`StartMode::Immediate`] the child already runs when this is
     /// called, so descendants it starts before this hook finishes are not
     /// covered (e.g. they stay outside the cgroup). To include every
-    /// descendant, combine it with [`StartMode::StdinGate`] (or the exec
-    /// gate of #41).
+    /// descendant, combine it with [`StartMode::StdinGate`] or
+    /// [`StartMode::ExecGate`]: then `pid` is still waiting at the gate.
     fn on_spawn(&self, _pid: u32) -> io::Result<()> {
         Ok(())
     }

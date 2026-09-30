@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use texrun_core::CancelToken;
 
 use crate::capture::{CapturedOutput, Reader};
 use crate::error::RunError;
+use crate::gate::{self, ExecGate};
 use crate::rlimit;
 use crate::spec::{Capture, HostLauncher, Launcher, Spec, StartMode};
 
@@ -137,11 +138,20 @@ pub struct Finished<S = ()> {
     pub stdout: CapturedOutput,
     /// Captured stderr (empty for [`Capture::Discard`]).
     pub stderr: CapturedOutput,
-    /// Whether the supervisor set [`Spec::rlimits`] on the child with
-    /// `prlimit(2)`. `false` if there were none, if the platform has no
-    /// `prlimit` ([`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED)) or if the
-    /// launcher applies them itself ([`Launcher::apply_rlimits`]).
+    /// Whether the supervisor applied all of [`Spec::rlimits`]: with
+    /// `prlimit(2)`, or through the exec gate ([`StartMode::ExecGate`],
+    /// which sets them before the program starts). `false` if there were
+    /// none, if they could not be applied on this platform (no `prlimit`,
+    /// [`PRLIMIT_SUPPORTED`](crate::PRLIMIT_SUPPORTED); or a resource the
+    /// gate cannot set, e.g. [`Resource::AddressSpace`](crate::Resource::AddressSpace)
+    /// on macOS, while the others were still set), if the run was stopped
+    /// before the gate had set them, or if the launcher applies them itself
+    /// ([`Launcher::apply_rlimits`]).
     pub rlimits_applied: bool,
+    /// Why a [`StartMode::ExecGate`] was not used (the gate cannot be run),
+    /// so that the program was started as with [`StartMode::Immediate`].
+    /// `None` for every other start mode.
+    pub gate_fallback: Option<String>,
 }
 
 /// Runs `spec` on the host ([`HostLauncher`]) and supervises it until it
@@ -156,22 +166,19 @@ pub fn run_with<S>(
     spec: &Spec<'_>,
     mut watch: Watch<'_, S>,
 ) -> Result<Finished<S>, RunError> {
-    let (gate, apply_rlimits) = check_spec(launcher, spec)?;
-    let mut cmd = launcher.command(spec)?;
-    cmd.stdin(if gate.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    })
-    .stdout(stdio(spec.stdout))
-    .stderr(stdio(spec.stderr))
-    .process_group(0);
+    let plan = check_spec(launcher, spec)?;
+    let program = spec.program_name();
+    let (mut cmd, mut channel) = command(launcher, spec, &plan)?;
+    cmd.stdout(stdio(spec.stdout))
+        .stderr(stdio(spec.stderr))
+        .process_group(0);
 
     let start = Instant::now();
-    let child = cmd.spawn().map_err(|source| RunError::Spawn {
-        program: spec.program_name(),
-        source,
-    })?;
+    let spawned = cmd.spawn();
+    // `cmd` holds the gate's end of the channel: close our copy, so that
+    // the channel ends when the gate `exec`s or exits.
+    drop(cmd);
+    let child = spawned.map_err(|source| spawn_error(plan.start, &program, source))?;
     let leader_pid = child.id();
     let pgid = Pid::from_child(&child);
     let mut group = Group {
@@ -185,23 +192,27 @@ pub fn run_with<S>(
     let stdout = reader(group.child.stdout.take(), spec.stdout);
     let stderr = reader(group.child.stderr.take(), spec.stderr);
 
-    let program = spec.program_name();
     launcher
         .on_spawn(leader_pid)
         .map_err(RunError::io(format!("preparing {program}")))?;
-    let rlimits_applied = apply_rlimits && rlimit::PRLIMIT_SUPPORTED;
-    if rlimits_applied {
+    let prlimit_applied = plan.apply_rlimits
+        && rlimit::PRLIMIT_SUPPORTED
+        && !matches!(plan.start, Start::ExecGate(_));
+    if prlimit_applied {
         // `pgid` is the child's PID (it leads its own group).
         rlimit::apply(pgid, &spec.rlimits).map_err(RunError::io(format!(
             "setting resource limits on {program}"
         )))?;
     }
-    if let Some(token) = gate
+    if let Start::StdinGate(token) = plan.start
         && let Some(mut stdin) = group.child.stdin.take()
     {
         // An error means the child is already gone; the poll loop sees its
         // exit status. Dropping `stdin` closes the pipe.
         let _ = stdin.write_all(token);
+    }
+    if let Some(channel) = channel.as_mut() {
+        channel.release();
     }
 
     // A timeout too large to represent never expires.
@@ -214,6 +225,9 @@ pub fn run_with<S>(
     };
     let mut last_check = start;
     let stop = loop {
+        if let Some(channel) = channel.as_mut() {
+            channel.poll();
+        }
         // Detect the exit without reaping: the leader stays a zombie, which
         // keeps its PID and PGID reserved until the group has been killed.
         if leader_exited(pgid).map_err(RunError::io(format!("waiting for {program}")))? {
@@ -246,6 +260,11 @@ pub fn run_with<S>(
     group.reaped = true;
     launcher.on_reaped(leader_pid);
 
+    let rlimits_applied = match channel.as_mut() {
+        None => prlimit_applied,
+        Some(channel) => gate_outcome(channel, &plan, stop.is_some(), status, &program)?,
+    };
+
     let readers_deadline = Instant::now() + READER_GRACE;
     Ok(Finished {
         pid: leader_pid,
@@ -255,17 +274,38 @@ pub fn run_with<S>(
         stdout: stdout.finish(readers_deadline),
         stderr: stderr.finish(readers_deadline),
         rlimits_applied,
+        gate_fallback: plan.gate_fallback,
     })
 }
 
-/// Checks `spec` before anything is started. Returns the start gate token
-/// (if any) and whether the supervisor applies the rlimits.
-fn check_spec<'s>(
-    launcher: &dyn Launcher,
-    spec: &'s Spec<'_>,
-) -> Result<(Option<&'s [u8]>, bool), RunError> {
-    let gate = match &spec.start {
-        StartMode::Immediate => None,
+/// How the child is started, after [`check_spec`].
+#[derive(Clone, Copy)]
+enum Start<'s> {
+    Immediate,
+    StdinGate(&'s [u8]),
+    ExecGate(&'s ExecGate),
+}
+
+/// The checked [`Spec`].
+struct Plan<'s> {
+    start: Start<'s>,
+    /// Whether the supervisor applies [`Spec::rlimits`] (there are some and
+    /// the launcher leaves them to the supervisor).
+    apply_rlimits: bool,
+    /// With the exec gate: whether it is given every limit (none is
+    /// skipped as unsupported on this platform).
+    gate_applies_all: bool,
+    /// Why [`StartMode::ExecGate`] fell back to [`StartMode::Immediate`].
+    gate_fallback: Option<String>,
+}
+
+/// Checks `spec` before anything is started.
+fn check_spec<'s>(launcher: &dyn Launcher, spec: &'s Spec<'_>) -> Result<Plan<'s>, RunError> {
+    let apply_rlimits = launcher.apply_rlimits() && !spec.rlimits.is_empty();
+    let required = apply_rlimits && spec.require_rlimits;
+    let mut gate_fallback = None;
+    let start = match &spec.start {
+        StartMode::Immediate => Start::Immediate,
         StartMode::StdinGate { token } => {
             if token.len() > StartMode::MAX_TOKEN_LEN {
                 return Err(RunError::InvalidSpec(format!(
@@ -274,16 +314,147 @@ fn check_spec<'s>(
                     StartMode::MAX_TOKEN_LEN
                 )));
             }
-            Some(token.as_slice())
+            Start::StdinGate(token)
+        }
+        StartMode::ExecGate(gate) => {
+            if !spec.program.is_absolute() {
+                return Err(RunError::InvalidSpec(format!(
+                    "the exec gate needs an absolute program, not {}",
+                    spec.program_name()
+                )));
+            }
+            match gate.unusable() {
+                None => Start::ExecGate(gate),
+                Some(reason) if required => return Err(RunError::Unsupported(reason)),
+                Some(reason) => {
+                    gate_fallback = Some(reason);
+                    Start::Immediate
+                }
+            }
         }
     };
-    let apply_rlimits = launcher.apply_rlimits() && !spec.rlimits.is_empty();
-    if apply_rlimits && !rlimit::PRLIMIT_SUPPORTED && spec.require_rlimits {
-        return Err(RunError::Unsupported(
-            "resource limits for a child process require prlimit(2) (Linux)".to_owned(),
-        ));
+    let unsettable = spec.rlimits.iter().find(|&(r, _)| !rlimit::settable(r));
+    if required {
+        match start {
+            Start::ExecGate(_) => {
+                if let Some((resource, _)) = unsettable {
+                    return Err(RunError::Unsupported(format!(
+                        "{resource:?} cannot be limited on this platform"
+                    )));
+                }
+            }
+            Start::Immediate | Start::StdinGate(_) => {
+                if !rlimit::PRLIMIT_SUPPORTED {
+                    return Err(RunError::Unsupported(
+                        "resource limits for a child process require prlimit(2) (Linux) \
+                         or an exec gate"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
     }
-    Ok((gate, apply_rlimits))
+    Ok(Plan {
+        start,
+        apply_rlimits,
+        gate_applies_all: apply_rlimits && unsettable.is_none(),
+        gate_fallback,
+    })
+}
+
+/// The spec handed to [`Launcher::command`] for the exec gate: `spec` with
+/// the gate as program, and the limits (those this platform can set), the
+/// program and its arguments as the gate's arguments.
+fn gate_spec<'a>(gate: &ExecGate, spec: &Spec<'a>, plan: &Plan<'_>) -> Spec<'a> {
+    let limits = spec
+        .rlimits
+        .iter()
+        .filter(|&(r, _)| plan.apply_rlimits && rlimit::settable(r));
+    let mut gated = spec.clone();
+    gated.args = gate.command_args(limits, &spec.program, spec.args.iter());
+    gate.program().clone_into(&mut gated.program);
+    gated
+}
+
+/// The command for `spec` (for the exec gate, if used), with stdin set,
+/// and the channel to the gate.
+fn command(
+    launcher: &dyn Launcher,
+    spec: &Spec<'_>,
+    plan: &Plan<'_>,
+) -> Result<(Command, Option<gate::Channel>), RunError> {
+    let mut channel = None;
+    let mut cmd = match plan.start {
+        Start::ExecGate(gate) => launcher.command(&gate_spec(gate, spec, plan))?,
+        Start::Immediate | Start::StdinGate(_) => launcher.command(spec)?,
+    };
+    match plan.start {
+        Start::Immediate => cmd.stdin(Stdio::null()),
+        Start::StdinGate(_) => cmd.stdin(Stdio::piped()),
+        Start::ExecGate(_) => {
+            let (ours, theirs) =
+                gate::Channel::pair().map_err(RunError::io("creating the exec gate channel"))?;
+            channel = Some(ours);
+            cmd.stdin(Stdio::from(theirs))
+        }
+    };
+    Ok((cmd, channel))
+}
+
+/// Whether the exec gate applied all limits, from its report once the
+/// leader has been reaped, or the error it reported.
+fn gate_outcome(
+    channel: &mut gate::Channel,
+    plan: &Plan<'_>,
+    stopped: bool,
+    status: ExitStatus,
+    program: &str,
+) -> Result<bool, RunError> {
+    // Everything the gate wrote before it exited or `exec`ed is in the
+    // socket by now.
+    channel.poll();
+    match channel.report() {
+        gate::Report::Released => Ok(plan.gate_applies_all),
+        gate::Report::Failed { stage, errno } => Err(gate_error(&stage, errno, program)),
+        // Stopped (e.g. timed out) before the gate got that far.
+        gate::Report::None if stopped => Ok(false),
+        gate::Report::None => Err(RunError::ExecGate(format!(
+            "the gate ended ({status}) without starting {program}"
+        ))),
+    }
+}
+
+/// The error for a failed spawn (of the program, or of the exec gate).
+fn spawn_error(start: Start<'_>, program: &str, source: io::Error) -> RunError {
+    match start {
+        Start::ExecGate(gate) => RunError::ExecGate(format!(
+            "cannot start {}: {source}",
+            gate.program().display()
+        )),
+        Start::Immediate | Start::StdinGate(_) => RunError::Spawn {
+            program: program.to_owned(),
+            source,
+        },
+    }
+}
+
+/// The error for a gate that reported failing at `stage`.
+fn gate_error(stage: &str, errno: Option<i32>, program: &str) -> RunError {
+    let source = || errno.map_or_else(|| io::Error::other(stage), io::Error::from_raw_os_error);
+    match stage {
+        "exec" => RunError::Spawn {
+            program: program.to_owned(),
+            source: source(),
+        },
+        "rlimit" => RunError::Io {
+            context: format!("setting resource limits on {program}"),
+            source: source(),
+        },
+        _ => RunError::ExecGate(match errno {
+            Some(_) => format!("the gate did not start {program} ({stage}: {})", source()),
+            None => format!("the gate did not start {program} ({stage} failed)"),
+        }),
+    }
 }
 
 fn stdio(capture: Capture) -> Stdio {
