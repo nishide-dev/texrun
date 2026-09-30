@@ -5,9 +5,11 @@ updates:
     schedule:
       interval: weekly
     commit-message:
-      # Produces "chore(deps): ..." as required by CONTRIBUTING.md.
-      prefix: chore
-      include: scope
+      # Produces "chore(deps): ..." as required by CONTRIBUTING.md for both
+      # normal and dev-dependencies. (`include: scope` would produce
+      # "chore(deps-dev): ..." for dev-dependency updates.)
+      prefix: chore(deps)
+      prefix-development: chore(deps)
     open-pull-requests-limit: 5
     groups:
       cargo-minor-and-patch:
@@ -18,8 +20,7 @@ updates:
     schedule:
       interval: weekly
     commit-message:
-      prefix: chore
-      include: scope
+      prefix: chore(deps)
     groups:
       github-actions:
         patterns: ["*"]

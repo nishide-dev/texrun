@@ -4,8 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
-  # Re-run periodically so newly published RustSec advisories are noticed
-  # even when no code changes.
+  # Re-run `deny` periodically so newly published RustSec advisories are
+  # noticed even when no code changes. Other jobs are skipped on schedule.
   schedule:
     - cron: "0 0 * * 1"
   workflow_dispatch:
@@ -14,8 +14,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Only cancel superseded PR runs; every main push and scheduled run completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +27,7 @@ env:
 jobs:
   fmt:
     name: fmt
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -39,6 +41,7 @@ jobs:
 
   check:
     name: check
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -54,6 +57,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -69,6 +73,7 @@ jobs:
 
   test:
     name: test (${{ matrix.name }})
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -88,11 +93,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The tool version is not updated by Dependabot; bump it manually.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest@0.9
       - name: Run tests (nextest)
-        run: cargo nextest run --workspace --all-features --locked --no-tests=warn
+        run: cargo nextest run --workspace --all-features --locked --no-tests=fail
       # nextest does not run doctests.
       - name: Run doctests
         run: cargo test --workspace --all-features --locked --doc
@@ -107,6 +113,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install && rustup show
+      # The tool version is not updated by Dependabot; bump it manually.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deny@0.20
@@ -114,9 +121,11 @@ jobs:
 
   # Single aggregate check for branch protection, so the required check list
   # does not need to change when jobs are added or the matrix changes.
+  # Not run on schedule: only `deny` runs then, and its failure fails the run.
+  # `always()` keeps it from being skipped when a needed job fails on PRs.
   ci-success:
     name: ci-success
-    if: always()
+    if: always() && github.event_name != 'schedule'
     needs: [fmt, check, clippy, test, deny]
     runs-on: ubuntu-latest
     timeout-minutes: 5

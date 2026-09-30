@@ -36,7 +36,9 @@ unused-allowed-license = "allow"
 # unavoidable transitively (e.g. windows-sys). Revisit if it becomes noisy.
 multiple-versions = "warn"
 wildcards = "deny"
-# Workspace-internal path dependencies are allowed without a version.
+# Path dependencies without a version are tolerated only for crates with
+# `publish = false` (and dev-dependencies). Publishable workspace crates must
+# still give internal path dependencies a version, as Cargo.toml does today.
 allow-wildcard-paths = true
 highlight = "all"
 

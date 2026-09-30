@@ -178,13 +178,15 @@ cargo test --workspace
 
 フォーマット違反は `cargo fmt --all` で自動修正できます。
 
+CI は `cargo check` / `cargo clippy` / test を `--locked` 付きで実行します。そのため `Cargo.lock` が `Cargo.toml` と一致していないと、CI だけが失敗します。依存を追加・変更したときは、更新された `Cargo.lock` も commit してください。CI と同じ条件で確認したい場合は、上記の `cargo check` / `cargo clippy` / `cargo test` に `--locked` を付けて実行してください（例: `cargo check --workspace --all-targets --all-features --locked`）。
+
 依存 crate を追加・更新した場合は、依存ポリシー（ライセンス・advisory・取得元）も確認してください。
 
 ```bash
 cargo deny check
 ```
 
-CI では test を [cargo-nextest](https://nexte.st/) で実行します（`cargo nextest run --workspace --all-features` と、doctest 用の `cargo test --workspace --doc`）。ローカルでは `cargo test --workspace` で同じ test を実行できます。`cargo-deny` と `cargo-nextest` は `cargo install --locked cargo-deny cargo-nextest` で導入できます。
+CI では test を [cargo-nextest](https://nexte.st/) で実行します（`cargo nextest run --workspace --all-features --locked` と、doctest 用の `cargo test --workspace --all-features --locked --doc`）。ローカルでは `cargo test --workspace` で同じ test を実行できます。`cargo-deny` と `cargo-nextest` は `cargo install --locked cargo-deny cargo-nextest` で導入できます。
 
 - 上記は #2 / #11 で定義し、`.github/workflows/ci.yml` で実行している品質ゲートと同一です。CI 側のチェックが変わった場合は、このドキュメントも合わせて更新してください。
 
@@ -211,12 +213,13 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 | `check` | `cargo check --workspace --all-targets --all-features --locked` |
 | `clippy` | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` |
 | `test (linux)` / `test (macos)` | `cargo nextest run` と doctest（`cargo test --doc`） |
-| `deny` | `cargo deny check`（advisories / licenses / bans / sources、設定は `deny.toml`） |
+| `deny` | `cargo deny --locked check`（advisories / licenses / bans / sources、設定は `deny.toml`） |
 | `ci-success` | 上記すべての成功を確認する集約 check |
 | `pr-title` | PR タイトルが Conventional Commits 形式か（type は上記の type 一覧に限定、scope は任意、description は小文字始まり・末尾ピリオドなし） |
 
 - merge 前に `ci-success` と `pr-title` が成功していることを確認してください（branch protection の required check として設定する想定です）。
 - squash merge では PR タイトルが最終コミットのタイトルになるため、自動検証の対象は PR タイトルです。feature branch 内の個々のコミットメッセージは自動検証しないので、レビュー時に目視で確認します。
+- 新しい RustSec advisory を検出するため、`deny` は週次の schedule でも実行されます（schedule のときは `deny` 以外の job はスキップされます）。
 - 依存 crate と GitHub Actions の更新は Dependabot が週次で `chore(deps): ...` の PR を作成します。
 - TeX Live が必要な integration test の CI job は、fixture（#10）と Docker 開発環境（#14）が揃った段階で追加します。
 
