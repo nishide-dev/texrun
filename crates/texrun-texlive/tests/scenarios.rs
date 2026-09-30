@@ -122,14 +122,11 @@ fn references() {
     assert_location(refs[0], "main.tex", 5);
     assert_location(cites[0], "main.tex", 5);
 
-    // kpsewhich is disabled: latexmk says so on stderr and carries on. The
-    // message is not turned into a diagnostic (only the .log is parsed).
+    // kpsewhich is disabled; latexmk may mention that on stderr (the wording
+    // depends on the latexmk version, so it is not checked) and carries on.
+    // Such console output never becomes a diagnostic: only the .log is
+    // parsed. The rc's own failure message must not appear.
     let stderr = String::from_utf8_lossy(&run.stderr.bytes);
-    assert!(
-        stderr.contains("Kpsewhich command needed but not set up"),
-        "{}",
-        describe(&run)
-    );
     assert!(
         !stderr.contains("texrun: failed to run"),
         "{}",
@@ -139,7 +136,7 @@ fn references() {
         !run.result
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("Kpsewhich")),
+            .any(|d| d.message.to_ascii_lowercase().contains("kpsewhich")),
         "{}",
         describe(&run)
     );

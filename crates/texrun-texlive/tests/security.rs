@@ -13,6 +13,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use common::{
     Compile, assert_outcome, assert_pdf, copy_tree, describe, files_named, find, fixture, has,
@@ -68,17 +69,20 @@ fn rc_files_in_the_project_are_not_copied_or_read() {
     assert!(!ws.path().join("latexmkrc").exists());
     assert_outcome(&run, CompileOutcome::Succeeded);
 
-    // Engine layer (`-norc`): rc files placed in the workspace and in the
-    // engine's HOME after the copy are not read either. Reading any of them
-    // would fail the compile.
+    // Engine layer (`-norc`): rc files placed after the copy in the
+    // workspace and in the user rc locations of the engine's HOME
+    // (`~/.latexmkrc`, `~/.config/latexmk/latexmkrc`) are not read either.
+    // Reading any of them would fail the compile.
     let ws = Compile::fixture("security/rc-files", "main.tex").workspace();
     let rc = fs::read(fixture("security/rc-files/latexmkrc")).unwrap();
     let home = ws.path().join(".texrun/home");
-    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join(".config/latexmk");
+    fs::create_dir_all(&xdg).unwrap();
     for dir in [ws.path(), home.as_path()] {
         fs::write(dir.join("latexmkrc"), &rc).unwrap();
         fs::write(dir.join(".latexmkrc"), &rc).unwrap();
     }
+    fs::write(xdg.join("latexmkrc"), &rc).unwrap();
     let run = Compile::fixture("security/rc-files", "main.tex").run_in(&ws);
     assert_outcome(&run, CompileOutcome::Succeeded);
     assert_pdf(&run, &ws, "main.pdf");
@@ -87,11 +91,37 @@ fn rc_files_in_the_project_are_not_copied_or_read() {
 #[test]
 fn format_line_is_ignored() {
     require_texlive!();
-    // With the first line honoured, pdflatex would look for a format that
-    // does not exist and fail.
+    // The first line names an installed format without LaTeX. Honoured, it
+    // would replace the LaTeX format and the document would fail.
     let (run, ws) = Compile::fixture("security/format-line", "main.tex").run();
     assert_outcome(&run, CompileOutcome::Succeeded);
     assert_pdf(&run, &ws, "main.pdf");
+
+    // Control: pdflatex run directly with the first line honoured fails on
+    // the same file, so the fixture does exercise the first line.
+    let dir = plain_tempdir();
+    copy_tree(&fixture("security/format-line"), dir.path());
+    let status = Command::new(which("pdflatex"))
+        .args([
+            "-parse-first-line",
+            "-no-shell-escape",
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "main.tex",
+        ])
+        .current_dir(dir.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "the first line had no effect: {status:?}"
+    );
 }
 
 /// Writes wrapper scripts for pdflatex / bibtex / makeindex into `dir`. Each

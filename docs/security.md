@@ -84,9 +84,9 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 
 | 保証 | test |
 | --- | --- |
-| shell escape（`\write18`、pipe による open）が実行されない | `security.rs`: `shell_escape_*` |
-| 入力・workspace・HOME の latexmk rc が読まれない（workspace へのコピーでも除外される） | `security.rs`: `rc_files_in_the_project_are_not_copied_or_read` |
-| 先頭行の format 指定が無視される | `security.rs`: `format_line_is_ignored` |
+| shell escape（`\write18` は `\immediate` あり・なしの両方、pipe による open）が実行されない | `security.rs`: `shell_escape_*` |
+| 入力・workspace・HOME（`~/.latexmkrc`、`~/.config/latexmk/latexmkrc`）の latexmk rc が読まれない（workspace へのコピーでも除外される） | `security.rs`: `rc_files_in_the_project_are_not_copied_or_read` |
+| 先頭行の format 指定が無視される | `security.rs`: `format_line_is_ignored`（対照: 先頭行を解釈させた pdflatex では同じ fixture が失敗する） |
 | pdflatex・bibtex・makeindex が shell を経由せずに起動される | `security.rs`: `auxiliary_tools_are_started_without_a_shell`、`latexmk.rs`: `no_shell_between_latexmk_and_pdflatex` |
 | `\input` / `\openin` / `\openout` で、絶対パスと `..` を含むパスが拒否される | `security.rs`: `input_*` / `openin_*` / `openout_*`（対照: `reading_inside_the_workspace_works` / `writing_inside_the_output_directory_works`） |
 | root 外を指す symlink で workspace を作れない | `security.rs`: `symlink_outside_the_root_is_rejected_before_compiling` |
