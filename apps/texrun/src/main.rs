@@ -8,6 +8,7 @@ mod compile;
 mod duration;
 mod escape;
 mod human;
+mod output;
 mod report;
 mod signals;
 
@@ -20,7 +21,7 @@ use clap::error::ErrorKind;
 use texrun_core::schema::Versioned;
 
 use crate::cli::{Cli, Command};
-use crate::report::{Category, CompileReport, ErrorInfo, Stage, exit};
+use crate::report::{Category, CompileReport, ErrorInfo, Stage, exit, kind};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -43,9 +44,10 @@ fn usage_error(e: &clap::Error) -> ExitCode {
     );
     if !informational && wants_json(std::env::args_os()) {
         let report = CompileReport {
+            texrun_exit_code: Some(exit::USAGE),
             error: Some(ErrorInfo::new(
                 Stage::Args,
-                "usage",
+                kind::USAGE,
                 Category::Usage,
                 e.render().to_string().trim_end(),
             )),

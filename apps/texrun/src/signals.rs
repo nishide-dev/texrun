@@ -41,9 +41,9 @@ impl SignalGuard {
                         .is_ok()
                     {
                         cancel.cancel();
-                        eprintln!("texrun: {}, stopping the compile...", name(signal));
+                        eprintln!("texrun: {}, stopping...", name(signal));
                     } else {
-                        eprintln!("texrun: {}, still stopping the compile...", name(signal));
+                        eprintln!("texrun: {}, still stopping...", name(signal));
                     }
                 }
             })?;

@@ -92,7 +92,7 @@ previews to the output directory. See `texrun compile --help` for details.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--json` | off | Print the result as one JSON document on stdout |
-| `-o, --output <DIR>` | `texrun-out/` next to the entrypoint | Where the PDF, log and `preview/page-NNN.png` are copied. Files of the same name are replaced; files from earlier runs are not removed |
+| `-o, --output <DIR>` | `texrun-out/` next to the entrypoint | Where the PDF, log and `preview/page-NNN.png` are copied. Files of the same name are replaced; files from earlier runs are not removed. Symlinks inside the project are never followed on the way there (exit 3, `unsafe_output_path`) |
 | `--root <DIR>` | the entrypoint's directory | Project root copied into the workspace; must contain the entrypoint. `/` is refused; `$HOME` and the system temporary directory are refused unless given explicitly |
 | `--timeout <DURATION>` | `60s` | Wall-clock limit of the compile (`90`, `90s`, `2m`, `1500ms`) |
 | `--keep-workspace` | off | Keep the workspace for debugging; its path is printed on stderr |
@@ -125,10 +125,11 @@ project root.
 ```jsonc
 {
   "schema_version": 1,
+  "texrun_exit_code": 0,             // the exit code of texrun itself (table below)
   // When the compile ran to an outcome (texrun_core::CompileResult):
   "outcome": "succeeded",            // failed | timed_out | cancelled
   "engine": { "name": "texlive", "version": "latexmk 4.86" },
-  "exit": { "code": 0 },
+  "exit": { "code": 0 },             // how the latexmk process ended, e.g. { "signal": 9 }
   "elapsed_ms": 812,
   "diagnostics": [
     { "severity": "error", "kind": "undefined_control_sequence",
@@ -143,6 +144,10 @@ project root.
   "preview": { "status": "rendered", "backend": "mupdf", "format": "png",
                "pdf": { "page_count": 1, "pages": [ ... ] }, "pages": [ ... ], "notices": [] },
   "output_dir": "/abs/path/texrun-out",     // artifact paths are relative to this
+  // Only when copying stopped with an error: produced, but not in output_dir
+  "artifacts_not_copied": [ { "kind": "preview", "path": "preview/page-001.png", "page": 1 } ],
+  // Advice about the run (not document diagnostics), when there is any
+  "notes": [ { "severity": "info", "kind": "parent_directory_input", "message": "..." } ],
   "project": { "root": "/abs/path", "entrypoint": "main.tex" },  // diagnostic files are relative to root
   "workspace": { "excluded": [ { "path": "latexmkrc", "reason": "tool_config" } ],
                  "excluded_total": 1, "vanished": 0 },
@@ -152,11 +157,33 @@ project root.
 }
 ```
 
-Check `error` first, then `outcome`. `error.stage` is one of `args`,
-`project`, `probe`, `workspace`, `compile`, `collect`, `setup`; `error.kind`
-is a stable `snake_case` code. `error` can appear together with an `outcome`
-(e.g. the compile succeeded but its output could not be copied). New fields
-and enum values may be added without changing `schema_version`.
+Check `error` first, then `outcome` (or just `texrun_exit_code`). `exit` is
+the latexmk process status and is informational only. `error` can appear
+together with an `outcome`, e.g. when the compile succeeded but its output
+could not be copied: `artifacts` then lists what was copied and
+`artifacts_not_copied` the rest. New fields and enum values may be added
+without changing `schema_version`.
+
+`error.stage` is one of `args`, `project`, `output`, `probe`, `workspace`,
+`compile`, `collect`, `setup`. `error.kind` is a stable `snake_case` code:
+
+- from the CLI: `usage`, `invalid_preview_options`, `non_utf8_path`,
+  `unsafe_root`, `unsafe_output_path` (stage `output`), `io` (stage
+  `output`), `signal_setup`;
+- from the engine (stages `probe`, `compile`): `unavailable`, `spawn`, `io`,
+  `invalid_request`, `unsupported`;
+- from the workspace (stages `project`, `workspace`, `collect`):
+  `root_not_directory`, `invalid_entrypoint`, `entrypoint_not_found`,
+  `entrypoint_outside_root`, `entrypoint_not_file`, `entrypoint_excluded`,
+  `invalid_request`, `symlink_outside_root`, `limit_exceeded`,
+  `input_changed`, `artifact_missing`, `artifact_not_file`, `output_exists`,
+  `unsafe_output_path`, `io`.
+
+`notes[].kind` is one of `parent_directory_input` (a file above the
+entrypoint's directory was not found; `--root` does not help),
+`broad_project_root` (an explicit `--root` is `$HOME` or a temporary
+directory) and `output_inside_project` (the output directory is nested in
+the project and will be copied into the next workspace).
 
 ### Exit codes
 
@@ -169,8 +196,10 @@ and enum values may be added without changing `schema_version`.
 | 4 | The compile timed out |
 | 130 | Interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP |
 
-Page previews never change the exit code; problems with them are reported as
-preview notices. On Ctrl-C, texrun stops latexmk (its whole process group),
+A signal gives 128+N even if it arrives after the compile finished (e.g.
+while previews are rendered; the JSON then still shows `outcome` and a
+`cancelled` preview notice). Otherwise page previews never change the exit
+code; problems with them are reported as preview notices. On Ctrl-C, texrun stops latexmk (its whole process group),
 removes the workspace and then exits.
 
 ## System requirements

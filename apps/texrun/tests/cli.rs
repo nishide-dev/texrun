@@ -442,11 +442,15 @@ fn missing_latexmk_is_a_runtime_error() {
     );
     assert!(doc.get("outcome").is_none());
     assert_eq!(doc["project"]["entrypoint"], "main.tex");
+    assert_eq!(doc["texrun_exit_code"], 3);
+    let hint = doc["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("`latexmk` is on PATH"), "{hint}");
 
     let plain = env.run(&["compile", "main.tex"]);
     assert_eq!(code(&plain), 3);
     assert!(plain.stdout.is_empty());
     assert!(stderr(&plain).starts_with("error: engine `texlive` is unavailable"));
+    assert!(stderr(&plain).contains("\nhint: install TeX Live"));
     assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
 }
 
@@ -597,7 +601,7 @@ fn sigint_cancels_kills_latexmk_and_cleans_up() {
 
         assert_eq!(code(&out), expected, "{}", stderr(&out));
         assert_eq!(json(&out)["outcome"], "cancelled");
-        assert!(stderr(&out).contains("stopping the compile"));
+        assert!(stderr(&out).contains("stopping..."));
         assert_stopped(&heartbeat);
         assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
     }
@@ -659,6 +663,194 @@ fn stale_symlink_in_output_is_refused() {
     assert_eq!(doc["error"]["stage"], "collect");
     assert_eq!(doc["error"]["kind"], "unsafe_output_path");
     assert_eq!(doc["artifacts"], Value::Array(vec![]));
+    assert_eq!(doc["artifacts_not_copied"][0]["path"], "main.pdf");
     assert_eq!(fs::read_to_string(target).unwrap(), "keep me");
     assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
+}
+
+#[test]
+fn symlinked_output_directory_inside_the_project_is_refused() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.file("proj/main.tex", MINIMAL);
+    fs::create_dir(env.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(env.path("elsewhere"), env.path("proj/texrun-out")).unwrap();
+
+    // Default output directory: refused before compiling.
+    let out = env.run(&["compile", "--json", "main.tex"]);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["error"]["stage"], "output");
+    assert_eq!(doc["error"]["kind"], "unsafe_output_path");
+    assert_eq!(doc["texrun_exit_code"], 3);
+    assert!(doc.get("outcome").is_none());
+
+    // The same through an explicit --output, also for a deeper directory.
+    for output in [
+        "texrun-out",
+        "texrun-out/deeper",
+        "./texrun-out/../texrun-out",
+    ] {
+        let out = env.run(&["compile", "--json", "-o", output, "main.tex"]);
+        assert_eq!(code(&out), 3, "{output}: {}", stderr(&out));
+        assert_eq!(json(&out)["error"]["kind"], "unsafe_output_path");
+    }
+    assert!(
+        fs::read_dir(env.path("elsewhere"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let plain = env.run(&["compile", "main.tex"]);
+    assert_eq!(code(&plain), 3);
+    assert!(
+        stderr(&plain).contains("is a symlink inside the project"),
+        "{}",
+        stderr(&plain)
+    );
+
+    // A symlink outside the project, given explicitly, is the user's choice.
+    std::os::unix::fs::symlink(env.path("elsewhere"), env.path("out-link")).unwrap();
+    let link = env.path("out-link");
+    let out = env.run(&[
+        "compile",
+        "--json",
+        "-o",
+        link.to_str().unwrap(),
+        "main.tex",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(env.path("elsewhere/main.pdf").is_file());
+}
+
+#[test]
+fn partially_copied_output_is_reported() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.write_tool("pdfinfo", FAKE_PDFINFO);
+    env.write_tool("pdftoppm", FAKE_PDFTOPPM);
+    env.file("proj/main.tex", MINIMAL);
+    fs::create_dir(env.path("proj/texrun-out")).unwrap();
+    fs::create_dir(env.path("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(env.path("elsewhere"), env.path("proj/texrun-out/preview")).unwrap();
+
+    let out = env.run(&["compile", "--json", "main.tex"]);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    let doc = json(&out);
+    assert_eq!(doc["outcome"], "succeeded");
+    assert_eq!(doc["error"]["stage"], "collect");
+    let copied: Vec<&Value> = doc["artifacts"].as_array().unwrap().iter().collect();
+    assert_eq!(copied.len(), 2, "{copied:?}");
+    assert_eq!(copied[0]["path"], "main.pdf");
+    assert_eq!(copied[1]["path"], "main.log");
+    let not_copied = doc["artifacts_not_copied"].as_array().unwrap();
+    assert_eq!(not_copied.len(), 3);
+    assert_eq!(not_copied[0]["path"], "preview/page-001.png");
+    assert_eq!(doc["preview"]["pages"], Value::Array(vec![]));
+    assert!(env.path("proj/texrun-out/main.pdf").is_file());
+    assert!(
+        fs::read_dir(env.path("elsewhere"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let out = env.run(&["compile", "main.tex"]);
+    assert_eq!(code(&out), 3);
+    let text = stdout(&out);
+    assert!(
+        text.contains("Compiled main.tex in ")
+            && text.contains(", but the output could not be copied to texrun-out"),
+        "{text}"
+    );
+    assert!(text.contains("  PDF: texrun-out/main.pdf"), "{text}");
+    assert!(
+        text.contains("  not copied to texrun-out: preview/page-001.png, preview/page-002.png"),
+        "{text}"
+    );
+    assert!(!text.contains("no PDF was reported"), "{text}");
+}
+
+#[test]
+fn json_carries_texrun_exit_code_separately_from_latexmk_exit() {
+    let env = Env::new(FAKE_FAIL);
+    env.file("proj/main.tex", MINIMAL);
+    let doc = json(&env.run(&["compile", "--json", "main.tex"]));
+    assert_eq!(doc["texrun_exit_code"], 1);
+    assert_eq!(doc["exit"]["code"], 12);
+
+    let doc = json(&env.run(&["compile", "--json", "--bogus", "main.tex"]));
+    assert_eq!(doc["texrun_exit_code"], 2);
+
+    env.write_latexmk(FAKE_SUCCEED);
+    let doc = json(&env.run(&["compile", "--json", "main.tex"]));
+    assert_eq!(doc["texrun_exit_code"], 0);
+}
+
+const FAKE_PARENT_INPUT: &str = r#"
+printf 'This is pdfTeX (fake)\n file:line:error style messages enabled.\n(./%s.tex\n./%s.tex:3: LaTeX Error: File `../common.tex'"'"' not found.\n\nType X to quit or <RETURN> to proceed,\nor enter new name. (Default extension: tex)\n\nEnter file name: \n./%s.tex:3: Emergency stop.\n<read *> \n         \nl.3 \\input{../common}\n\n)\n' "$stem" "$stem" "$stem" > "$out/$stem.log"
+exit 12
+"#;
+
+#[test]
+fn parent_directory_input_gets_a_note() {
+    let env = Env::new(FAKE_PARENT_INPUT);
+    env.file("proj/inner/main.tex", MINIMAL);
+    let out = env.run(&["compile", "--json", "--root", ".", "inner/main.tex"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let doc = json(&out);
+    let notes = doc["notes"].as_array().expect("notes");
+    let note = notes
+        .iter()
+        .find(|n| n["kind"] == "parent_directory_input")
+        .unwrap_or_else(|| panic!("{doc:#}"));
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .contains("even with --root")
+    );
+
+    let out = env.run(&["compile", "inner/main.tex"]);
+    assert!(
+        stdout(&out).contains("note: TeX cannot read files above the entrypoint's directory"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn nested_output_inside_the_project_is_warned_about() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.file("proj/main.tex", MINIMAL);
+    fs::create_dir_all(env.path("proj/build/pdf")).unwrap();
+    let out = env.run(&["compile", "--json", "-o", "build/pdf", "main.tex"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json(&out);
+    assert!(
+        doc["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "output_inside_project"),
+        "{doc:#}"
+    );
+    assert!(stderr(&out).contains("warning: the output directory build/pdf"));
+}
+
+#[test]
+fn entrypoint_symlink_outside_the_root_is_explained() {
+    let env = Env::new(FAKE_SUCCEED);
+    let real = env.file("outside/main.tex", MINIMAL);
+    std::os::unix::fs::symlink(&real, env.path("proj/main.tex")).unwrap();
+    let out = env.run(&["compile", "--json", "main.tex"]);
+    assert_eq!(code(&out), 2);
+    let doc = json(&out);
+    assert_eq!(doc["error"]["kind"], "entrypoint_outside_root");
+    assert!(
+        doc["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("the entrypoint is a symlink to"),
+        "{doc:#}"
+    );
 }

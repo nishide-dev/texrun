@@ -5,10 +5,13 @@
 //! ```text
 //! {
 //!   "schema_version": 1,
+//!   // Exit code of the texrun process itself (see `exit`):
+//!   "texrun_exit_code": 0,
 //!   // Present when the compile ran to an outcome (the fields of CompileResult):
 //!   "outcome": "succeeded" | "failed" | "timed_out" | "cancelled",
 //!   "engine": { "name": "texlive", "version": "latexmk 4.86" },
-//!   "exit": { "code": 0 },
+//!   // How the latexmk *process* ended (not texrun's exit code):
+//!   "exit": { "code": 0 } | { "signal": 9 },
 //!   "elapsed_ms": 1234,
 //!   "diagnostics": [ { "severity", "kind", "message", "file"?, "line"?, "raw_excerpt"? } ],
 //!   "artifacts": [ { "kind": "pdf", "path": "main.pdf", "size_bytes": 1234 } ],
@@ -20,13 +23,18 @@
 //!                "notices": [ { "severity", "kind", "message", "page"?, "detail"? } ] },
 //!   // Absolute host directory the artifact paths are relative to (when collected):
 //!   "output_dir": "/abs/texrun-out",
+//!   // Produced but not copied, when copying stopped with an error (paths as in `artifacts`):
+//!   "artifacts_not_copied": [ { "kind": "pdf", "path": "main.pdf" } ],
+//!   // Advice and warnings about the run (not document diagnostics):
+//!   "notes": [ { "severity": "warning" | "info", "kind": "parent_directory_input", "message": "..." } ],
 //!   // Once the entrypoint was resolved; diagnostic files are relative to `root`:
 //!   "project": { "root": "/abs/project", "entrypoint": "main.tex" },
 //!   // Once the workspace was created:
 //!   "workspace": { "excluded": [ { "path": "latexmkrc", "reason": "tool_config" } ],
 //!                  "excluded_total": 1, "vanished": 0, "kept_path"?: "/tmp/texrun-ws-..." },
 //!   // Present when texrun could not finish (exit code 2 or 3):
-//!   "error": { "stage": "probe", "kind": "unavailable", "category": "runtime", "message": "..." }
+//!   "error": { "stage": "probe", "kind": "unavailable", "category": "runtime",
+//!              "message": "...", "hint"?: "..." }
 //! }
 //! ```
 //!
@@ -37,10 +45,9 @@
 
 use std::error::Error as StdError;
 use std::path::Path;
-use std::process::ExitCode;
 
 use serde::Serialize;
-use texrun_core::{CompileOutcome, CompileResult, EngineError};
+use texrun_core::{Artifact, CompileOutcome, CompileResult, EngineError, Severity};
 use texrun_preview::PreviewReport;
 use texrun_workspace::{ExclusionReason, MaterializeReport, WorkspaceError};
 
@@ -60,9 +67,34 @@ pub mod exit {
     pub const CANCELLED: u8 = 130;
 }
 
+/// Error kinds produced by the CLI itself (the other kinds come from
+/// `EngineErrorKind` and `WorkspaceErrorKind`). Listed in the README.
+pub mod kind {
+    /// Invalid command line (clap).
+    pub const USAGE: &str = "usage";
+    /// `--pages` / `--preview-dpi` / `--preview-backend` rejected.
+    pub const INVALID_PREVIEW_OPTIONS: &str = "invalid_preview_options";
+    /// A path argument is not valid UTF-8.
+    pub const NON_UTF8_PATH: &str = "non_utf8_path";
+    /// The project root would be `/`, `$HOME` or a temporary directory.
+    pub const UNSAFE_ROOT: &str = "unsafe_root";
+    /// The output directory crosses a symlink inside the project, or a
+    /// non-directory is in the way.
+    pub const UNSAFE_OUTPUT_PATH: &str = "unsafe_output_path";
+    /// I/O error while preparing the output directory.
+    pub const IO: &str = "io";
+    /// Signal handlers could not be installed.
+    pub const SIGNAL_SETUP: &str = "signal_setup";
+}
+
 /// The payload of the `--json` document (wrapped in `Versioned`).
 #[derive(Debug, Default, Serialize)]
 pub struct CompileReport {
+    /// The exit code of the texrun process, filled in just before the
+    /// report is printed. Not to be confused with `exit`, the latexmk
+    /// process status inside the flattened result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub texrun_exit_code: Option<u8>,
     /// The compile result, when the engine ran to an outcome. Artifact
     /// paths are relative to [`CompileReport::output_dir`] once collected.
     #[serde(flatten)]
@@ -70,6 +102,13 @@ pub struct CompileReport {
     /// Absolute host directory that holds the collected artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+    /// Artifacts that were produced but not copied because copying stopped
+    /// with an error (paths relative to the output root, like `artifacts`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts_not_copied: Vec<Artifact>,
+    /// Advice and warnings about the run itself.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
     /// Page previews, when they were attempted (after a successful compile,
     /// unless `--no-preview`). Their images are also in `artifacts`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +119,20 @@ pub struct CompileReport {
     pub workspace: Option<WorkspaceInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+}
+
+/// Advice or a warning about the run (not a document diagnostic).
+#[derive(Debug, Clone, Serialize)]
+pub struct Note {
+    /// `warning` or `info`.
+    pub severity: Severity,
+    /// Stable code: `parent_directory_input`, `broad_project_root`,
+    /// `output_inside_project`.
+    pub kind: &'static str,
+    pub message: String,
+    /// Already printed on stderr when it happened (human mode).
+    #[serde(skip)]
+    pub printed: bool,
 }
 
 /// The resolved project.
@@ -161,6 +214,8 @@ pub enum Stage {
     Workspace,
     /// Running the engine.
     Compile,
+    /// Checking or creating the output directory.
+    Output,
     /// Copying artifacts to the output directory.
     Collect,
     /// Setting up texrun itself (signal handling).
@@ -185,8 +240,7 @@ pub struct ErrorInfo {
     pub stage: Stage,
     /// Stable `snake_case` code: an `EngineErrorKind` (stages `probe`,
     /// `compile`), a `WorkspaceErrorKind` (`project`, `workspace`,
-    /// `collect`) or a CLI code (`usage`, `unsupported_option`,
-    /// `unsafe_root`, `non_utf8_path`, `signal_setup`).
+    /// `collect`) or one of [`kind`] (the CLI's own codes).
     pub kind: String,
     pub category: Category,
     /// Human-readable message including the error's causes.
@@ -225,7 +279,15 @@ impl ErrorInfo {
             K::InvalidRequest => Category::Input,
             _ => Category::Runtime,
         };
-        Self::new(stage, snake_case_name(&kind), category, error_chain(err))
+        let info = Self::new(stage, snake_case_name(&kind), category, error_chain(err));
+        if kind == K::Unavailable {
+            info.with_hint(
+                "install TeX Live with latexmk and make sure `latexmk` is on PATH, or use the \
+                 Docker development environment (docs/development.md)",
+            )
+        } else {
+            info
+        }
     }
 
     pub fn from_workspace(stage: Stage, err: &WorkspaceError) -> Self {
@@ -310,10 +372,6 @@ impl CompileReport {
             None => exit::RUNTIME,
         }
     }
-
-    pub fn exit(&self, signal: Option<i32>) -> ExitCode {
-        ExitCode::from(self.exit_code(signal))
-    }
 }
 
 #[cfg(test)]
@@ -333,6 +391,28 @@ mod tests {
                 Duration::from_millis(5),
             )),
             ..CompileReport::default()
+        }
+    }
+
+    #[test]
+    fn readme_lists_the_cli_error_kinds() {
+        let readme = include_str!("../../../README.md");
+        for code in [
+            kind::USAGE,
+            kind::INVALID_PREVIEW_OPTIONS,
+            kind::NON_UTF8_PATH,
+            kind::UNSAFE_ROOT,
+            kind::UNSAFE_OUTPUT_PATH,
+            kind::IO,
+            kind::SIGNAL_SETUP,
+            "parent_directory_input",
+            "broad_project_root",
+            "output_inside_project",
+        ] {
+            assert!(
+                readme.contains(&format!("`{code}`")),
+                "{code} is not in the README"
+            );
         }
     }
 

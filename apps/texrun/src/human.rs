@@ -15,7 +15,7 @@ use texrun_workspace::{ExclusionReason, MaterializeReport};
 
 use crate::duration::format_duration;
 use crate::escape::{escape, escape_path};
-use crate::report::ErrorInfo;
+use crate::report::{CompileReport, ErrorInfo, Stage};
 
 /// At most this many diagnostics of each severity are printed; the rest are
 /// counted (`--json` has all of them).
@@ -46,10 +46,12 @@ impl Paths {
     }
 }
 
-/// Renders the result of a compile that ran to an outcome (stdout).
+/// Renders the result of a compile that ran to an outcome (stdout):
+/// diagnostics, the status line, the copied files, what could not be copied,
+/// previews and notes.
 pub fn render_result(
+    report: &CompileReport,
     result: &CompileResult,
-    preview: Option<&PreviewReport>,
     paths: &Paths,
     timeout: Duration,
 ) -> String {
@@ -59,7 +61,16 @@ pub fn render_result(
     let entry = escape_path(&paths.entrypoint);
     let elapsed = format_duration(result.elapsed);
     let counts = counts(result);
+    let copy_failed = report
+        .error
+        .as_ref()
+        .is_some_and(|e| matches!(e.stage, Stage::Output | Stage::Collect));
+    let output = escape_path(&paths.output);
     let _ = match result.outcome {
+        CompileOutcome::Succeeded if copy_failed => writeln!(
+            out,
+            "Compiled {entry} in {elapsed}{counts}, but the output could not be copied to {output}"
+        ),
         CompileOutcome::Succeeded => writeln!(out, "Compiled {entry} in {elapsed}{counts}"),
         CompileOutcome::Failed => writeln!(out, "Failed to compile {entry} in {elapsed}{counts}"),
         CompileOutcome::TimedOut => writeln!(
@@ -84,11 +95,30 @@ pub fn render_result(
             paths.output_file(artifact.path.as_str())
         );
     }
-    if result.is_success() && result.pdf().is_none() {
+    if !report.artifacts_not_copied.is_empty() {
+        let names: Vec<String> = report
+            .artifacts_not_copied
+            .iter()
+            .map(|a| escape(a.path.as_str()).into_owned())
+            .collect();
+        let _ = writeln!(
+            out,
+            "  not copied to {output}: {} (see the error below)",
+            names.join(", ")
+        );
+    } else if result.is_success() && result.pdf().is_none() {
         let _ = writeln!(out, "  (no PDF was reported)");
     }
-    if let Some(preview) = preview {
+    if let Some(preview) = &report.preview {
         render_preview(&mut out, preview, paths);
+    }
+    for note in report.notes.iter().filter(|n| !n.printed) {
+        let label = if note.severity >= Severity::Warning {
+            "warning"
+        } else {
+            "note"
+        };
+        let _ = writeln!(out, "{label}: {}", escape(&note.message));
     }
     out
 }
@@ -189,16 +219,6 @@ fn render_diagnostics(out: &mut String, diagnostics: &[Diagnostic], paths: &Path
                 groups.len() - MAX_SHOWN_PER_SEVERITY
             );
         }
-    }
-    if diagnostics
-        .iter()
-        .any(|d| d.kind == DiagnosticKind::MissingFile && d.message.contains("../"))
-    {
-        let _ = writeln!(
-            out,
-            "note: TeX cannot read files above the entrypoint's directory; put the entrypoint \
-             in the project root and pass that directory as --root"
-        );
     }
 }
 
@@ -318,7 +338,12 @@ mod tests {
             ArtifactKind::Log,
             WorkspacePath::new("main.log").unwrap(),
         ));
-        let text = render_result(&r, None, &paths(), Duration::from_secs(60));
+        let text = render_result(
+            &CompileReport::default(),
+            &r,
+            &paths(),
+            Duration::from_secs(60),
+        );
         assert_eq!(
             text,
             "paper/chapters/intro.tex:3: error: Undefined control sequence\n\
@@ -344,7 +369,12 @@ mod tests {
             WorkspacePath::new("main.log").unwrap(),
         ));
         assert_eq!(
-            render_result(&r, None, &paths(), Duration::from_secs(60)),
+            render_result(
+                &CompileReport::default(),
+                &r,
+                &paths(),
+                Duration::from_secs(60)
+            ),
             "Compiled paper/main.tex in 1.23s\n  PDF: paper/texrun-out/main.pdf\n"
         );
     }
@@ -387,7 +417,12 @@ mod tests {
             EngineInfo::new("texlive"),
             Duration::from_secs(5),
         );
-        let text = render_result(&r, None, &paths(), Duration::from_secs(5));
+        let text = render_result(
+            &CompileReport::default(),
+            &r,
+            &paths(),
+            Duration::from_secs(5),
+        );
         assert!(text.contains("Timed out compiling paper/main.tex after 5s (limit 5s"));
     }
 

@@ -26,8 +26,11 @@ Exit codes:
   3    texrun runtime error: latexmk missing or unusable, I/O errors,
        artifacts could not be copied to the output directory
   4    the compile timed out (see --timeout)
-  130  interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP
-Page previews never change the exit code.";
+  130  interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP.
+       A signal counts even if it arrives after the compile (e.g. while
+       previews are rendered); otherwise previews never change the exit code.
+With --json, the code is also in `texrun_exit_code`; the `exit` field is
+how the latexmk process ended.";
 
 const COMPILE_AFTER_HELP: &str = "\
 Output:
@@ -44,7 +47,10 @@ Output:
 
   The PDF, the log and, after a successful compile, PNG previews of the
   first pages (preview/page-NNN.png) are copied to the output directory,
-  replacing files of the same name. Files from an earlier run (a PDF when
+  replacing files of the same name. Symlinks inside the project are never
+  followed on the way to the output directory (the default texrun-out/ is
+  inside the project); put an --output below the project directly in its
+  top level, or it is copied into the next workspace. Files from an earlier run (a PDF when
   the compile now fails, previews of pages no longer rendered) are not
   removed; rely on the exit code and the reported artifacts.
 ";
