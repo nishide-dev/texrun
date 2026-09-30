@@ -16,11 +16,16 @@
 #   --ulimit does not take it);
 # - nothing of its own at /workspace or /texrun (texrun mounts there).
 #
-# The TeX Live packages are the same as in the dev image, so the #10
-# fixtures behave the same with both backends. No preview tools: previews
-# are rendered on the host until #46 moves them into the sandbox (which
-# adds MuPDF / Poppler here then), so they would only add attack surface
-# and AGPL / GPL distribution terms to the image now.
+# - /usr/bin/mutool (MuPDF) and /usr/bin/pdfinfo + /usr/bin/pdftoppm
+#   (Poppler) for the page previews, and /usr/bin/sleep (coreutils), which
+#   keeps the preview container alive while texrun runs the tools in it
+#   (#46).
+#
+# The TeX Live and preview packages are the same as in the dev image, so
+# the #10 fixtures and the preview tests behave the same with both
+# backends. MuPDF is AGPL-licensed and Poppler GPL-licensed: they are
+# installed from Debian as separate programs, and texrun only starts them
+# (see README for what distributing this image means).
 
 # Pinned by digest (multi-arch index); Dependabot (docker ecosystem)
 # updates it.
@@ -44,6 +49,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          latexmk \
          texlive-latex-base \
          texlive-latex-recommended \
+         mupdf-tools \
+         poppler-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/log/apt/* /var/log/dpkg.log
 
