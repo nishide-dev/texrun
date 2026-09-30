@@ -234,7 +234,8 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 - squash merge では PR タイトルが最終コミットのタイトルになるため、自動検証の対象は PR タイトルです。feature branch 内の個々のコミットメッセージは自動検証しないので、レビュー時に目視で確認します。
 - 新しい RustSec advisory を検出するため、`deny` は週次の schedule でも実行されます（schedule のときは `deny` 以外の job はスキップされます）。
 - 依存 crate・GitHub Actions・開発環境の base image（digest）の更新は、Dependabot が週次で `chore(deps): ...` の PR を作成します。
-- `integration` の image は GitHub Actions の cache（buildx の `type=gha`）から再利用するので、`Dockerfile` を変えない限り build はほぼ cache で済みます。
+- `integration` の image の layer と cargo の build 成果物は GitHub Actions の cache（buildx の `type=gha` と `actions/cache`）から再利用するので、`Dockerfile` を変えない限り build はほぼ cache で済みます。cache への保存は main への push のときだけで、PR は main の cache を読むだけです。
+- `integration` は、TeX Live に言及する `#[ignore]` が残っていないことも確認します。TeX Live を使う test は `#[ignore]` ではなく `require_texlive!()` で選別してください（[docs/development.md](docs/development.md#tex-live-integration-test)）。
 
 ## License
 
