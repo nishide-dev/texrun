@@ -486,6 +486,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "texrun-sandbox"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "texrun-core",
+ "texrun-process",
+ "thiserror",
+]
+
+[[package]]
 name = "texrun-texlive"
 version = "0.1.0"
 dependencies = [

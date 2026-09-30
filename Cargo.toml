@@ -7,6 +7,7 @@ members = [
     "crates/texrun-process",
     "crates/texrun-texlive",
     "crates/texrun-preview",
+    "crates/texrun-sandbox",
     "crates/texrun-workspace",
 ]
 
@@ -24,6 +25,7 @@ texrun-latex-log = { path = "crates/texrun-latex-log", version = "0.1.0" }
 texrun-process = { path = "crates/texrun-process", version = "0.1.0" }
 texrun-texlive = { path = "crates/texrun-texlive", version = "0.1.0" }
 texrun-preview = { path = "crates/texrun-preview", version = "0.1.0" }
+texrun-sandbox = { path = "crates/texrun-sandbox", version = "0.1.0" }
 texrun-workspace = { path = "crates/texrun-workspace", version = "0.1.0" }
 
 # External crates (add only when an issue actually needs them)

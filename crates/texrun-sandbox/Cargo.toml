@@ -1,0 +1,23 @@
+[package]
+name = "texrun-sandbox"
+description = "Container sandbox for texrun: runs a supervised program in a hardened Docker / Podman container."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+texrun-core.workspace = true
+# The container is started and supervised like every other program
+# (`Launcher`), and the runtime CLI is run through the same supervisor.
+texrun-process.workspace = true
+thiserror.workspace = true
+# `geteuid` / `getegid` for the container user (Unix only).
+rustix = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
