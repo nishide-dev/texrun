@@ -21,7 +21,7 @@ Squash merge 時は PR タイトルが最終コミットのタイトル、PR 本
 - [ ] `cargo check --workspace --all-targets --all-features`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --workspace`
+- [ ] `cargo test --workspace --all-features`
 
 ## 関連 Issue
 
