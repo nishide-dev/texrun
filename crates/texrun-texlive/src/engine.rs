@@ -811,7 +811,10 @@ mod tests {
         assert_eq!(read_source(root.path(), root.path()), None);
         // A FIFO is refused without blocking.
         let fifo = root.path().join("fifo.tex");
-        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
         assert!(status.success());
         assert_eq!(read_source(root.path(), &fifo), None);
         let big = root.path().join("big.tex");
