@@ -7,7 +7,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Exposes `texrun_core::testing` (a scripted fake engine) so that downstream
+# crates can test against `TypesetEngine` without a TeX installation.
+test-util = []
+
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
