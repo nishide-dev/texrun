@@ -72,7 +72,7 @@ host に Rust toolchain がある場合は host で直接実行してもよい�
 - build 成果物は checkout ごとに分離している。cargo は local package の鮮度を mtime で判定し、どの checkout もコンテナ内では同じ `/workspace` に見えるため、target を checkout 間で共有すると別 worktree の古い成果物で test が通ってしまう（偽 green）おそれがある
 - `target/docker/` は `.gitignore` の `/target/` で無視される。host で build した `target/debug/` などとは別ディレクトリなので、macOS 向けと Linux 向けの成果物は混ざらない
 - registry / git の cache は内容で識別されるため共有しても安全。`compose.yaml` で project 名を `texrun` に固定しているので、どの checkout から実行しても同じ volume を使う
-- bind mount 上の target でも build 時間の差は小さい。OrbStack（macOS, Apple Silicon）で clean な `cargo clippy` + `cargo test` を測ると、named volume では約 2.4 秒、bind mount では約 2.6 秒だった（現状の小さな workspace で計測）
+- bind mount 上の target でも build 時間の差は小さい。OrbStack（macOS, Apple Silicon）で clean な `cargo clippy` + `cargo test` を測ると、named volume では約 2.4 秒、bind mount では約 2.6 秒だった。これは現状の小さな workspace で測った参考値で、Docker の実装・host の file system・マシン性能によって変わる
 
 cache の消し方:
 
@@ -93,7 +93,20 @@ TeX Live を必要とする integration test の実行方法（`#[ignore]` + `--
 
 ## 注意事項
 
-- コンテナ内の process は root で動く。Docker Desktop / OrbStack（macOS）では bind mount 上に作られたファイルは host ユーザーの所有になるが、Linux の Docker Engine では root 所有になる。Linux では `target/docker/` も root 所有になるため、消すときは `docker compose run --rm dev cargo clean` を使う。integration test（#10）の出力先は repo 内ではなく tempdir にする
+- コンテナ内の process は root で動く。Docker Desktop / OrbStack（macOS）では bind mount 上に作られたファイルは host ユーザーの所有になるが、Linux の Docker Engine では root 所有になる。integration test（#10）の出力先は repo 内ではなく tempdir にする
+- Linux の Docker Engine では、`target/` が無い状態でコンテナを実行すると `target/` 自体が root 所有で作られ、host の `cargo build` が Permission denied で失敗する。これを避けるため、初回は host で先に作っておく
+
+  ```bash
+  mkdir -p target
+  ```
+
+  すでに root 所有になってしまった場合は、所有者を戻す（`target/docker/` だけを消したい場合は `docker compose run --rm dev cargo clean` でもよい）
+
+  ```bash
+  sudo chown -R "$(id -u):$(id -g)" target
+  ```
+
+- `docker compose run --rm --user "$(id -u):$(id -g)" dev ...` のように host ユーザーで実行する方法は、現状ではサポートしていない。OrbStack で試したところ、registry の cache がすでにある場合は `cargo test` が通った。しかし cache が空の volume では、`cargo fetch` が root 所有の `/usr/local/cargo/registry` に書き込めず、Permission denied で失敗した。HOME も未設定になる。対応する場合は、image 側で `CARGO_HOME` と volume の権限を調整する必要があるため、将来の選択肢とする
 - image tag `texrun-dev:latest` は全 checkout で共有している。`Dockerfile` を変更した checkout で build すると、ほかの checkout が使う image も置き換わる。変更前の image に戻すときは、元の checkout で `docker compose build dev` をやり直す
 - base image は tag 指定（digest 固定なし）で、apt パッケージも version を固定していない。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）
   - `texlive-binaries` 2024.20240313.70630+ds-6（pdfTeX 1.40.26）
