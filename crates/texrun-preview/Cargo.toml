@@ -12,8 +12,10 @@ serde.workspace = true
 tempfile.workspace = true
 texrun-core.workspace = true
 thiserror.workspace = true
-# Unix only: descriptor-based file operations, `killpg` and `prlimit`.
-rustix = { workspace = true, features = ["process"] }
+# Supervised tool processes (Unix only).
+texrun-process.workspace = true
+# Unix only: descriptor-based file operations.
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -19,7 +19,7 @@
 //!   character allowlist;
 //! - latexmk runs in its own process group, which is killed with `SIGKILL`
 //!   on timeout, cancellation or when an output limit is exceeded, and once
-//!   more after latexmk exits;
+//!   more after latexmk exits (the shared supervisor of `texrun-process`);
 //! - output limits: `RLIMIT_FSIZE` per file (Linux), total output directory
 //!   size (polled), and the captured stdout / stderr (4 MiB each).
 //!

@@ -11,12 +11,12 @@ rust-version.workspace = true
 tempfile.workspace = true
 texrun-core.workspace = true
 texrun-latex-log.workspace = true
-
-# Unix only: process groups, `killpg` and resource limits.
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["process"] }
+# Process groups, the poll loop and resource limits (Unix only).
+texrun-process.workspace = true
 
 [dev-dependencies]
+# `setrlimit` on the test process itself (core dump test).
+rustix = { workspace = true, features = ["process"] }
 texrun-preview.workspace = true
 texrun-workspace.workspace = true
 

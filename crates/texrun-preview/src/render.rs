@@ -27,14 +27,6 @@ const RENDER_NAME: &str = "page.png";
 /// Pixels an image may exceed `max_long_edge_px` by (rounding in the tools).
 const PIXEL_SLACK: u32 = 2;
 
-/// Where a tool runs and writes: its environment and the descriptor of its
-/// working directory (where it writes [`RENDER_NAME`]).
-#[derive(Clone, Copy)]
-struct Dirs<'a> {
-    env: &'a ToolEnv,
-    work: &'a OwnedFd,
-}
-
 /// Generates page previews and reads PDF metadata with the external tools of
 /// a [`Toolset`].
 #[derive(Debug, Clone)]
@@ -154,18 +146,17 @@ impl Run<'_> {
         };
         // Private scratch space: `HOME` for the tools and their working
         // directory. For rendering it lives in the output root so that
-        // finished images can be renamed into place.
+        // finished images can be renamed into place. It is created and
+        // opened through descriptors (`mkdirat` / `openat(O_NOFOLLOW)`), and
+        // the tools run in, and write to, the held `work` directory.
         let scratch = match output_root {
-            Some(root) => tempfile::Builder::new()
-                .prefix(".texrun-preview-")
-                .tempdir_in(root),
-            None => tempfile::Builder::new().prefix("texrun-preview-").tempdir(),
+            Some(root) => fsops::ScratchDir::create(root, ".texrun-preview-"),
+            None => fsops::ScratchDir::create(&std::env::temp_dir(), "texrun-preview-"),
         };
         let scratch = match scratch.and_then(|dir| {
-            fs::create_dir(dir.path().join("home"))?;
-            fs::create_dir(dir.path().join("work"))?;
-            let work_fd = fsops::open_dir(&dir.path().join("work"))?;
-            Ok((dir, work_fd))
+            dir.subdir("home")?;
+            let work = dir.subdir("work")?;
+            Ok((dir, work))
         }) {
             Ok(scratch) => scratch,
             Err(e) => {
@@ -176,11 +167,12 @@ impl Run<'_> {
                 return;
             }
         };
-        let (scratch, work_fd) = scratch;
+        let (scratch, work) = scratch;
         let env = ToolEnv {
             path: search_path.map(std::ffi::OsStr::to_os_string),
             home: scratch.path().join("home"),
-            cwd: scratch.path().join("work"),
+            work,
+            work_path: scratch.path().join("work"),
         };
 
         let Some(count) = self.page_count(&pdf, &env) else {
@@ -204,11 +196,7 @@ impl Run<'_> {
         match root_fd {
             Some(root_fd) => {
                 self.selected = last - first + 1;
-                let dirs = Dirs {
-                    env: &env,
-                    work: &work_fd,
-                };
-                self.render_pages(&pdf, &root_fd, dirs, first, last, &pages);
+                self.render_pages(&pdf, &root_fd, &env, first, last, &pages);
             }
             None => self.inspected = true,
         }
@@ -253,12 +241,7 @@ impl Run<'_> {
         }
     }
 
-    fn invoke(
-        &self,
-        inv: &Invocation<'_>,
-        env: &ToolEnv,
-        watch: Option<(&Path, u64)>,
-    ) -> RunOutput {
+    fn invoke(&self, inv: &Invocation<'_>, env: &ToolEnv, watch: Option<(&str, u64)>) -> RunOutput {
         process::run(
             inv.program,
             &inv.args,
@@ -368,7 +351,7 @@ impl Run<'_> {
         &mut self,
         pdf: &Path,
         root_fd: &OwnedFd,
-        dirs: Dirs<'_>,
+        env: &ToolEnv,
         first: u32,
         last: u32,
         pages: &[PageInfo],
@@ -399,7 +382,7 @@ impl Run<'_> {
                 continue;
             };
             if self
-                .render_page(pdf, dirs, &dir, info, &mut total)
+                .render_page(pdf, env, &dir, info, &mut total)
                 .is_break()
             {
                 break;
@@ -445,7 +428,7 @@ impl Run<'_> {
     fn render_page(
         &mut self,
         pdf: &Path,
-        dirs: Dirs<'_>,
+        env: &ToolEnv,
         dir: &OwnedFd,
         info: &PageInfo,
         total: &mut u64,
@@ -455,20 +438,19 @@ impl Run<'_> {
         let Some(dpi) = self.page_dpi(info) else {
             return ControlFlow::Continue(());
         };
-        let tmp = dirs.env.cwd.join(RENDER_NAME);
         let budget = self.options.max_total_bytes.saturating_sub(*total);
-        fsops::remove(dirs.work, RENDER_NAME);
+        fsops::remove(&env.work, RENDER_NAME);
         let inv = self.backend.render(pdf, page, dpi, max_px, RENDER_NAME);
-        let out = self.invoke(&inv, dirs.env, Some((&tmp, budget)));
+        let out = self.invoke(&inv, env, Some((RENDER_NAME, budget)));
         if self.stopped(&inv, &out, Some(page)) {
-            fsops::remove(dirs.work, RENDER_NAME);
+            fsops::remove(&env.work, RENDER_NAME);
             return ControlFlow::Break(());
         }
-        let size = fsops::regular_file_len(dirs.work, RENDER_NAME);
+        let size = fsops::regular_file_len(&env.work, RENDER_NAME);
         // Checked before the exit status: on Linux a tool that reaches
         // `RLIMIT_FSIZE` is killed by `SIGXFSZ`.
         if size.is_some_and(|size| size > budget) {
-            fsops::remove(dirs.work, RENDER_NAME);
+            fsops::remove(&env.work, RENDER_NAME);
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::SizeLimit,
@@ -482,7 +464,7 @@ impl Run<'_> {
             return ControlFlow::Break(());
         }
         if !out.succeeded() {
-            fsops::remove(dirs.work, RENDER_NAME);
+            fsops::remove(&env.work, RENDER_NAME);
             self.render_failed(page, &format!("{} failed", program_name(&inv)), &out);
             return ControlFlow::Continue(());
         }
@@ -491,16 +473,16 @@ impl Run<'_> {
             return ControlFlow::Continue(());
         };
         let Some((width_px, height_px)) =
-            fsops::read_header::<24>(dirs.work, RENDER_NAME).and_then(|h| png::dimensions(&h))
+            fsops::read_header::<24>(&env.work, RENDER_NAME).and_then(|h| png::dimensions(&h))
         else {
-            fsops::remove(dirs.work, RENDER_NAME);
+            fsops::remove(&env.work, RENDER_NAME);
             self.render_failed(page, "the output is not a PNG image", &out);
             return ControlFlow::Continue(());
         };
         // Last line of defense for the pixel limit, whatever the tool made of
         // the page size (allowing for rounding).
         if width_px.max(height_px) > max_px.saturating_add(PIXEL_SLACK) {
-            fsops::remove(dirs.work, RENDER_NAME);
+            fsops::remove(&env.work, RENDER_NAME);
             self.render_failed(
                 page,
                 &format!(
@@ -512,7 +494,7 @@ impl Run<'_> {
         }
         let name = WorkspacePath::new(&format!("page-{page:03}.png"))
             .expect("generated file name is a valid path");
-        if let Err(e) = fsops::rename(dirs.work, RENDER_NAME, dir, name.as_str()) {
+        if let Err(e) = fsops::rename(&env.work, RENDER_NAME, dir, name.as_str()) {
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::OutputError,

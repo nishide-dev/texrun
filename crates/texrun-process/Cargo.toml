@@ -1,0 +1,20 @@
+[package]
+name = "texrun-process"
+description = "Supervised execution of external programs for texrun: process groups, limits and bounded output capture."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+texrun-core.workspace = true
+thiserror.workspace = true
+# Unix only: process groups, `killpg`, `waitid`, `prlimit` and `fstat`.
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

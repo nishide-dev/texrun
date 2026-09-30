@@ -4,7 +4,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use texrun_latex_log::LogParser;
 use crate::command::{self, MAX_PRINT_LINE};
 use crate::layout::{self, HOME_DIR};
 use crate::names::{check_host_path, check_name};
-use crate::process::{self, CapturedOutput, Limits, StopReason, Watch};
+use crate::process::{self, CapturedOutput, Job, Limits, StopReason};
 use crate::rc::{self, RcOptions};
 
 /// Engine identifier reported in [`EngineInfo::name`].
@@ -249,22 +248,16 @@ impl LatexmkEngine {
         plan.prepare_dirs()?;
         let (rc_dir, rc_path) = self.write_rc(&plan.root)?;
 
-        let mut cmd = Command::new(&latexmk);
-        cmd.args(command::latexmk_args(
-            &rc_path,
-            &plan.output_dir,
-            &plan.entry_arg,
-        ))
-        .current_dir(&plan.cwd)
-        .env_clear()
-        .envs(command::child_env(
-            &self.child_path(),
-            &plan.home,
-            self.config.source_date_epoch,
-        ));
-
         let limits = self.config.limits;
-        let watch = Watch {
+        let job = Job {
+            program: &latexmk,
+            args: command::latexmk_args(&rc_path, &plan.output_dir, &plan.entry_arg),
+            cwd: &plan.cwd,
+            env: command::child_env(
+                &self.child_path(),
+                &plan.home,
+                self.config.source_date_epoch,
+            ),
             timeout: Some(
                 request
                     .options
@@ -276,7 +269,7 @@ impl LatexmkEngine {
             limits,
             file_size_gate: process::FILE_SIZE_GATE_SUPPORTED,
         };
-        let finished = process::run(cmd, &watch);
+        let finished = process::run(&job);
         // The rc is not needed any more, whatever happened.
         let _ = rc_dir.close();
         let finished = finished?;
@@ -376,19 +369,18 @@ impl TypesetEngine for LatexmkEngine {
             .prefix("texrun-probe-")
             .tempdir()
             .map_err(io_error("creating a directory for `latexmk -v`".to_owned()))?;
-        let mut cmd = Command::new(&latexmk);
-        cmd.args(["-norc", "-v"])
-            .current_dir(scratch.path())
-            .env_clear()
-            .envs(command::child_env(&self.child_path(), scratch.path(), None));
-        let watch = Watch {
+        let job = Job {
+            program: &latexmk,
+            args: vec!["-norc".into(), "-v".into()],
+            cwd: scratch.path(),
+            env: command::child_env(&self.child_path(), scratch.path(), None),
             timeout: Some(PROBE_TIMEOUT),
             cancel: None,
             size_dirs: Vec::new(),
             limits: self.config.limits,
             file_size_gate: false,
         };
-        let finished = process::run(cmd, &watch)?;
+        let finished = process::run(&job)?;
         let stdout = String::from_utf8_lossy(&finished.stdout.bytes);
         let version = match (finished.stop, parse_version(&stdout)) {
             (None, Some(v)) if finished.status.success() => v,
@@ -839,11 +831,11 @@ mod tests {
         fs::write(&rc, rc::render(RcOptions { stdin_gate: true })).unwrap();
         let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();
-        let status = Command::new(latexmk)
+        let status = std::process::Command::new(latexmk)
             .args(command::latexmk_args(&rc, &out, "./main.tex"))
             .current_dir(dir.path())
             .env_clear()
-            .envs(command::child_env(&engine.child_path(), dir.path(), None))
+            .envs(command::child_env(&engine.child_path(), dir.path(), None).vars())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

@@ -102,6 +102,108 @@ pub(crate) fn rename(from_dir: &OwnedFd, from: &str, to_dir: &OwnedFd, to: &str)
     Ok(rustix::fs::renameat(from_dir, from, to_dir, to)?)
 }
 
+/// Deepest directory level [`remove_tree`] descends to. The tools only
+/// create a few levels of caches in their `HOME`.
+const MAX_REMOVE_DEPTH: usize = 32;
+
+/// A private directory created below a held parent directory with `mkdirat`
+/// and opened with `O_NOFOLLOW`, removed (through the descriptors) when
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct ScratchDir {
+    parent: OwnedFd,
+    name: String,
+    dir: OwnedFd,
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    /// Creates `<parent_path>/<prefix><random>` (mode 0700). `parent_path`
+    /// is opened like [`open_dir`]; everything below it is created and
+    /// opened through descriptors. A name that exists already (whatever it
+    /// is) is never reused.
+    pub(crate) fn create(parent_path: &Path, prefix: &str) -> io::Result<Self> {
+        let parent = open_dir(parent_path)?;
+        for _ in 0..64 {
+            let name = format!("{prefix}{:016x}", random_u64());
+            match rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(0o700)) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            let dir = rustix::fs::openat(&parent, name.as_str(), DIR_FLAGS, Mode::empty())
+                .map_err(map)?;
+            let path = parent_path.join(&name);
+            return Ok(Self {
+                parent,
+                name,
+                dir,
+                path,
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no unused scratch directory name found",
+        ))
+    }
+
+    /// A path of the directory (for `HOME` and messages; not followed by
+    /// texrun itself).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Creates the subdirectory `name` and opens it (`O_NOFOLLOW`).
+    pub(crate) fn subdir(&self, name: &str) -> io::Result<OwnedFd> {
+        rustix::fs::mkdirat(&self.dir, name, Mode::from_raw_mode(0o700))?;
+        rustix::fs::openat(&self.dir, name, DIR_FLAGS, Mode::empty()).map_err(map)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Ok(name) = std::ffi::CString::new(self.name.as_str()) {
+            remove_tree(&self.parent, &name, 0);
+        }
+    }
+}
+
+/// A random value for a directory name (the standard library's per-process
+/// random hash keys, mixed with a counter).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
+/// Removes `name` in `dir` and, if it is a directory, everything below it,
+/// best effort. Symlinks are removed, never followed; directories are
+/// opened with `O_NOFOLLOW` below the held descriptor.
+fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize) {
+    if rustix::fs::unlinkat(dir, name, AtFlags::empty()).is_ok() {
+        return;
+    }
+    if depth < MAX_REMOVE_DEPTH
+        && let Ok(sub) = rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())
+        && let Ok(mut entries) = rustix::fs::Dir::read_from(&sub)
+    {
+        let mut names = Vec::new();
+        while let Some(Ok(entry)) = entries.read() {
+            let entry_name = entry.file_name();
+            if !matches!(entry_name.to_bytes(), b"." | b"..") {
+                names.push(entry_name.to_owned());
+            }
+        }
+        for n in names {
+            remove_tree(&sub, &n, depth + 1);
+        }
+    }
+    let _ = rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR);
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -153,5 +255,58 @@ mod tests {
         remove(&fd, "f");
         remove(&fd, "missing");
         assert!(!dir.path().join("f").exists());
+    }
+
+    #[test]
+    fn scratch_dirs_are_private_and_removed_through_descriptors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), b"x").unwrap();
+        let a = ScratchDir::create(root.path(), ".s-").unwrap();
+        let b = ScratchDir::create(root.path(), ".s-").unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(
+            a.path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".s-")
+        );
+        let mode = fs::metadata(a.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let work = a.subdir("work").unwrap();
+        assert!(a.subdir("work").is_err(), "never reused");
+        fs::write(a.path().join("work/f"), b"data").unwrap();
+        fs::create_dir_all(a.path().join("home/.cache/deep")).unwrap();
+        fs::write(a.path().join("home/.cache/deep/c"), b"c").unwrap();
+        // A symlink inside is removed, not followed.
+        std::os::unix::fs::symlink(outside.path(), a.path().join("home/link")).unwrap();
+        assert_eq!(regular_file_len(&work, "f"), Some(4));
+
+        drop(a);
+        drop(b);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn a_moved_scratch_dir_is_still_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = ScratchDir::create(root.path(), ".s-").unwrap();
+        let work = scratch.subdir("work").unwrap();
+        // Something replaces the work directory by a symlink: the held
+        // descriptor still names the real one.
+        let outside = tempfile::tempdir().unwrap();
+        fs::rename(scratch.path().join("work"), scratch.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), scratch.path().join("work")).unwrap();
+        fs::write(scratch.path().join("old/page.png"), b"png").unwrap();
+        assert_eq!(regular_file_len(&work, "page.png"), Some(3));
+        drop(scratch);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }
