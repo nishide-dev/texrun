@@ -63,7 +63,9 @@ pub struct ContainerConfig {
     /// Which runtime to use. `None`: Docker, else Podman (the first that is
     /// installed and reachable).
     pub runtime: Option<RuntimeKind>,
-    /// The engine image; must exist locally (texrun never pulls).
+    /// The engine image; must exist locally (texrun never pulls). Default:
+    /// [`texrun_sandbox::DEFAULT_IMAGE`], the image published for this
+    /// version of texrun.
     pub image: String,
     /// `--runtime` of the container (e.g. `runsc` for gVisor, if
     /// configured in the daemon). `None`: the daemon's default. Not tested
@@ -290,9 +292,8 @@ impl TypesetEngine for ContainerEngine {
     /// compile, and nothing mounted).
     fn probe(&self) -> Result<EngineInfo, EngineError> {
         let runtime = self.runtime()?;
-        let image_id = runtime
-            .image_id(&self.config.image)
-            .map_err(sandbox_error)?;
+        let image = runtime.image(&self.config.image).map_err(sandbox_error)?;
+        let image_id = image.id;
         *self.image_id.lock().unwrap_or_else(PoisonError::into_inner) = Some(image_id.clone());
         let spec = container_spec(&self.config, &image_id, PROBE_TIMEOUT);
         let container = Container::new(&runtime, spec);
@@ -330,10 +331,11 @@ impl TypesetEngine for ContainerEngine {
             .unwrap_or(&image_id)
             .to_owned();
         *self.version.lock().unwrap_or_else(PoisonError::into_inner) = Some(format!(
-            "latexmk {version} ({} {}, image {} {short_id})",
+            "latexmk {version} ({} {}, image {} {short_id}, {})",
             runtime.kind(),
             runtime.version(),
-            self.config.image
+            self.config.image,
+            image_version(image.version.as_deref())
         ));
         Ok(self.info())
     }
@@ -344,6 +346,20 @@ impl TypesetEngine for ContainerEngine {
         request: &CompileRequest,
     ) -> Result<CompileResult, EngineError> {
         self.run(ctx, request).map(|run| run.result)
+    }
+}
+
+/// How [`TypesetEngine::probe`] reports the image's version label
+/// ([`texrun_sandbox::IMAGE_VERSION_LABEL`]) in `engine.version`, so that a
+/// result shows whether the image was published for this version of texrun.
+fn image_version(label: Option<&str>) -> String {
+    match label {
+        Some(v) if v == texrun_sandbox::VERSION => format!("image version {v}"),
+        Some(v) => format!(
+            "image version {v}, not {} of texrun",
+            texrun_sandbox::VERSION
+        ),
+        None => "image without a version label".to_owned(),
     }
 }
 
@@ -480,6 +496,21 @@ fn sandbox_error(e: SandboxError) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_version_is_compared_with_texruns() {
+        let this = texrun_sandbox::VERSION;
+        assert_eq!(image_version(Some(this)), format!("image version {this}"));
+        assert_eq!(
+            image_version(Some("0.0.0-other")),
+            format!("image version 0.0.0-other, not {this} of texrun")
+        );
+        assert_eq!(image_version(None), "image without a version label");
+        assert_eq!(
+            ContainerConfig::default().image,
+            format!("ghcr.io/nishide-dev/texrun-engine:{this}")
+        );
+    }
 
     #[test]
     fn the_container_deadline_follows_the_timeout() {

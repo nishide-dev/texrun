@@ -75,13 +75,44 @@ pub use container::{
     ROOT_FALLBACK_ID,
 };
 pub use error::SandboxError;
-pub use runtime::{RUNTIME_ENV, Runtime, RuntimeKind};
+pub use runtime::{Image, RUNTIME_ENV, Runtime, RuntimeKind};
 pub use session::Session;
 
-/// Image used when none is configured. Built from `docker/engine/Dockerfile`
-/// (`docker build -t texrun-engine:latest docker/engine`).
-pub const DEFAULT_IMAGE: &str = "texrun-engine:latest";
+/// Repository of the published engine images: built from
+/// `docker/engine/Dockerfile` for every release by
+/// `.github/workflows/engine-image.yml`, tagged with the version of texrun.
+pub const IMAGE_REPOSITORY: &str = "ghcr.io/nishide-dev/texrun-engine";
+
+/// The version of texrun that this build is, which is also the tag of its
+/// engine image in [`IMAGE_REPOSITORY`] and the value of
+/// [`IMAGE_VERSION_LABEL`] in that image.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Image used when none is configured: the engine image published for this
+/// version of texrun (`<IMAGE_REPOSITORY>:<VERSION>`). texrun never pulls
+/// it: `docker pull` it once, or build it locally under this name
+/// (`docker build -t <DEFAULT_IMAGE> docker/engine`).
+pub const DEFAULT_IMAGE: &str = concat!(
+    "ghcr.io/nishide-dev/texrun-engine:",
+    env!("CARGO_PKG_VERSION")
+);
+
+/// Image label with the version of texrun that an engine image was
+/// published for (set by the release workflow; absent in local builds
+/// unless given with `--label`). Reported with the image
+/// ([`Image::version`]).
+pub const IMAGE_VERSION_LABEL: &str = "org.opencontainers.image.version";
 
 /// Label (`<LABEL>=1`) of every container texrun creates, for finding ones
 /// left behind by a texrun process that was killed.
 pub const LABEL: &str = "org.texrun.sandbox";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_image_is_the_published_one_of_this_version() {
+        assert_eq!(DEFAULT_IMAGE, format!("{IMAGE_REPOSITORY}:{VERSION}"));
+    }
+}

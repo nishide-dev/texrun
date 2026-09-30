@@ -70,6 +70,7 @@ fn a_document_compiles_in_the_container() {
     assert_eq!(doc["engine"]["name"], "texlive-container");
     let version = doc["engine"]["version"].as_str().unwrap();
     assert!(version.starts_with("latexmk "), "{version}");
+    assert!(version.contains(", image "), "{version}");
     assert_eq!(
         doc["resource_limits"],
         serde_json::json!({ "rlimits": true, "cgroup": true })
@@ -145,7 +146,7 @@ fn a_missing_image_is_a_runtime_error() {
         doc["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("docker build"),
+            .contains("docker pull ghcr.io/nishide-dev/texrun-engine:"),
         "{doc:#}"
     );
     // Nothing was compiled.

@@ -46,7 +46,7 @@ fn container() -> Result<Option<PreviewContainer>, ()> {
         let image = std::env::var(IMAGE_ENV)
             .ok()
             .filter(|i| !i.is_empty())
-            .unwrap_or_else(|| texrun_sandbox::DEFAULT_IMAGE.to_owned());
+            .unwrap_or_else(|| "texrun-engine:latest".to_owned());
         let runtime = texrun_sandbox::Runtime::detect(None).map_err(|e| e.to_string())?;
         let id = runtime.image_id(&image).map_err(|e| e.to_string())?;
         Ok(PreviewContainer::new(runtime, id))

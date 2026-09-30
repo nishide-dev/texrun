@@ -215,12 +215,27 @@ impl Runtime {
     /// The ID of the local image `image`, or [`SandboxError::Unavailable`]
     /// if there is none (texrun never pulls one).
     pub fn image_id(&self, image: &str) -> Result<String, SandboxError> {
+        self.image(image).map(|i| i.id)
+    }
+
+    /// The local image `image` (its ID and version label), or
+    /// [`SandboxError::Unavailable`] if there is none (texrun never pulls
+    /// one).
+    pub fn image(&self, image: &str) -> Result<Image, SandboxError> {
         check_image(image)?;
-        match self.query(&["image", "inspect", "--format", "{{.Id}}", "--", image]) {
-            Ok(id) => Ok(id.trim().to_owned()),
+        let format = "{{.Id}} {{json .Config.Labels}}";
+        match self.query(&["image", "inspect", "--format", format, "--", image]) {
+            Ok(out) => parse_image(&out).ok_or_else(|| {
+                SandboxError::Unavailable(format!(
+                    "unexpected `{} image inspect` output for `{image}`: {:?}",
+                    self.kind,
+                    out.trim()
+                ))
+            }),
             Err(e) => Err(SandboxError::Unavailable(format!(
-                "the container image `{image}` is not available to {}: {e} (build it with \
-                 `{} build -t {image} docker/engine`)",
+                "the container image `{image}` is not available to {}: {e} (texrun never \
+                 pulls images: pull it with `{} pull {image}`, or build it from docker/engine \
+                 in the texrun repository)",
                 self.kind, self.kind
             ))),
         }
@@ -354,6 +369,41 @@ fn parse_version(version: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// A local image ([`Runtime::image`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Image {
+    /// The image ID (`sha256:...`), which compiles are created from.
+    pub id: String,
+    /// The version of texrun the image was published for: its
+    /// [`IMAGE_VERSION_LABEL`](crate::IMAGE_VERSION_LABEL). `None` if the
+    /// image has no such label (e.g. a local build), or one that is not a
+    /// plain version string.
+    pub version: Option<String>,
+}
+
+/// Parses `{{.Id}} {{json .Config.Labels}}`.
+fn parse_image(out: &str) -> Option<Image> {
+    let (id, labels) = out.trim().split_once(' ')?;
+    if id.is_empty() {
+        return None;
+    }
+    let labels: Option<std::collections::BTreeMap<String, String>> =
+        serde_json::from_str(labels).ok()?;
+    let version = labels
+        .and_then(|mut l| l.remove(crate::IMAGE_VERSION_LABEL))
+        .filter(|v| {
+            !v.is_empty()
+                && v.len() <= 64
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        });
+    Some(Image {
+        id: id.to_owned(),
+        version,
+    })
+}
+
 /// An image reference texrun passes to the runtime: `[registry/]name[:tag]`
 /// or `name@sha256:<digest>`, with the characters of the reference grammar
 /// only.
@@ -421,6 +471,44 @@ mod tests {
         }
         for bad in ["", "-x", "a b", "a;b", "x\n", "$(x)"] {
             assert!(check_image(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn image_inspect_output_is_parsed() {
+        let labelled = format!(
+            "sha256:0123 {{\"{}\":\"0.1.0\",\"other\":\"x\"}}\n",
+            crate::IMAGE_VERSION_LABEL
+        );
+        assert_eq!(
+            parse_image(&labelled),
+            Some(Image {
+                id: "sha256:0123".into(),
+                version: Some("0.1.0".into())
+            })
+        );
+        for unlabelled in [
+            "sha256:0123 null",
+            "sha256:0123 {}",
+            "sha256:0123 {\"a\":\"b\"}",
+        ] {
+            assert_eq!(
+                parse_image(unlabelled),
+                Some(Image {
+                    id: "sha256:0123".into(),
+                    version: None
+                }),
+                "{unlabelled}"
+            );
+        }
+        // Only a plain version string is reported.
+        let odd = format!(
+            "sha256:0123 {{\"{}\":\"1.0 \\u001b[31m\"}}",
+            crate::IMAGE_VERSION_LABEL
+        );
+        assert_eq!(parse_image(&odd).unwrap().version, None);
+        for bad in ["", "sha256:0123", " {}", "sha256:0123 {", "sha256:0123 []"] {
+            assert_eq!(parse_image(bad), None, "{bad:?}");
         }
     }
 
