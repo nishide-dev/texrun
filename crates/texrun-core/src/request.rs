@@ -43,12 +43,33 @@ impl CompileRequest {
     /// enforce. Engines call this at the start of
     /// [`TypesetEngine::compile`](crate::TypesetEngine::compile).
     ///
-    /// Currently rejects a zero timeout with [`EngineError::InvalidRequest`].
+    /// Rejects with [`EngineError::InvalidRequest`]:
+    ///
+    /// - a zero timeout;
+    /// - an entrypoint that is not separated from the output directory: the
+    ///   entrypoint lies inside [`CompileOptions::output_dir`] (i.e. the
+    ///   output directory is the entrypoint or one of its ancestors), or the
+    ///   output directory lies below the entrypoint. The check is lexical;
+    ///   the workspace layer never copies input files into the output
+    ///   directory.
     pub fn validate(&self) -> Result<(), EngineError> {
         if self.options.timeout == Some(Duration::ZERO) {
             return Err(EngineError::InvalidRequest(
                 "timeout must be greater than zero".to_owned(),
             ));
+        }
+        let output_dir = &self.options.output_dir;
+        if self.entrypoint.starts_with(output_dir) {
+            return Err(EngineError::InvalidRequest(format!(
+                "entrypoint `{}` must not be inside the output directory `{output_dir}`",
+                self.entrypoint
+            )));
+        }
+        if output_dir.starts_with(&self.entrypoint) {
+            return Err(EngineError::InvalidRequest(format!(
+                "output directory `{output_dir}` must not be inside the entrypoint `{}`",
+                self.entrypoint
+            )));
         }
         Ok(())
     }
@@ -189,5 +210,33 @@ mod tests {
         )
         .unwrap();
         assert!(from_json.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_entrypoint_not_separated_from_output_dir() {
+        let with_out = |entry: &str, out: &str| {
+            CompileRequest::new(wp(entry))
+                .with_options(CompileOptions::default().with_output_dir(wp(out)))
+        };
+        for (entry, out) in [
+            (".texrun/out/main.tex", ".texrun/out"),
+            ("build/sub/main.tex", "build"),
+            ("main.tex", "main.tex"),
+            ("main.tex", "main.tex/out"),
+        ] {
+            assert_eq!(
+                with_out(entry, out).validate().unwrap_err().kind(),
+                EngineErrorKind::InvalidRequest,
+                "{entry} / {out}"
+            );
+        }
+        for (entry, out) in [
+            ("main.tex", ".texrun/out"),
+            ("src/main.tex", "src-out"),
+            ("src/main.tex", "out"),
+            ("build2/main.tex", "build"),
+        ] {
+            assert!(with_out(entry, out).validate().is_ok(), "{entry} / {out}");
+        }
     }
 }

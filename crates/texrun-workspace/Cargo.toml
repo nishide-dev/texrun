@@ -1,0 +1,19 @@
+[package]
+name = "texrun-workspace"
+description = "Isolated compile workspaces for texrun: input materialization and artifact collection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tempfile.workspace = true
+texrun-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+texrun-core = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
