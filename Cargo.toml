@@ -4,6 +4,7 @@ members = [
     "apps/texrun",
     "crates/texrun-core",
     "crates/texrun-latex-log",
+    "crates/texrun-texlive",
     "crates/texrun-workspace",
 ]
 
@@ -18,6 +19,7 @@ rust-version = "1.98"
 # Internal crates
 texrun-core = { path = "crates/texrun-core", version = "0.1.0" }
 texrun-latex-log = { path = "crates/texrun-latex-log", version = "0.1.0" }
+texrun-texlive = { path = "crates/texrun-texlive", version = "0.1.0" }
 texrun-workspace = { path = "crates/texrun-workspace", version = "0.1.0" }
 
 # External crates (add only when an issue actually needs them)

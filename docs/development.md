@@ -91,6 +91,12 @@ docker compose down --volumes
 TeX Live を必要とする integration test の実行方法（`#[ignore]` + `--ignored`、環境変数、cargo feature のいずれで有効化するか）は #10 で決める。
 決まり次第このセクションに追記する。いずれの方式でも、この dev コンテナ内で実行すれば `latexmk` / `mutool` / `pdftoppm` が揃った状態でテストできる。
 
+それまでの間、TeX Live engine（`crates/texrun-texlive`）の integration test は `#[ignore]` にしてある。dev コンテナ内で次のように実行する。latexmk が無い環境では skip せずに失敗する。
+
+```bash
+docker compose run --rm dev cargo test -p texrun-texlive -- --ignored
+```
+
 ## 注意事項
 
 - コンテナ内の process は root で動く。Docker Desktop / OrbStack（macOS）では bind mount 上に作られたファイルは host ユーザーの所有になるが、Linux の Docker Engine では root 所有になる。integration test（#10）の出力先は repo 内ではなく tempdir にする

@@ -434,6 +434,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "texrun-texlive"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "texrun-core",
+ "texrun-latex-log",
+ "texrun-workspace",
+]
+
+[[package]]
 name = "texrun-workspace"
 version = "0.1.0"
 dependencies = [
