@@ -400,7 +400,9 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
 - BibTeX の `.blg` も artifact にしない（#27）。内容は diagnostics（`bibtex_error` / `bibtex_failed` / `missing_file` など）の `raw_excerpt` に入る。engine は output dir 以下の `.blg` を、compile の timeout の外で読むので、読む量に上限を設ける。
   - output dir の走査: 最大 20,000 entry・深さ 16、symlink はたどらない
   - 読む `.blg`: この compile で更新されたもの（mtime が latexmk の開始以降）を最大 16 個。通常ファイルだけを `O_NOFOLLOW | O_NONBLOCK` で開き、先頭 1 MiB まで読む
-  - 1 つの `.blg` から最大 200 個の diagnostics。parse は読んだ量に線形
+  - `<stem>.blg` を先に読み、全 `.blg` を合わせて最大 200 個の diagnostics（各 `.blg` の要約と省略の通知は別）。parse は読んだ量に線形
+  - 文書は output dir に任意のファイルを書けるので、`.blg` の内容も main の `.log` と同じく文書が制御できる入力として扱う。file を付けるのは entrypoint のディレクトリに実在する `.bib` / `.bst` だけなので、`.blg` を偽造しても workspace 外や存在しないファイルを指す diagnostic にはならない
+  - output dir は compile ごとに新しい前提（CLI は毎回新しい workspace を作る）。mtime の判定は保険
   - `.bib` / `.bst` の file は、`.blg` が database / style として名前を挙げ、entrypoint のディレクトリ（latexmk が BibTeX の `BIBINPUTS` / `BSTINPUTS` の先頭に置く）に workspace 内の通常ファイルとしてあるときだけ付ける。`.aux` 内の位置や installed な style には付けない
 - 既定では `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` を設定しないので、PDF の日時は compile した時刻になる。再現可能なビルドを求められた場合に限り、CLI の option（#6）で `SOURCE_DATE_EPOCH=<値>` と `FORCE_SOURCE_DATE=1` を env allowlist に加える。これで、PDF の日時が固定されることを確認した。
 - banner と log 内のパスは、MVP では抑制しない。生成物を第三者と共有する場合は、利用者の判断に委ねる。

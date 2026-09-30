@@ -137,6 +137,44 @@ fn several_databases_from_a_subdirectory_entrypoint() {
 }
 
 #[test]
+fn unclosed_brace_keeps_only_the_file() {
+    require_texlive!();
+    let (run, _ws) = Compile::fixture("bibtex", "unclosed.tex").run();
+    assert_outcome(&run, CompileOutcome::Failed);
+    let d = find(&run, DiagnosticKind::BibtexError);
+    // The `{` on line 3 is not closed; BibTeX only notices at the next
+    // entry (line 8), which is not where to fix it.
+    assert_eq!((file_of(d), d.line), (Some("unclosed.bib"), None), "{d:#?}");
+    assert!(d.message.contains("next entry at line 8"), "{d:#?}");
+    assert!(!d.message.contains("previous line"), "{d:#?}");
+}
+
+#[test]
+fn no_citations_is_a_warning() {
+    require_texlive!();
+    let (run, _ws) = Compile::fixture("bibtex", "no-citations.tex").run();
+    // latexmk takes this as a success, and so do the diagnostics.
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    assert_eq!(run.result.errors().count(), 0, "{}", describe(&run));
+    let d = find(&run, DiagnosticKind::BibtexError);
+    assert_eq!(d.severity, Severity::Warning);
+    assert!(d.message.contains("no \\citation commands"), "{d:#?}");
+    assert!(
+        !of_kind(&run, DiagnosticKind::BibtexFailed)
+            .iter()
+            .any(|d| d.severity > Severity::Info)
+    );
+}
+
+#[test]
+fn unreadable_database_is_explained() {
+    require_texlive!();
+    let (run, _ws) = Compile::fixture("bibtex", "hidden-database.tex").run();
+    let d = find(&run, DiagnosticKind::MissingFile);
+    assert!(d.message.contains("safe settings"), "{d:#?}");
+}
+
+#[test]
 fn a_working_bibliography_reports_no_bibtex_problem() {
     require_texlive!();
     let (run, _ws) = Compile::fixture("references", "main.tex").run();

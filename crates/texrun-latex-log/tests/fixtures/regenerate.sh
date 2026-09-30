@@ -111,3 +111,7 @@ compile bibtex-missing-database bibtex
 compile bibtex-missing-entry bibtex
 compile bibtex-missing-style bibtex
 compile bibtex-multi-database bibtex
+compile bibtex-unclosed-entry bibtex
+compile bibtex-unclosed-brace bibtex
+compile bibtex-unclosed-quote bibtex
+compile bibtex-no-citations bibtex

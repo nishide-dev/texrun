@@ -177,3 +177,77 @@ fn without_files_no_location_is_guessed() {
     );
     assert_eq!(parsed.diagnostics[0].kind, K::BibtexError);
 }
+
+/// BibTeX read on past a mistake that is not closed: only the file is
+/// reported, and the message says where BibTeX noticed.
+#[track_caller]
+fn assert_read_on(name: &str, message: &str) {
+    let parsed = parse(name);
+    assert!(parsed.failed);
+    let d = &parsed.diagnostics[0];
+    assert_eq!(
+        (
+            d.severity,
+            d.kind,
+            d.file.as_ref().map(WorkspacePath::as_str),
+            d.line
+        ),
+        (Severity::Error, K::BibtexError, Some("refs.bib"), None),
+        "{d:#?}"
+    );
+    assert_eq!(d.message, message);
+    let failed = parsed
+        .diagnostics
+        .iter()
+        .find(|d| d.kind == K::BibtexFailed)
+        .unwrap();
+    assert_eq!(failed.severity, Severity::Info);
+}
+
+#[test]
+fn unclosed_entry() {
+    // The `}` after line 5 is missing.
+    assert_read_on(
+        "bibtex-unclosed-entry",
+        "BibTeX: I was expecting a `,' or a `}' (found the next entry at line 7; the entry \
+         before it is probably not closed: a missing `}` or an unbalanced `{` / `\"` in one of \
+         its fields)",
+    );
+}
+
+#[test]
+fn unclosed_brace_in_a_field() {
+    // The `{` on line 3 is not closed; BibTeX notices at line 8.
+    assert_read_on(
+        "bibtex-unclosed-brace",
+        "BibTeX: I was expecting a `,' or a `}' (found the next entry at line 8; the entry \
+         before it is probably not closed: a missing `}` or an unbalanced `{` / `\"` in one of \
+         its fields)",
+    );
+}
+
+#[test]
+fn unclosed_quote_in_a_field() {
+    // The `"` on line 2 is not closed; BibTeX notices at line 6.
+    assert_read_on(
+        "bibtex-unclosed-quote",
+        "BibTeX: Unbalanced braces (detected at line 6; an unbalanced `{` or `\"` earlier in \
+         this entry is likely)",
+    );
+}
+
+#[test]
+fn no_citations_is_only_a_warning() {
+    // latexmk takes this as a success; so does the parser.
+    let parsed = parse("bibtex-no-citations");
+    assert!(!parsed.failed);
+    assert_eq!(parsed.error_messages, Some(1));
+    assert_eq!(
+        summary(&parsed.diagnostics),
+        [(Severity::Warning, K::BibtexError, None, None)]
+    );
+    assert_eq!(
+        parsed.diagnostics[0].message,
+        "BibTeX: I found no \\citation commands"
+    );
+}

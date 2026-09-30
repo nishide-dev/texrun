@@ -19,6 +19,13 @@
 //! `\bibliography` does not exist (it "vetoes" the rule and exits with 0),
 //! so no `.blg` is written; that is only visible on latexmk's console.
 //!
+//! The output directory is assumed to be new for each compile (the CLI
+//! always creates a new workspace). The modification time check only keeps
+//! logs of an earlier compile in a reused output directory out when they
+//! are older than the second latexmk started in; and when latexmk finds
+//! BibTeX's results up to date and does not run it again, the problems of
+//! the earlier run are not reported again.
+//!
 //! # Cost
 //!
 //! Runs after the compile, outside its timeout, on files the document
@@ -26,9 +33,11 @@
 //! visits at most [`MAX_SCANNED_ENTRIES`] entries, [`MAX_SCAN_DEPTH`] levels
 //! deep, without following symlinks; at most [`MAX_BLG_FILES`] logs are read,
 //! each regular file opened with `O_NOFOLLOW | O_NONBLOCK` and read up to
-//! [`MAX_BLG_BYTES`] (its head: BibTeX reports errors in order); each log
-//! yields at most [`MAX_BLG_DIAGNOSTICS`] diagnostics. Parsing is linear in
-//! the bytes read, and the console scan is linear in the captured output.
+//! [`MAX_BLG_BYTES`] (its head: BibTeX reports errors in order), starting
+//! with `<stem>.blg`; all logs together yield at most
+//! [`MAX_BLG_DIAGNOSTICS`] diagnostics (errors first within each log; plus a
+//! summary and a notice per log and a few notes). Parsing is linear in the
+//! bytes read, and the console scan is linear in the captured output.
 
 use std::collections::HashSet;
 use std::fs;
@@ -45,7 +54,8 @@ pub(crate) const MAX_BLG_FILES: usize = 16;
 /// At most this many bytes of each `.blg` are read.
 pub(crate) const MAX_BLG_BYTES: u64 = 1024 * 1024;
 
-/// At most this many diagnostics are kept per `.blg` (errors first).
+/// At most this many diagnostics are kept from all `.blg` files of a
+/// compile together (not counting their summaries and notices).
 pub(crate) const MAX_BLG_DIAGNOSTICS: usize = 200;
 
 /// The walk of the output directory stops after this many entries.
@@ -82,25 +92,51 @@ impl Inputs<'_> {
 }
 
 /// Diagnostics about BibTeX: from the `.blg` files below `output_dir`
-/// modified at or after `since`, and from latexmk's console output.
+/// modified at or after `since` (`<stem>.blg` first), and from latexmk's
+/// console output.
 pub(crate) fn diagnostics(
     output_dir: &Path,
+    stem: &str,
     since: SystemTime,
     inputs: &Inputs<'_>,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    let (blgs, walk_cut) = find_blgs(output_dir, since);
-    let parser = BlgParser::new().with_max_diagnostics(MAX_BLG_DIAGNOSTICS);
+    let (blgs, walk_cut) = find_blgs(output_dir, &format!("{stem}.blg"), since);
     let locate = |name: &WorkspacePath| inputs.locate(name);
     let mut failed = false;
-    for path in &blgs {
+    let mut budget = MAX_BLG_DIAGNOSTICS;
+    for (n, path) in blgs.iter().enumerate() {
+        if budget == 0 {
+            out.push(Diagnostic::new(
+                Severity::Info,
+                DiagnosticKind::Other,
+                format!(
+                    "{} more BibTeX logs were not analyzed (limit: {MAX_BLG_DIAGNOSTICS} \
+                     diagnostics from BibTeX logs)",
+                    blgs.len() - n
+                ),
+            ));
+            break;
+        }
         let Some((bytes, cut)) = read_head(path, MAX_BLG_BYTES) else {
             continue;
         };
-        let parsed = parser.parse_with_files(&bytes, &locate);
+        let parsed = BlgParser::new()
+            .with_max_diagnostics(budget)
+            .parse_with_files(&bytes, &locate);
         failed |= parsed.failed;
+        let kept = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind != DiagnosticKind::BibtexFailed)
+            .count()
+            - usize::from(parsed.omitted > 0);
+        budget = budget.saturating_sub(kept);
+        if parsed.omitted > 0 {
+            budget = 0;
+        }
         out.extend(parsed.diagnostics);
         if cut {
             out.push(Diagnostic::new(
@@ -155,14 +191,21 @@ pub(crate) fn diagnostics(
 }
 
 /// Regular `*.blg` files below `dir` modified at or after `since` (whole
-/// seconds, for file systems with coarse timestamps), sorted, and whether
-/// the walk was cut short by a limit.
-pub(crate) fn find_blgs(dir: &Path, since: SystemTime) -> (Vec<PathBuf>, bool) {
+/// seconds, for file systems with coarse timestamps; a safety net only, see
+/// the module docs): `dir/<first>` first (found even when the limits cut
+/// the walk short), then the others sorted; and whether the walk was cut
+/// short by a limit.
+pub(crate) fn find_blgs(dir: &Path, first: &str, since: SystemTime) -> (Vec<PathBuf>, bool) {
     let since = since
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(SystemTime::UNIX_EPOCH, |d| {
             SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())
         });
+    let fresh = |meta: &fs::Metadata| meta.modified().is_ok_and(|m| m >= since);
+    let first = dir.join(first);
+    let first = fs::symlink_metadata(&first)
+        .is_ok_and(|m| m.is_file() && fresh(&m))
+        .then_some(first);
     let mut found = Vec::new();
     let mut visited = 0usize;
     let mut cut = false;
@@ -191,12 +234,10 @@ pub(crate) fn find_blgs(dir: &Path, since: SystemTime) -> (Vec<PathBuf>, bool) {
                 && path
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("blg"))
-                && entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|m| m >= since)
+                && first.as_ref() != Some(&path)
+                && entry.metadata().is_ok_and(|m| fresh(&m))
             {
-                if found.len() == MAX_BLG_FILES {
+                if found.len() + usize::from(first.is_some()) == MAX_BLG_FILES {
                     cut = true;
                     break 'walk;
                 }
@@ -205,6 +246,9 @@ pub(crate) fn find_blgs(dir: &Path, since: SystemTime) -> (Vec<PathBuf>, bool) {
         }
     }
     found.sort();
+    if let Some(first) = first {
+        found.insert(0, first);
+    }
     (found, cut)
 }
 
@@ -325,16 +369,17 @@ mod tests {
         // Symlinks are not followed.
         std::os::unix::fs::symlink(out.join("main.blg"), out.join("link.blg")).unwrap();
         std::os::unix::fs::symlink(&out, out.join("loop")).unwrap();
-        let (found, cut) = find_blgs(&out, SystemTime::UNIX_EPOCH);
+        let (found, cut) = find_blgs(&out, "main.blg", SystemTime::UNIX_EPOCH);
         let names: Vec<_> = found
             .iter()
             .map(|p| p.strip_prefix(&out).unwrap().to_str().unwrap().to_owned())
             .collect();
-        assert_eq!(names, ["chapters/deep/x.blg", "chapters/x.BLG", "main.blg"]);
+        // `<stem>.blg` first.
+        assert_eq!(names, ["main.blg", "chapters/deep/x.blg", "chapters/x.BLG"]);
         assert!(!cut);
         // Files from before the compile are stale.
         let later = SystemTime::now() + std::time::Duration::from_secs(5);
-        assert!(find_blgs(&out, later).0.is_empty());
+        assert!(find_blgs(&out, "main.blg", later).0.is_empty());
     }
 
     #[test]
@@ -343,7 +388,7 @@ mod tests {
         for n in 0..(MAX_BLG_FILES + 3) {
             fs::write(root.join(format!("{n}.blg")), "x").unwrap();
         }
-        let (found, cut) = find_blgs(&root, SystemTime::UNIX_EPOCH);
+        let (found, cut) = find_blgs(&root, "main.blg", SystemTime::UNIX_EPOCH);
         assert_eq!(found.len(), MAX_BLG_FILES);
         assert!(cut);
 
@@ -354,9 +399,43 @@ mod tests {
         }
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("x.blg"), "x").unwrap();
-        let (found, cut) = find_blgs(&root, SystemTime::UNIX_EPOCH);
+        let (found, cut) = find_blgs(&root, "main.blg", SystemTime::UNIX_EPOCH);
         assert!(found.is_empty());
         assert!(cut);
+    }
+
+    #[test]
+    fn the_main_log_is_read_even_past_the_file_limit() {
+        let (_dir, root) = workspace();
+        fs::create_dir(root.join("sub")).unwrap();
+        for n in 0..(MAX_BLG_FILES + 3) {
+            fs::write(root.join(format!("sub/{n}.blg")), "x").unwrap();
+        }
+        fs::write(root.join("main.blg"), "x").unwrap();
+        let (found, cut) = find_blgs(&root, "main.blg", SystemTime::UNIX_EPOCH);
+        assert_eq!(found.len(), MAX_BLG_FILES);
+        assert_eq!(found[0], root.join("main.blg"));
+        assert!(cut);
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_for_the_whole_compile() {
+        let (_dir, root) = workspace();
+        let many = "Warning--empty author in x\n".repeat(150);
+        for n in 0..4 {
+            fs::write(root.join(format!("{n}.blg")), &many).unwrap();
+        }
+        let inputs = Inputs {
+            root: &root,
+            entry_dir: &root,
+            entry_dir_rel: None,
+        };
+        let d = diagnostics(&root, "main", SystemTime::UNIX_EPOCH, &inputs, b"", b"");
+        let warnings = d.iter().filter(|d| d.severity == Severity::Warning).count();
+        assert_eq!(warnings, MAX_BLG_DIAGNOSTICS);
+        // One omitted notice, and one note for the logs not analyzed.
+        assert!(d.len() <= MAX_BLG_DIAGNOSTICS + 3, "{}", d.len());
+        assert!(d.last().unwrap().message.contains("2 more BibTeX logs"));
     }
 
     #[test]
@@ -431,7 +510,7 @@ mod tests {
             entry_dir_rel: None,
         };
         let stdout = b"  bibtex out/main: Bibtex errors: See file 'out/main.blg'\n";
-        let d = diagnostics(&out, SystemTime::UNIX_EPOCH, &inputs, stdout, b"");
+        let d = diagnostics(&out, "main", SystemTime::UNIX_EPOCH, &inputs, stdout, b"");
         let summary: Vec<_> = d
             .iter()
             .map(|d| {
@@ -443,15 +522,10 @@ mod tests {
                 )
             })
             .collect();
+        // `main.blg` first.
         assert_eq!(
             summary,
             [
-                (
-                    Severity::Warning,
-                    DiagnosticKind::UndefinedCitation,
-                    None,
-                    None
-                ),
                 (
                     Severity::Error,
                     DiagnosticKind::BibtexError,
@@ -459,13 +533,19 @@ mod tests {
                     Some(7)
                 ),
                 (Severity::Info, DiagnosticKind::BibtexFailed, None, None),
+                (
+                    Severity::Warning,
+                    DiagnosticKind::UndefinedCitation,
+                    None,
+                    None
+                ),
             ]
         );
 
         // latexmk says BibTeX failed, but there is no log.
         let empty = root.join("empty");
         fs::create_dir(&empty).unwrap();
-        let d = diagnostics(&empty, SystemTime::UNIX_EPOCH, &inputs, stdout, b"");
+        let d = diagnostics(&empty, "main", SystemTime::UNIX_EPOCH, &inputs, stdout, b"");
         assert_eq!(d.len(), 1);
         assert_eq!(
             (d[0].severity, d[0].kind),
@@ -475,6 +555,7 @@ mod tests {
         // A vetoed rule without names.
         let d = diagnostics(
             &empty,
+            "main",
             SystemTime::UNIX_EPOCH,
             &inputs,
             b"",

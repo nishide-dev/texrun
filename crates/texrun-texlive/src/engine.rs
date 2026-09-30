@@ -633,7 +633,14 @@ impl Plan {
             entry_dir: &self.cwd,
             entry_dir_rel: self.entry_dir_rel.as_ref(),
         };
-        bibtex::diagnostics(&self.output_dir, started, &inputs, stdout, stderr)
+        bibtex::diagnostics(
+            &self.output_dir,
+            &self.stem,
+            started,
+            &inputs,
+            stdout,
+            stderr,
+        )
     }
 }
 

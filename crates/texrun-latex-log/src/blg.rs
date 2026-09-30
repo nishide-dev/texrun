@@ -106,6 +106,15 @@ pub struct ParsedBlg {
 ///
 /// Messages are prefixed with `BibTeX: ` / `BibTeX warning: `.
 ///
+/// Like latexmk (4.86, `check_bibtex_log`), `I found no \citation commands`
+/// (a document without `\cite` yet) is only a warning, and a log whose
+/// errors are all such "weak" errors (also a missing `.aux` or database
+/// file) is not a failure: those messages are warnings and there is no
+/// `BibtexFailed`. A missing database with nothing else (`I found no
+/// database files` follows) stays an error, as for latexmk. For a file
+/// that exists but that kpathsea's paranoid mode refuses (absolute, `..`
+/// or a component starting with `.`), the message says so.
+///
 /// # Locations
 ///
 /// - `file` is set only for a `.bib` / `.bst` file that the log itself names
@@ -118,11 +127,18 @@ pub struct ParsedBlg {
 ///   BibTeX was reading when it found the error, i.e. the line of the
 ///   unexpected token. When BibTeX adds `(Error may have been on previous
 ///   line)` (the token starts its line, so e.g. a missing `,` at the end of
-///   the previous line is likely), the message says so. Of the warnings
-///   with a `--line N`, only `string name "x" is undefined` keeps it:
-///   BibTeX reports the other ones (e.g. `I'm ignoring key's extra "year"
-///   field`) after looking ahead past the field, so `N` may be a later
-///   line.
+///   the previous line is likely), the message says so.
+/// - `line` is `None` (the file is kept, and the message says where BibTeX
+///   noticed and what is likely wrong) when BibTeX read on past the
+///   mistake before noticing: the quoted text after the position starts
+///   with `@` (it reached the next entry, so the entry before is not closed
+///   or has an unbalanced `{` / `"`; also a `@string` without its closing
+///   brace, which cannot be told apart), `Unbalanced braces`, `Illegal end
+///   of database file`, and every error in a `.bst` style.
+/// - Of the warnings with a `--line N`, only `string name "x" is undefined`
+///   keeps it: BibTeX reports the other ones (e.g. `I'm ignoring key's
+///   extra "year" field`) after looking ahead past the field, so `N` may be
+///   a later line.
 ///
 /// # Volume
 ///
@@ -182,6 +198,7 @@ impl BlgParser {
             located: HashMap::new(),
             out: Collector::new(self.max_diagnostics),
             errors_reported: 0,
+            weak_only: weak_only(&lines),
         };
         parser.run()
     }
@@ -201,6 +218,8 @@ struct Parser<'a> {
     located: HashMap<&'a str, Option<WorkspacePath>>,
     out: Collector,
     errors_reported: usize,
+    /// All errors BibTeX counted are weak (see [`weak_only`]).
+    weak_only: bool,
 }
 
 /// Where BibTeX says a message happened.
@@ -245,7 +264,10 @@ impl<'a> Parser<'a> {
             i += 1;
         }
 
-        let failed = fatal || error_messages.is_some_and(|n| n > 0) || self.errors_reported > 0;
+        // latexmk takes a log with only weak errors as a success.
+        let failed = fatal
+            || !self.weak_only
+                && (error_messages.is_some_and(|n| n > 0) || self.errors_reported > 0);
         let mut parsed = std::mem::replace(&mut self.out, Collector::new(0)).finish();
         let summary = failed.then(|| {
             let severity = if self.errors_reported > 0 {
@@ -319,10 +341,12 @@ impl<'a> Parser<'a> {
         };
 
         let mut previous_line = false;
+        let mut quoted = Vec::new();
         let limit = end.saturating_add(MAX_TRAILING_LINES).min(self.lines.len());
         while end < limit {
             let next = self.text(end);
             if is_quoted(self.lines[end]) {
+                quoted.push(next.get(3..).unwrap_or(""));
                 end += 1;
             } else if next == "(Error may have been on previous line)" {
                 previous_line = true;
@@ -335,15 +359,35 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let message = message.trim();
+        let read_on = if kind == DiagnosticKind::BibtexError {
+            read_on_note(message, location, quoted.get(1).copied())
+        } else {
+            None
+        };
         let (file, line) = match location {
-            Some(location) => self.resolve(location, true),
+            Some(location) => self.resolve(location, read_on.is_none()),
             None => (None, None),
         };
-        let mut message = format!("BibTeX: {}", message.trim());
-        if previous_line {
-            message.push_str(" (the error may be on the previous line)");
+        let mut text = format!("BibTeX: {message}");
+        match read_on {
+            Some(note) => text.push_str(&note),
+            None if previous_line => text.push_str(" (the error may be on the previous line)"),
+            None => {}
         }
-        self.push(Severity::Error, kind, &message, file, line, i, end);
+        if kind == DiagnosticKind::MissingFile && unsafe_name(message) {
+            text.push_str(
+                " (TeX Live's safe settings do not let BibTeX open files by absolute path, in \
+                 parent directories or in directories starting with `.`)",
+            );
+        }
+        let weak = weak_error(t);
+        let severity = if weak == Some(Weak::NoCitations) || weak.is_some() && self.weak_only {
+            Severity::Warning
+        } else {
+            Severity::Error
+        };
+        self.push(severity, kind, &text, file, line, i, end);
         Some(end)
     }
 
@@ -382,9 +426,7 @@ impl<'a> Parser<'a> {
         keep_line: bool,
     ) -> (Option<WorkspacePath>, Option<u32>) {
         let name = location.file.trim();
-        let is_input = name.rsplit_once('.').is_some_and(|(_, ext)| {
-            ext.eq_ignore_ascii_case("bib") || ext.eq_ignore_ascii_case("bst")
-        });
+        let is_input = has_extension(name, "bib") || has_extension(name, "bst");
         if !is_input || !self.known.contains(name) {
             return (None, None);
         }
@@ -448,6 +490,105 @@ impl<'a> Parser<'a> {
 /// A line quoting input (` : ...`).
 fn is_quoted(line: &str) -> bool {
     line.starts_with(" : ") || line.trim_end() == " :"
+}
+
+/// When BibTeX read on past the actual mistake before it noticed, a note
+/// saying where it noticed (its line is then not reported, see the
+/// Locations section of [`BlgParser`]); `None` when its line is where the
+/// unexpected token is. `after` is the second quoted line (the text after
+/// the position BibTeX reached).
+fn read_on_note(
+    message: &str,
+    location: Option<Location<'_>>,
+    after: Option<&str>,
+) -> Option<String> {
+    let location = location?;
+    let at = |what: &str| {
+        location
+            .line
+            .map_or(String::new(), |n| format!("{what} at line {n}; "))
+    };
+    if has_extension(location.file, "bst") {
+        Some(format!(
+            " ({}the mistake may be earlier in the style)",
+            at("detected")
+        ))
+    } else if message.starts_with("Unbalanced braces") {
+        Some(format!(
+            " ({}an unbalanced `{{` or `\"` earlier in this entry is likely)",
+            at("detected")
+        ))
+    } else if message.starts_with("Illegal end of database file") {
+        Some(format!(
+            " ({}an entry is probably not closed)",
+            at("reached the end of the file")
+        ))
+    } else if after.is_some_and(|a| a.trim_start().starts_with('@')) {
+        Some(format!(
+            " ({}the entry before it is probably not closed: a missing `}}` or an unbalanced \
+             `{{` / `\"` in one of its fields)",
+            at("found the next entry")
+        ))
+    } else {
+        None
+    }
+}
+
+/// An error latexmk does not count as a failure when it is the only kind
+/// of error in the log (the "weak errors" of latexmk 4.86's
+/// `check_bibtex_log`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Weak {
+    /// `I found no \citation commands` (a document without `\cite` yet):
+    /// always only a warning.
+    NoCitations,
+    /// A missing `.aux` or database file.
+    Missing,
+}
+
+fn weak_error(t: &str) -> Option<Weak> {
+    if t.starts_with("I found no \\citation commands---while reading file") {
+        Some(Weak::NoCitations)
+    } else if t.starts_with("I couldn't open auxiliary file ")
+        || t.starts_with("I couldn't open database file ")
+    {
+        Some(Weak::Missing)
+    } else {
+        None
+    }
+}
+
+/// Whether all errors BibTeX counted in its summary are weak, as latexmk
+/// decides (it then treats the run as a success). A linear pre-scan.
+fn weak_only(lines: &[&str]) -> bool {
+    let mut weak = 0u64;
+    let mut errors = None;
+    for line in lines {
+        if is_quoted(line) {
+            continue;
+        }
+        let t = line.trim_end();
+        if weak_error(t).is_some() {
+            weak += 1;
+        } else if let Some(n) = error_count(t) {
+            errors = Some(u64::from(n));
+        }
+    }
+    weak > 0 && errors.is_some_and(|n| n <= weak)
+}
+
+/// Whether the file of `I couldn't open ... file <name>` is one kpathsea's
+/// paranoid mode refuses (absolute, or with a `..` or dot component).
+fn unsafe_name(message: &str) -> bool {
+    let name = message.rsplit_once(" file ").map_or("", |(_, n)| n);
+    let name = name.trim_matches(['`', '\'']);
+    name.starts_with('/') || name.split('/').any(|c| c.starts_with('.'))
+}
+
+fn has_extension(name: &str, ext: &str) -> bool {
+    name.trim()
+        .rsplit_once('.')
+        .is_some_and(|(_, e)| e.eq_ignore_ascii_case(ext))
 }
 
 /// `I couldn't open ...`: a file BibTeX could not open.
@@ -606,6 +747,90 @@ mod tests {
         assert_eq!(parsed.diagnostics[0].kind, DiagnosticKind::BibtexError);
         assert!(parsed.diagnostics[1].message.contains("fatal error"));
         assert!(parsed.failed);
+    }
+
+    #[test]
+    fn styles_and_unclosed_entries_keep_only_the_file() {
+        let blg = "The style file: my.bst\n\
+                   read is an unknown function---line 7 of file my.bst\n\
+                   Database file #1: refs.bib\n\
+                   Illegal end of database file---line 9 of file refs.bib\n \
+                   : @string{x = \"y\"\n \
+                   :                  \n\
+                   I was expecting a `,' or a `}'---line 3 of file refs.bib\n \
+                   : \n \
+                   : @string{b = \"c\"}\n\
+                   (Error may have been on previous line)\n";
+        let parsed = parse(blg);
+        let d = &parsed.diagnostics;
+        let located: Vec<_> = d
+            .iter()
+            .map(|d| (d.file.as_ref().map(WorkspacePath::as_str), d.line))
+            .collect();
+        assert_eq!(
+            located[..3],
+            [
+                (Some("paper/my.bst"), None),
+                (Some("paper/refs.bib"), None),
+                (Some("paper/refs.bib"), None),
+            ]
+        );
+        assert_eq!(
+            d[0].message,
+            "BibTeX: read is an unknown function (detected at line 7; the mistake may be \
+             earlier in the style)"
+        );
+        assert!(
+            d[1].message
+                .contains("reached the end of the file at line 9")
+        );
+        assert!(d[2].message.contains("found the next entry at line 3"));
+        assert!(!d[2].message.contains("previous line"));
+    }
+
+    #[test]
+    fn weak_errors_follow_latexmk() {
+        // Only a missing database: weak, as for latexmk.
+        let blg = "I couldn't open database file x.bib\n---line 3 of file main.aux\n\
+                   (There was 1 error message)\n";
+        let parsed = parse(blg);
+        assert!(!parsed.failed);
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].severity, Severity::Warning);
+        // With another error, it counts.
+        let blg = "I couldn't open database file x.bib\n---line 3 of file main.aux\n\
+                   I found no database files---while reading file main.aux\n\
+                   (There were 2 error messages)\n";
+        let parsed = parse(blg);
+        assert!(parsed.failed);
+        assert_eq!(parsed.diagnostics[0].severity, Severity::Error);
+        // No citations stays a warning next to a real error.
+        let blg = "I found no \\citation commands---while reading file main.aux\n\
+                   Database file #1: refs.bib\nRepeated entry---line 2 of file refs.bib\n\
+                   (There were 2 error messages)\n";
+        let parsed = parse(blg);
+        assert!(parsed.failed);
+        let severities: Vec<_> = parsed.diagnostics.iter().map(|d| d.severity).collect();
+        assert_eq!(
+            severities,
+            [Severity::Warning, Severity::Error, Severity::Info]
+        );
+    }
+
+    #[test]
+    fn refused_names_are_explained() {
+        for name in [
+            ".hidden/refs.bib",
+            "../refs.bib",
+            "/abs/refs.bib",
+            "a/.b/c.bst",
+        ] {
+            let blg = format!("I couldn't open database file {name}\n");
+            let d = &parse(&blg).diagnostics[0];
+            assert!(d.message.contains("safe settings"), "{name}: {d:#?}");
+        }
+        let d = &parse("I couldn't open database file refs.bib\n").diagnostics[0];
+        assert!(!d.message.contains("safe settings"));
     }
 
     #[test]
