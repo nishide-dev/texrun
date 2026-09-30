@@ -1,0 +1,172 @@
+//! End-to-end tests of `texrun compile --backend container`.
+//!
+//! They need a container runtime and the engine image
+//! (`docker build -t texrun-engine:latest docker/engine`, or the image in
+//! `TEXRUN_SANDBOX_IMAGE`); without them they are skipped, unless
+//! `TEXRUN_REQUIRE_SANDBOX=1` (CI's `sandbox` job). The engine's own
+//! container tests are in `crates/texrun-texlive/tests/container.rs`.
+
+mod common;
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use tempfile::TempDir;
+
+fn project(files: &[(&str, &str)]) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, content) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    dir
+}
+
+/// `texrun compile --json --backend container --container-image <image>
+/// --no-preview <args>` in `dir`.
+fn compile(dir: &Path, args: &[&str]) -> (i32, Value, String) {
+    let image = common::sandbox_image();
+    let out: Output = Command::new(env!("CARGO_BIN_EXE_texrun"))
+        .args([
+            "compile",
+            "--json",
+            "--backend",
+            "container",
+            "--container-image",
+            &image,
+            "--no-preview",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let doc = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "not JSON ({e}): {}\n{stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    (out.status.code().unwrap(), doc, stderr)
+}
+
+#[test]
+fn a_document_compiles_in_the_container() {
+    common::require_sandbox!();
+    let dir = project(&[
+        (
+            "main.tex",
+            "\\documentclass{article}\n\\begin{document}\n\\input{chapters/intro}\n\\end{document}\n",
+        ),
+        ("chapters/intro.tex", "Hello from the container.\n"),
+    ]);
+    let (code, doc, stderr) = compile(dir.path(), &["main.tex"]);
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    assert_eq!(doc["outcome"], "succeeded");
+    assert_eq!(doc["engine"]["name"], "texlive-container");
+    let version = doc["engine"]["version"].as_str().unwrap();
+    assert!(version.starts_with("latexmk "), "{version}");
+    assert_eq!(
+        doc["resource_limits"],
+        serde_json::json!({ "rlimits": true, "cgroup": true })
+    );
+    assert!(
+        fs::read(dir.path().join("texrun-out/main.pdf"))
+            .unwrap()
+            .starts_with(b"%PDF-")
+    );
+}
+
+#[test]
+fn diagnostics_point_into_the_project() {
+    common::require_sandbox!();
+    let dir = project(&[
+        (
+            "main.tex",
+            "\\documentclass{article}\n\\begin{document}\n\\input{sub/bad}\n\\end{document}\n",
+        ),
+        ("sub/bad.tex", "Fine.\n\\undefinedcommand\n"),
+    ]);
+    let (code, doc, stderr) = compile(dir.path(), &["main.tex"]);
+    assert_eq!(code, 1, "{doc:#}\n{stderr}");
+    let d = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["kind"] == "undefined_control_sequence")
+        .unwrap_or_else(|| panic!("{doc:#}"));
+    assert_eq!(d["file"], "sub/bad.tex", "{d:#}");
+    assert_eq!(d["line"], 2, "{d:#}");
+    // No host or container path in the result.
+    let text = doc.to_string();
+    assert!(!text.contains("/workspace/"), "{text}");
+}
+
+#[test]
+fn a_timeout_is_exit_code_4() {
+    common::require_sandbox!();
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\def\\x{\\x}\\x\n\\end{document}\n",
+    )]);
+    let started = Instant::now();
+    let (code, doc, stderr) = compile(dir.path(), &["--timeout", "2s", "main.tex"]);
+    assert_eq!(code, 4, "{doc:#}\n{stderr}");
+    assert_eq!(doc["outcome"], "timed_out");
+    assert!(started.elapsed() < Duration::from_secs(40));
+}
+
+#[test]
+fn a_missing_image_is_a_runtime_error() {
+    // Also without a runtime: either way the backend is unavailable.
+    let dir = project(&[("main.tex", "x")]);
+    let out = Command::new(env!("CARGO_BIN_EXE_texrun"))
+        .args([
+            "compile",
+            "--json",
+            "--backend",
+            "container",
+            "--container-image",
+            "texrun-no-such-image:0",
+            "main.tex",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(3), "{doc:#}");
+    assert_eq!(doc["error"]["stage"], "probe", "{doc:#}");
+    assert_eq!(doc["error"]["kind"], "unavailable", "{doc:#}");
+    assert!(
+        doc["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("docker build"),
+        "{doc:#}"
+    );
+    // Nothing was compiled.
+    assert!(!dir.path().join("texrun-out").exists());
+}
+
+#[test]
+fn container_options_need_the_container_backend() {
+    let dir = project(&[("main.tex", "x")]);
+    for args in [
+        &["--container-image", "x"][..],
+        &["--container-runtime", "docker"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_texrun"))
+            .arg("compile")
+            .arg("--json")
+            .args(args)
+            .arg("main.tex")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+}

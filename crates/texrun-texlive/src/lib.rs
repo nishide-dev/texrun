@@ -63,12 +63,17 @@ compile_error!("texrun-texlive supports Unix hosts only");
 
 mod bibtex;
 mod command;
+mod container;
 mod engine;
 mod layout;
 mod names;
 mod process;
 mod rc;
 
+pub use container::{
+    CONTAINER_ENGINE_NAME, ContainerConfig, ContainerEngine, DEFAULT_GUEST_ROOT, GUEST_LATEXMK,
+    GUEST_PATH, GUEST_ROOT_PARENTS,
+};
 pub use engine::{
     DEFAULT_TIMEOUT, ENGINE_NAME, LATEXMK_PROGRAM, LatexmkConfig, LatexmkEngine, LatexmkRun,
     MAX_PARSED_LOG_BYTES,
@@ -77,3 +82,5 @@ pub use process::{CapturedOutput, Limits};
 /// For [`LatexmkConfig::with_exec_gate`] and [`LatexmkConfig::with_cgroups`]
 /// (from `texrun-process`).
 pub use texrun_process::{Cgroups, ExecGate};
+/// For [`ContainerConfig::with_runtime`] (from `texrun-sandbox`).
+pub use texrun_sandbox::RuntimeKind;

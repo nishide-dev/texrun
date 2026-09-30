@@ -14,6 +14,19 @@
 //! docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 dev cargo test -p texrun-texlive
 //! ```
 //!
+//! # Backends
+//!
+//! [`TEST_BACKEND_ENV`]`=container` runs the tests that use the default
+//! engine ([`Compile::new`]) with the container backend
+//! ([`ContainerEngine`], image [`SANDBOX_IMAGE_ENV`] or
+//! `texrun-engine:latest`) instead of latexmk on the host; TeX Live is then
+//! only needed in the image. Tests that depend on the host's TeX Live
+//! (wrappers in `PATH`, running pdflatex directly) start with
+//! [`host_only!`] and are skipped there. `tests/container.rs` checks what
+//! only the container backend guarantees; it runs whenever the backend is
+//! usable, and [`REQUIRE_SANDBOX_ENV`]`=1` turns a missing runtime or image
+//! into a failure.
+//!
 //! # Fixtures
 //!
 //! `tests/fixtures/<name>/` are small TeX projects. They are used as the
@@ -36,11 +49,11 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use texrun_core::{
-    CancelToken, CompileOptions, CompileOutcome, Diagnostic, DiagnosticKind, TypesetEngine,
-    WorkspacePath,
+    CancelToken, CompileContext, CompileOptions, CompileOutcome, CompileRequest, Diagnostic,
+    DiagnosticKind, EngineError, EngineInfo, TypesetEngine, WorkspacePath,
 };
 use texrun_preview::{PreviewOptions, Previewer};
-use texrun_texlive::{LatexmkEngine, LatexmkRun};
+use texrun_texlive::{ContainerConfig, ContainerEngine, LatexmkEngine, LatexmkRun};
 use texrun_workspace::{ProjectInput, Workspace, WorkspaceConfig};
 
 /// Set to `1` to fail (instead of skip) tests that need TeX Live.
@@ -50,6 +63,83 @@ pub const REQUIRE_TEXLIVE_ENV: &str = "TEXRUN_REQUIRE_TEXLIVE";
 /// (page counts, previews). The same variable as in the `texrun-preview`
 /// real tool tests.
 pub const REQUIRE_PREVIEW_TOOLS_ENV: &str = "TEXRUN_REQUIRE_PREVIEW_TOOLS";
+
+/// `container` runs the default engine in a container (see the module
+/// docs); anything else, or unset, runs latexmk on the host.
+pub const TEST_BACKEND_ENV: &str = "TEXRUN_TEST_BACKEND";
+
+/// The image of the container backend in tests (default:
+/// `texrun-engine:latest`).
+pub const SANDBOX_IMAGE_ENV: &str = "TEXRUN_SANDBOX_IMAGE";
+
+/// Set to `1` to fail (instead of skip) tests that need the container
+/// backend (a runtime and the engine image).
+pub const REQUIRE_SANDBOX_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
+
+/// Whether the default engine of the tests is the container backend.
+pub fn container_backend() -> bool {
+    std::env::var_os(TEST_BACKEND_ENV).is_some_and(|v| v == "container")
+}
+
+/// A container engine for the tests' image.
+pub fn container_engine(config: ContainerConfig) -> ContainerEngine {
+    let config = match std::env::var(SANDBOX_IMAGE_ENV) {
+        Ok(image) if !image.is_empty() => config.with_image(image),
+        _ => config,
+    };
+    ContainerEngine::new(config)
+}
+
+/// The engine a test compiles with.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "one value per compile")]
+pub enum TestEngine {
+    /// latexmk on the host.
+    Host(LatexmkEngine),
+    /// latexmk in a container.
+    Container(ContainerEngine),
+}
+
+impl TestEngine {
+    /// The default engine of [`TEST_BACKEND_ENV`].
+    pub fn default_backend() -> Self {
+        if container_backend() {
+            Self::Container(container_engine(ContainerConfig::default()))
+        } else {
+            Self::Host(LatexmkEngine::default())
+        }
+    }
+
+    pub fn run(
+        &self,
+        ctx: &CompileContext<'_>,
+        request: &CompileRequest,
+    ) -> Result<LatexmkRun, EngineError> {
+        match self {
+            Self::Host(engine) => engine.run(ctx, request),
+            Self::Container(engine) => engine.run(ctx, request),
+        }
+    }
+
+    pub fn probe(&self) -> Result<EngineInfo, EngineError> {
+        match self {
+            Self::Host(engine) => engine.probe(),
+            Self::Container(engine) => engine.probe(),
+        }
+    }
+}
+
+impl From<LatexmkEngine> for TestEngine {
+    fn from(engine: LatexmkEngine) -> Self {
+        Self::Host(engine)
+    }
+}
+
+impl From<ContainerEngine> for TestEngine {
+    fn from(engine: ContainerEngine) -> Self {
+        Self::Container(engine)
+    }
+}
 
 fn required(var: &str) -> bool {
     std::env::var_os(var).is_some_and(|v| v == "1")
@@ -61,6 +151,11 @@ fn required(var: &str) -> bool {
 /// shown for a passing test. (cargo-nextest captures the whole process
 /// output; use `--no-capture` there to see it.)
 fn report_skip(what: &'static str, var: &str) {
+    report_skip_with(what, &format!("set {var}=1 to fail instead"));
+}
+
+/// [`report_skip`] with another hint in the parentheses.
+fn report_skip_with(what: &'static str, hint: &str) {
     static REPORTED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
     if reported.contains(&what) {
@@ -75,16 +170,17 @@ fn report_skip(what: &'static str, var: &str) {
     let binary = binary.rsplit_once('-').map_or(binary.as_str(), |(b, _)| b);
     let _ = writeln!(
         std::io::stderr(),
-        "texrun-texlive {binary}: SKIPPED {what} (set {var}=1 to fail instead)"
+        "texrun-texlive {binary}: SKIPPED {what} ({hint})"
     );
 }
 
-/// Whether TeX Live (latexmk) is available. Panics if it is not and
-/// [`REQUIRE_TEXLIVE_ENV`] is `1`.
+/// Whether TeX Live (latexmk) is available to the default engine (on the
+/// host, or in the image with the container backend). Panics if it is not
+/// and [`REQUIRE_TEXLIVE_ENV`] is `1`.
 pub fn texlive_available() -> bool {
     static PROBE: OnceLock<Result<String, String>> = OnceLock::new();
     let probe = PROBE.get_or_init(|| {
-        LatexmkEngine::default()
+        TestEngine::default_backend()
             .probe()
             .map(|info| info.version.unwrap_or_default())
             .map_err(|e| e.to_string())
@@ -102,6 +198,7 @@ pub fn texlive_available() -> bool {
 }
 
 /// Returns from the calling test unless TeX Live is available.
+#[allow(unused_macros)]
 macro_rules! require_texlive {
     () => {
         if !common::texlive_available() {
@@ -109,7 +206,70 @@ macro_rules! require_texlive {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use require_texlive;
+
+/// Whether the container backend can be used (a runtime and the image).
+/// Panics if it cannot and [`REQUIRE_SANDBOX_ENV`] is `1`.
+pub fn sandbox_available() -> bool {
+    static PROBE: OnceLock<Result<String, String>> = OnceLock::new();
+    let probe = PROBE.get_or_init(|| {
+        container_engine(ContainerConfig::default())
+            .probe()
+            .map(|info| info.version.unwrap_or_default())
+            .map_err(|e| e.to_string())
+    });
+    match probe {
+        Ok(_) => true,
+        Err(e) if required(REQUIRE_SANDBOX_ENV) => {
+            panic!(
+                "the container backend is required ({REQUIRE_SANDBOX_ENV}=1) but not usable: {e}"
+            )
+        }
+        Err(_) => {
+            report_skip(
+                "container backend tests: no container runtime or engine image",
+                REQUIRE_SANDBOX_ENV,
+            );
+            false
+        }
+    }
+}
+
+/// Returns from the calling test unless the container backend is usable.
+#[allow(unused_macros)]
+macro_rules! require_sandbox {
+    () => {
+        if !common::sandbox_available() {
+            return;
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use require_sandbox;
+
+/// Tells (once per test binary) that tests were skipped because they need
+/// TeX Live on the host.
+pub fn report_host_only() {
+    report_skip_with(
+        "host-only tests: they need TeX Live on the host",
+        &format!("they run without {TEST_BACKEND_ENV}=container"),
+    );
+}
+
+/// Returns from the calling test when the default engine is the container
+/// backend: the test needs TeX Live on the host itself.
+#[allow(unused_macros)]
+macro_rules! host_only {
+    () => {
+        if common::container_backend() {
+            common::report_host_only();
+            return;
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use host_only;
 
 /// `tests/fixtures/<name>`.
 pub fn fixture(name: &str) -> PathBuf {
@@ -150,7 +310,7 @@ pub struct Compile<'a> {
     entry: &'a str,
     options: CompileOptions,
     config: WorkspaceConfig,
-    engine: LatexmkEngine,
+    engine: TestEngine,
     cancel: Option<CancelToken>,
 }
 
@@ -162,7 +322,7 @@ impl<'a> Compile<'a> {
             entry,
             options: CompileOptions::default().with_timeout(Duration::from_secs(60)),
             config: WorkspaceConfig::default(),
-            engine: LatexmkEngine::default(),
+            engine: TestEngine::default_backend(),
             cancel: None,
         }
     }
@@ -182,8 +342,8 @@ impl<'a> Compile<'a> {
         self
     }
 
-    pub fn engine(mut self, engine: LatexmkEngine) -> Self {
-        self.engine = engine;
+    pub fn engine(mut self, engine: impl Into<TestEngine>) -> Self {
+        self.engine = engine.into();
         self
     }
 

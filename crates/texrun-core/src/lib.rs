@@ -29,7 +29,7 @@ pub mod schema;
 pub mod testing;
 
 pub use artifact::{Artifact, ArtifactKind};
-pub use context::{CancelToken, CompileContext, WorkspaceRoot, WorkspaceRootError};
+pub use context::{CancelToken, CompileContext, PathMapping, WorkspaceRoot, WorkspaceRootError};
 pub use diagnostic::{Diagnostic, DiagnosticKind, Severity};
 pub use engine::{EngineError, EngineErrorKind, EngineInfo, TypesetEngine};
 pub use path::{WorkspacePath, WorkspacePathError};

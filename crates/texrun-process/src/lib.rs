@@ -52,8 +52,9 @@
 //! # Extension points
 //!
 //! - A [`Launcher`] decides *how* a [`Spec`] is started. [`HostLauncher`]
-//!   runs it directly on the host; a container backend (#26) can turn the
-//!   same spec into a runtime invocation and apply the limits itself
+//!   runs it directly on the host; the container backend (#26,
+//!   `texrun_sandbox::Container`) turns the same spec into a runtime
+//!   invocation and applies the limits itself
 //!   ([`Launcher::apply_rlimits`] `== false`, which also leaves out the
 //!   cgroup), stop it in [`Launcher::on_kill`] and clean up after the reap
 //!   ([`Launcher::on_reaped`]). The cgroup of #25 is built into the

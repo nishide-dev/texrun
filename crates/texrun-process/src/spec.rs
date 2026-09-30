@@ -257,10 +257,10 @@ impl<'a> Spec<'a> {
 /// [`Launcher::on_kill`], and after reaping the leader
 /// [`Launcher::on_reaped`].
 ///
-/// The hooks receive the leader's PID so that one launcher can serve
-/// several runs at once. Their exact shape (e.g. a per-run handle returned
-/// by `on_spawn`) will be revisited with the first real implementation
-/// (#26 containers). The cgroups of #25 are not a launcher: the supervisor
+/// The hooks receive the leader's PID so that one launcher could serve
+/// several runs at once; the container launcher of `texrun-sandbox` (#26)
+/// is a value per run instead, which keeps its state (the container) in
+/// itself. The cgroups of #25 are not a launcher: the supervisor
 /// handles them itself ([`Spec::cgroup`]), after the spawn and before
 /// [`Launcher::on_spawn`], and kills them with every group kill before
 /// [`Launcher::on_kill`].

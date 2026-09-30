@@ -11,6 +11,7 @@ CI の `integration` job も同じ image を build して使い、TeX distributi
 | --- | --- |
 | `docker/dev/Dockerfile` | dev image の定義 |
 | `compose.yaml` | service `dev`、bind mount と cache volume の定義 |
+| `docker/engine/Dockerfile` | container backend（`--backend container`）の engine image。dev image とは別の最小の runtime image（TeX Live + latexmk。Rust toolchain と preview tool は含まない）。base（`debian:trixie-slim`）は digest で固定し、TeX Live のパッケージは dev image と揃える。[container backend test](#container-backend-test) |
 
 image に含まれるもの:
 
@@ -107,6 +108,7 @@ docker compose down --volumes
 | --- | --- | --- | --- |
 | `TEXRUN_REQUIRE_TEXLIVE` | `crates/texrun-texlive` の TeX Live を使う test（`latexmk` を検出） | skip | 失敗 |
 | `TEXRUN_REQUIRE_PREVIEW_TOOLS` | `crates/texrun-preview` の実ツール test、`crates/texrun-texlive` の PDF ページ数と preview の確認 | skip | 失敗 |
+| `TEXRUN_REQUIRE_SANDBOX` | container backend の test（container runtime と engine image を検出。下の「container backend test」） | skip | 失敗 |
 
 - tool があれば、環境変数が無くても test は実行される。host に TeX Live がある場合、`cargo test --workspace --all-features` で host の TeX Live を使って実行される（version の違いで失敗した場合は、コンテナ内の結果を正とする）。
 - skip したときは、test binary ごとに 1 回だけ stderr に `SKIPPED ... (set TEXRUN_REQUIRE_...=1 to fail instead)` と表示する。libtest の capture を通さずに書くので `cargo test` でそのまま見える。`cargo nextest run`（CI の `test (linux)` / `test (macos)`）では、`.config/nextest.toml` の設定で成功した test の出力も実行の最後に表示されるので、そこに `SKIPPED` 行が出る。nextest は test ごとに process を分けるため、この場合は binary ごとではなく test ごとに 1 行出る。nextest の集計の `skipped` は 0 のままである（test としては pass 扱い）。
@@ -139,6 +141,7 @@ docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TO
 | `scenarios.rs` | 典型的な文書の fixture（下表）を workspace 経由で compile し、結果を検証する |
 | `security.rs` | [docs/security.md](security.md) §2 の保証が、workspace + engine の経路で効いていることを検証する |
 | `latexmk.rs` | engine 自体の挙動（probe、cancel、プロセスツリー、出力上限など） |
+| `container.rs` | container backend だけが保証すること（workspace 外が見えない、container を残さない、runtime による上限、mount 先によらない diagnostics の path） |
 | `fixtures/<name>/` | fixture の TeX project。そのまま project root として `Workspace::create` に渡す（コピーされるので、test が fixture の隣に書き込むことはない） |
 
 | fixture | 確認すること |
@@ -152,7 +155,7 @@ docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TO
 | `timeout` | 無限ループを短い timeout（2 秒）で `TimedOut` にし、プロセスを残さない |
 | `multi-file` | サブディレクトリの `\input` / `\include`: workspace へのコピー、子ファイルの `.aux`、ページ数、子ファイルに帰属する diagnostic、preview の生成 |
 | `unicode-names` | 日本語・空白・全角空白を含むファイル名 |
-| `security/*` | shell escape、workspace 外の読み書き、rc ファイル、先頭行の format 指定、補助ツールの起動 |
+| `security/*` | shell escape、workspace 外の読み書き、rc ファイル、先頭行の format 指定、補助ツールの起動。`security/sandbox` は container backend で workspace 外のファイルが PDF に埋め込めないこと（`container.rs`） |
 
 - 検証は構造化された結果（outcome、diagnostic の kind / file / line、artifact の有無と size、PDF のページ数）に対して行い、ログ全文の snapshot には依存しない。TeX Live の minor な差で壊れにくくするためである。
 - PDF のページ数は `texrun-preview`（`mutool` または `pdfinfo`）で読む。
@@ -182,6 +185,30 @@ docker run --rm --privileged -v "$PWD:/workspace" -w /workspace \
 （`-- cgroup` を外すと全件を実行する。CI はそうしている。）
 
 `--privileged` のコンテナは host からの隔離が弱いので、この用途（texrun 自身の test）以外では使わない。
+
+### container backend test
+
+container backend（`--backend container`、[docs/security.md](security.md) §4）の test は、host の container runtime（Docker、または Podman）と engine image（`docker/engine/Dockerfile`）を使う。dev コンテナの中には Docker が無いので、**host で**実行する（host に TeX Live は要らない）。
+
+```bash
+docker build -t texrun-engine:latest docker/engine
+
+# container の制限そのもの（TeX を使わない sh の script）
+TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun-sandbox
+
+# #10 の fixture（scenarios / security）を container backend で実行し、
+# container backend だけの保証（container.rs）も確認する
+TEXRUN_REQUIRE_SANDBOX=1 TEXRUN_REQUIRE_TEXLIVE=1 TEXRUN_TEST_BACKEND=container \
+  cargo test -p texrun-texlive --test container --test scenarios --test security
+
+# CLI（--backend container）
+TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
+```
+
+- `TEXRUN_TEST_BACKEND=container` にすると、`crates/texrun-texlive/tests/common` の既定の engine（`Compile::new`）が `ContainerEngine` になる。host の TeX Live に依存する test（`PATH` の wrapper、pdflatex の直接実行、host backend での対照）は `host_only!()` で skip し、binary ごとに `SKIPPED host-only tests` を 1 行出す。これらは `integration` job（host backend）で実行される。
+- `TEXRUN_SANDBOX_IMAGE` で image を変えられる（既定は `texrun-engine:latest`）。CI の `sandbox` job は `texrun-engine:ci` を build して使う。
+- runtime や image が無い環境（dev コンテナ、`test (macos)`、image を build していない `test (linux)`）では、これらの test は `SKIPPED` を出して何もしない。CI の `sandbox` job は `TEXRUN_REQUIRE_SANDBOX=1` で実行し、最後に label `org.texrun.sandbox` の container が残っていないことも確認する。
+- texrun が強制終了された場合などに残った container は、`docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる。container 内の `timeout` により、残っても compile の timeout + 45 秒で終了する。
 
 ## 注意事項
 

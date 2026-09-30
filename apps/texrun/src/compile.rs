@@ -21,16 +21,20 @@ use std::time::Duration;
 
 use texrun_core::schema::Versioned;
 use texrun_core::{
-    Artifact, CancelToken, CompileOptions, CompileOutcome, CompileResult, DiagnosticKind, Severity,
-    TypesetEngine, WorkspacePath,
+    Artifact, CancelToken, CompileContext, CompileOptions, CompileOutcome, CompileRequest,
+    CompileResult, DiagnosticKind, EngineError, EngineInfo, Severity, TypesetEngine, WorkspacePath,
 };
 use texrun_preview::{PreviewOptions, PreviewReport, Previewer};
-use texrun_texlive::{Cgroups, LatexmkConfig, LatexmkEngine};
+use texrun_texlive::{
+    Cgroups, ContainerConfig, ContainerEngine, LatexmkConfig, LatexmkEngine, LatexmkRun,
+};
 use texrun_workspace::{
     OverwritePolicy, ProjectInput, Workspace, WorkspaceConfig, WorkspaceError, WorkspaceErrorKind,
 };
 
-use crate::cli::{CgroupMode, CompileArgs, DEFAULT_OUTPUT_DIR_NAME};
+use crate::cli::{
+    CgroupMode, CompileArgs, ContainerRuntime, DEFAULT_OUTPUT_DIR_NAME, EngineBackend,
+};
 use crate::human::{self, Paths};
 use crate::output::{self, OutputDirError};
 use crate::report::{
@@ -142,15 +146,9 @@ fn execute(
     // the run here. May move texrun itself into a leaf of its cgroup
     // (`Cgroups::detect`).
     let cgroups = select_cgroups(args.cgroup)?;
-    let mut engine_config = LatexmkConfig::default()
-        .with_source_date_epoch(args.source_date_epoch)
-        .with_exec_gate(crate::gate::exec_gate());
-    if let Some(cgroups) = &cgroups {
-        engine_config = engine_config.with_cgroups(cgroups.clone());
-    }
-    let engine = LatexmkEngine::new(engine_config);
-    // Reports a missing latexmk before anything is copied, and makes the
-    // result carry the latexmk version.
+    let engine = Engine::new(args, cgroups.as_ref());
+    // Reports a missing latexmk (or container runtime / image) before
+    // anything is copied, and makes the result carry the latexmk version.
     engine
         .probe()
         .map_err(|e| ErrorInfo::from_engine(Stage::Probe, &e))?;
@@ -224,6 +222,67 @@ fn execute(
         eprintln!("warning: could not remove the workspace: {e}");
     }
     copied.error.map_or(Ok(()), Err)
+}
+
+/// The engine of `--backend`.
+#[allow(clippy::large_enum_variant, reason = "one value per run")]
+enum Engine {
+    Host(LatexmkEngine),
+    Container(ContainerEngine),
+}
+
+impl Engine {
+    fn new(args: &CompileArgs, cgroups: Option<&Cgroups>) -> Self {
+        match args.backend {
+            EngineBackend::Host => {
+                let mut config = LatexmkConfig::default()
+                    .with_source_date_epoch(args.source_date_epoch)
+                    .with_exec_gate(crate::gate::exec_gate());
+                if let Some(cgroups) = cgroups {
+                    config = config.with_cgroups(cgroups.clone());
+                }
+                Self::Host(LatexmkEngine::new(config))
+            }
+            // The runtime applies the limits (the container's rlimits and
+            // cgroup); the exec gate and texrun's cgroups are for host
+            // processes.
+            EngineBackend::Container => {
+                let mut config = ContainerConfig::default()
+                    .with_source_date_epoch(args.source_date_epoch)
+                    .with_runtime(args.container_runtime.and_then(ContainerRuntime::kind));
+                if let Some(image) = &args.container_image {
+                    config = config.with_image(image.clone());
+                }
+                Self::Container(ContainerEngine::new(config))
+            }
+        }
+    }
+
+    fn engine(&self) -> &dyn TypesetEngine {
+        match self {
+            Self::Host(engine) => engine,
+            Self::Container(engine) => engine,
+        }
+    }
+
+    fn probe(&self) -> Result<EngineInfo, EngineError> {
+        self.engine().probe()
+    }
+
+    fn info(&self) -> EngineInfo {
+        self.engine().info()
+    }
+
+    fn run(
+        &self,
+        ctx: &CompileContext<'_>,
+        request: &CompileRequest,
+    ) -> Result<LatexmkRun, EngineError> {
+        match self {
+            Self::Host(engine) => engine.run(ctx, request),
+            Self::Container(engine) => engine.run(ctx, request),
+        }
+    }
 }
 
 /// A note that is also printed on stderr right away.
@@ -396,6 +455,16 @@ fn select_cgroups(mode: CgroupMode) -> Result<Option<Cgroups>, ErrorInfo> {
 
 /// Checks that are not expressed in the clap definition.
 fn check_args(args: &CompileArgs) -> Result<(), ErrorInfo> {
+    if args.backend == EngineBackend::Host
+        && (args.container_runtime.is_some() || args.container_image.is_some())
+    {
+        return Err(ErrorInfo::new(
+            Stage::Args,
+            kind::USAGE,
+            Category::Usage,
+            "--container-runtime and --container-image need --backend container".to_owned(),
+        ));
+    }
     let paths = [
         ("the entrypoint", Some(&args.entrypoint)),
         ("--root", args.root.as_ref()),

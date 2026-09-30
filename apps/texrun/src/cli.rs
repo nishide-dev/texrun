@@ -25,7 +25,8 @@ Exit codes:
   2    usage or input error: invalid arguments, entrypoint not found or
        outside --root, project rejected (symlink leaving the root, input
        limits exceeded, unsafe project root)
-  3    texrun runtime error: latexmk missing or unusable, I/O errors,
+  3    texrun runtime error: latexmk missing or unusable (with --backend
+       container: no container runtime or engine image), I/O errors,
        artifacts could not be copied to the output directory, --cgroup
        required without a usable cgroup
   4    the compile timed out (see --timeout)
@@ -123,6 +124,28 @@ pub struct CompileArgs {
     pub source_date_epoch: Option<i64>,
 
     #[allow(clippy::doc_markdown, reason = "the doc comment is the --help text")]
+    /// Where TeX runs: host runs the host's latexmk as your user, confined by
+    /// TeX's own restrictions and resource limits; container runs it in a
+    /// container of the engine image (Docker or Podman) that sees only the
+    /// workspace, with no network, a read-only filesystem and no privileges
+    /// (docs/security.md §2, §4). Use container for documents you do not
+    /// trust, together with --no-preview: page previews are still rendered on
+    /// the host with either backend.
+    #[arg(long, value_enum, value_name = "BACKEND", default_value = "host")]
+    pub backend: EngineBackend,
+
+    /// Container runtime for --backend container [default: auto: Docker if
+    /// it is installed and running, otherwise Podman].
+    #[arg(long, value_enum, value_name = "RUNTIME")]
+    pub container_runtime: Option<ContainerRuntime>,
+
+    /// Engine image for --backend container; must exist locally (texrun
+    /// never pulls) [default: texrun-engine:latest, built from
+    /// docker/engine/Dockerfile].
+    #[arg(long, value_name = "IMAGE")]
+    pub container_image: Option<String>,
+
+    #[allow(clippy::doc_markdown, reason = "the doc comment is the --help text")]
     /// Run the engine and the preview tools in cgroups of their own, with
     /// limits on their memory, processes and CPU use (Linux, cgroup v2):
     /// auto uses a delegated cgroup if there is one (e.g. under
@@ -160,6 +183,32 @@ pub struct PreviewArgs {
     /// otherwise Poppler (pdftoppm)].
     #[arg(long, value_enum, value_name = "BACKEND")]
     pub preview_backend: Option<PreviewBackend>,
+}
+
+/// `--backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EngineBackend {
+    Host,
+    Container,
+}
+
+/// `--container-runtime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContainerRuntime {
+    Auto,
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntime {
+    /// The runtime to use, `None` for auto-detection.
+    pub fn kind(self) -> Option<texrun_texlive::RuntimeKind> {
+        match self {
+            Self::Auto => None,
+            Self::Docker => Some(texrun_texlive::RuntimeKind::Docker),
+            Self::Podman => Some(texrun_texlive::RuntimeKind::Podman),
+        }
+    }
 }
 
 /// `--cgroup`.
@@ -215,6 +264,9 @@ mod tests {
         assert!(!args.keep_workspace);
         assert_eq!(args.source_date_epoch, None);
         assert_eq!(args.cgroup, CgroupMode::Auto);
+        assert_eq!(args.backend, EngineBackend::Host);
+        assert_eq!(args.container_runtime, None);
+        assert_eq!(args.container_image, None);
         assert!(!args.preview.no_preview);
         assert_eq!(args.preview.pages, None);
     }
@@ -253,6 +305,32 @@ mod tests {
             command_line.push("m.tex");
             assert!(Cli::try_parse_from(&command_line).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn backend_options() {
+        let cli = Cli::try_parse_from([
+            "texrun",
+            "compile",
+            "--backend",
+            "container",
+            "--container-runtime",
+            "podman",
+            "--container-image",
+            "example/engine:1",
+            "m.tex",
+        ])
+        .unwrap();
+        let Command::Compile(args) = cli.command;
+        assert_eq!(args.backend, EngineBackend::Container);
+        assert_eq!(args.container_runtime, Some(ContainerRuntime::Podman));
+        assert_eq!(
+            args.container_runtime.unwrap().kind(),
+            Some(texrun_texlive::RuntimeKind::Podman)
+        );
+        assert_eq!(ContainerRuntime::Auto.kind(), None);
+        assert_eq!(args.container_image.as_deref(), Some("example/engine:1"));
+        assert!(Cli::try_parse_from(["texrun", "compile", "--backend", "vm", "m.tex"]).is_err());
     }
 
     #[test]

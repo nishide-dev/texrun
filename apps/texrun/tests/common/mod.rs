@@ -6,7 +6,9 @@
 //! stderr per test binary, when `latexmk` is not on `PATH`. With
 //! `TEXRUN_REQUIRE_TEXLIVE=1` (CI integration job, dev container) a missing
 //! TeX Live is a failure instead; `TEXRUN_REQUIRE_PREVIEW_TOOLS=1` does the
-//! same for the preview tools.
+//! same for the preview tools, and `TEXRUN_REQUIRE_SANDBOX=1` for the
+//! container backend (a runtime and the engine image, `TEXRUN_SANDBOX_IMAGE`
+//! or `texrun-engine:latest`).
 
 #![allow(dead_code)]
 
@@ -16,13 +18,52 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use texrun_core::TypesetEngine;
 use texrun_preview::Previewer;
-use texrun_texlive::LatexmkEngine;
+use texrun_texlive::{ContainerConfig, ContainerEngine, LatexmkEngine};
 
 /// Set to `1` to fail (instead of skip) tests that need TeX Live.
 pub const REQUIRE_TEXLIVE_ENV: &str = "TEXRUN_REQUIRE_TEXLIVE";
 
 /// Set to `1` to fail (instead of skip) tests that need a preview tool.
 pub const REQUIRE_PREVIEW_TOOLS_ENV: &str = "TEXRUN_REQUIRE_PREVIEW_TOOLS";
+
+/// Set to `1` to fail (instead of skip) tests that need the container
+/// backend.
+pub const REQUIRE_SANDBOX_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
+
+/// The engine image of the container backend tests.
+pub fn sandbox_image() -> String {
+    std::env::var("TEXRUN_SANDBOX_IMAGE")
+        .ok()
+        .filter(|i| !i.is_empty())
+        .unwrap_or_else(|| "texrun-engine:latest".to_owned())
+}
+
+/// Whether the container backend can be used. Panics if it cannot and
+/// [`REQUIRE_SANDBOX_ENV`] is `1`.
+pub fn sandbox_available() -> bool {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    let probe = PROBE.get_or_init(|| {
+        ContainerEngine::new(ContainerConfig::default().with_image(sandbox_image()))
+            .probe()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    match probe {
+        Ok(()) => true,
+        Err(e) if required(REQUIRE_SANDBOX_ENV) => {
+            panic!(
+                "the container backend is required ({REQUIRE_SANDBOX_ENV}=1) but not usable: {e}"
+            )
+        }
+        Err(_) => {
+            report_skip(
+                "container backend tests: no container runtime or engine image",
+                REQUIRE_SANDBOX_ENV,
+            );
+            false
+        }
+    }
+}
 
 fn required(var: &str) -> bool {
     std::env::var_os(var).is_some_and(|v| v == "1")
@@ -89,6 +130,7 @@ pub fn preview_tools_available() -> bool {
 }
 
 /// Returns from the calling test unless TeX Live is available.
+#[allow(unused_macros)]
 macro_rules! require_texlive {
     () => {
         if !common::texlive_available() {
@@ -96,9 +138,23 @@ macro_rules! require_texlive {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use require_texlive;
 
+/// Returns from the calling test unless the container backend is usable.
+#[allow(unused_macros)]
+macro_rules! require_sandbox {
+    () => {
+        if !common::sandbox_available() {
+            return;
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use require_sandbox;
+
 /// Returns from the calling test unless a preview tool is available.
+#[allow(unused_macros)]
 macro_rules! require_preview_tools {
     () => {
         if !common::preview_tools_available() {
@@ -106,6 +162,7 @@ macro_rules! require_preview_tools {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use require_preview_tools;
 
 /// A fixture project of the engine crate:

@@ -2,11 +2,12 @@
 //!
 //! Unlike [`CompileRequest`](crate::CompileRequest), which describes *what* to
 //! compile and is serializable, [`CompileContext`] carries host-side runtime
-//! state for one call: where the workspace lives, how to cancel, and (later)
-//! sandbox details. New runtime inputs are added as fields here rather than as
-//! new parameters of [`TypesetEngine::compile`](crate::TypesetEngine::compile).
+//! state for one call: where the workspace lives, how to cancel, and where a
+//! sandbox backend shows the workspace to the engine ([`PathMapping`]). New
+//! runtime inputs are added as fields here rather than as new parameters of
+//! [`TypesetEngine::compile`](crate::TypesetEngine::compile).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,6 +21,10 @@ pub enum WorkspaceRootError {
     /// The path is not absolute.
     #[error("workspace root must be an absolute path: {0:?}")]
     NotAbsolute(PathBuf),
+    /// The path has `.` or `..` components, or is the filesystem root
+    /// (only checked for [`PathMapping::new`]).
+    #[error("path must be a normalized absolute directory other than `/`: {0:?}")]
+    NotNormalized(PathBuf),
 }
 
 /// The absolute host directory of a prepared compile workspace.
@@ -58,6 +63,57 @@ impl WorkspaceRoot {
     }
 }
 
+/// Where the engine's processes see the workspace when they do not run on
+/// the host's filesystem view: a sandbox backend (#26) mounts the
+/// [`WorkspaceRoot`] at [`PathMapping::guest_root`] inside the sandbox.
+///
+/// Requests and results never contain host or guest paths
+/// ([`WorkspacePath`]s only), so they are the same with and without a
+/// mapping. An engine uses the mapping for what it passes to its processes
+/// (arguments, working directory, environment) and to interpret what they
+/// report (e.g. absolute paths in the TeX log), while it keeps reading and
+/// writing the workspace through the host path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PathMapping {
+    guest_root: PathBuf,
+}
+
+impl PathMapping {
+    /// Maps the workspace root to `guest_root`, which must be absolute,
+    /// without `.` / `..` components and not `/`.
+    pub fn new(guest_root: impl Into<PathBuf>) -> Result<Self, WorkspaceRootError> {
+        let guest_root = guest_root.into();
+        if !guest_root.is_absolute() {
+            return Err(WorkspaceRootError::NotAbsolute(guest_root));
+        }
+        let normal = guest_root
+            .components()
+            .skip(1)
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !normal || guest_root.parent().is_none() {
+            return Err(WorkspaceRootError::NotNormalized(guest_root));
+        }
+        Ok(Self { guest_root })
+    }
+
+    /// The workspace root as the engine's processes see it.
+    pub fn guest_root(&self) -> &Path {
+        &self.guest_root
+    }
+
+    /// Guest path of a workspace-relative path.
+    pub fn to_guest(&self, path: &WorkspacePath) -> PathBuf {
+        self.guest_root.join(path.as_path())
+    }
+
+    /// The workspace-relative path of `guest`, if it is below (or at) the
+    /// guest root. Purely lexical.
+    pub fn to_workspace_path(&self, guest: &Path) -> Option<WorkspacePath> {
+        let rel = guest.strip_prefix(&self.guest_root).ok()?;
+        WorkspacePath::from_path(rel).ok()
+    }
+}
+
 /// A cooperative cancellation flag shared between a caller and an engine.
 ///
 /// The caller (e.g. a Ctrl-C handler in the CLI) calls [`CancelToken::cancel`];
@@ -89,8 +145,7 @@ impl CancelToken {
 /// call. Not serialized.
 ///
 /// `#[non_exhaustive]`: construct with [`CompileContext::new`] and the `with_*`
-/// methods, so that later additions (e.g. sandbox / path-mapping details for
-/// #9) do not break engines or callers.
+/// methods, so that later additions do not break engines or callers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CompileContext<'a> {
@@ -98,6 +153,14 @@ pub struct CompileContext<'a> {
     pub workspace: &'a WorkspaceRoot,
     /// Cancellation flag; never cancelled unless the caller supplies one.
     pub cancel: CancelToken,
+    /// Where the engine's processes see the workspace, if not at its host
+    /// path. `None` (the default): at [`WorkspaceRoot::path`].
+    ///
+    /// A sandbox backend sets it for the engine it drives, or uses the one
+    /// a caller set to choose the mount point. An engine that runs its
+    /// processes on the host rejects a context with a mapping
+    /// ([`EngineError::Unsupported`](crate::EngineError::Unsupported)).
+    pub path_mapping: Option<PathMapping>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -106,6 +169,7 @@ impl<'a> CompileContext<'a> {
         Self {
             workspace,
             cancel: CancelToken::new(),
+            path_mapping: None,
         }
     }
 
@@ -113,6 +177,13 @@ impl<'a> CompileContext<'a> {
     #[must_use]
     pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Sets [`CompileContext::path_mapping`].
+    #[must_use]
+    pub fn with_path_mapping(mut self, mapping: PathMapping) -> Self {
+        self.path_mapping = Some(mapping);
         self
     }
 }
@@ -147,6 +218,30 @@ mod tests {
             root.output_dir(&CompileOptions::default()),
             abs("ws").join(CompileOptions::DEFAULT_OUTPUT_DIR)
         );
+    }
+
+    #[test]
+    fn path_mapping_maps_workspace_paths() {
+        let mapping = PathMapping::new("/workspace").unwrap();
+        let p = WorkspacePath::new("chapters/intro.tex").unwrap();
+        assert_eq!(
+            mapping.to_guest(&p),
+            Path::new("/workspace/chapters/intro.tex")
+        );
+        assert_eq!(
+            mapping.to_workspace_path(Path::new("/workspace/chapters/intro.tex")),
+            Some(p)
+        );
+        assert_eq!(mapping.to_workspace_path(Path::new("/workspace2/x")), None);
+        assert_eq!(mapping.to_workspace_path(Path::new("/etc/passwd")), None);
+        for bad in ["relative", "/", "/a/../b"] {
+            assert!(PathMapping::new(bad).is_err(), "{bad}");
+        }
+        let root = WorkspaceRoot::new(abs("ws")).unwrap();
+        let ctx = CompileContext::new(&root);
+        assert_eq!(ctx.path_mapping, None);
+        let ctx = ctx.with_path_mapping(mapping.clone());
+        assert_eq!(ctx.path_mapping, Some(mapping));
     }
 
     #[test]

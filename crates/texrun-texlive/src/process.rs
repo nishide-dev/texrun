@@ -17,6 +17,7 @@ use texrun_process::{
     Capture, CgroupLimits, CgroupOutcome, Cgroups, Cwd, EnvAllowlist, ExecGate, Resource, Rlimits,
     RunError, Spec, StartMode, Stop, Watch,
 };
+use texrun_sandbox::Container;
 
 use crate::layout;
 
@@ -158,8 +159,17 @@ impl Limits {
     }
 
     /// The limits set on latexmk (inherited by every process it starts)
-    /// for a compile with `timeout`.
+    /// for a compile with `timeout` on this host.
     pub(crate) fn rlimits(&self, timeout: Duration) -> Rlimits {
+        self.rlimits_for(
+            timeout,
+            cfg!(any(target_os = "linux", target_os = "android")),
+        )
+    }
+
+    /// [`Limits::rlimits`], with `RLIMIT_AS` if `address_space` (on Linux,
+    /// including a Linux container on any host).
+    pub(crate) fn rlimits_for(&self, timeout: Duration, address_space: bool) -> Rlimits {
         let cpu = self.cpu_seconds(timeout);
         let limits = Rlimits::new()
             .with(Resource::FileSize, self.max_file_bytes)
@@ -171,7 +181,7 @@ impl Limits {
                 cpu,
                 cpu.saturating_add(Self::CPU_KILL_GRACE.as_secs()),
             );
-        if cfg!(any(target_os = "linux", target_os = "android")) {
+        if address_space {
             limits.with(Resource::AddressSpace, self.max_address_space)
         } else {
             limits
@@ -227,6 +237,11 @@ pub(crate) enum Start<'a> {
     /// No exec gate and no `prlimit(2)` (macOS without a gate): latexmk
     /// runs without rlimits; only the output size check applies.
     Unlimited,
+    /// In a container (`texrun-sandbox`): the runtime sets the rlimits
+    /// (including `RLIMIT_AS`, the container is Linux) and the limits of
+    /// the container's cgroup before latexmk starts. The rc has no start
+    /// gate, and no host cgroup is used.
+    Container(&'a Container<'a>),
 }
 
 /// What to run and watch.
@@ -257,6 +272,11 @@ pub(crate) struct Finished {
     /// Whether all rlimits were set before latexmk started.
     pub(crate) rlimits_applied: bool,
     pub(crate) cgroup: CgroupOutcome,
+    /// Whether `RLIMIT_AS` was in place (Linux, or a container), so that an
+    /// allocation failure may be that limit.
+    pub(crate) address_space_limited: bool,
+    /// The container's memory limit stopped a process (OOM kill).
+    pub(crate) container_oom: bool,
 }
 
 /// Runs latexmk and supervises it until it exits or is stopped.
@@ -270,6 +290,9 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
     let timeout = job.timeout.unwrap_or(Duration::MAX);
     match &job.start {
         Start::Plain | Start::Unlimited => {}
+        Start::Container(_) => {
+            spec = spec.with_rlimits(job.limits.rlimits_for(timeout, true));
+        }
         Start::ExecGate(gate) => {
             // A gate that became unusable since it was checked fails the
             // run (nothing is started) instead of falling back to setting
@@ -290,7 +313,7 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
                 });
         }
     }
-    if !matches!(job.start, Start::Plain)
+    if !matches!(job.start, Start::Plain | Start::Container(_))
         && let Some(cgroups) = job.cgroups
     {
         spec = spec.with_cgroup(cgroups, job.limits.cgroup());
@@ -309,7 +332,17 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
         });
     }
 
-    let finished = texrun_process::run(&spec, watch)?;
+    let (finished, address_space_limited, container_oom) =
+        if let Start::Container(container) = &job.start {
+            let finished = texrun_process::run_with(*container, &spec, watch)?;
+            let oom = container.outcome().is_some_and(|o| o.oom_killed);
+            (finished, true, oom)
+        } else {
+            let finished = texrun_process::run(&spec, watch)?;
+            let linux = cfg!(any(target_os = "linux", target_os = "android"));
+            let limited = linux && finished.rlimits_applied;
+            (finished, limited, false)
+        };
     Ok(Finished {
         pid: finished.pid,
         status: finished.status,
@@ -323,6 +356,8 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
         stderr: finished.stderr,
         rlimits_applied: finished.rlimits_applied,
         cgroup: finished.cgroup,
+        address_space_limited,
+        container_oom,
     })
 }
 
@@ -386,6 +421,13 @@ pub(crate) fn limit_reached(
         .status
         .signal()
         .or_else(|| finished.status.code().filter(|&c| c > 128).map(|c| c - 128));
+    if finished.container_oom {
+        return Some(LimitReached::fatal(format!(
+            "resource limit exceeded: the compile needed more than {} bytes of memory (all its \
+             processes together), so a process was stopped",
+            limits.max_memory_bytes
+        )));
+    }
     if let CgroupOutcome::Applied(usage) = &finished.cgroup {
         if usage.oom_kills > 0 {
             return Some(LimitReached::fatal(format!(
@@ -415,8 +457,7 @@ pub(crate) fn limit_reached(
     if signal == Some(SIGXFSZ) {
         return Some(LimitReached::Output(per_file_limit(limits)));
     }
-    if finished.rlimits_applied
-        && cfg!(any(target_os = "linux", target_os = "android"))
+    if finished.address_space_limited
         && !finished.status.success()
         && ran_out_of_memory(&finished.stderr.bytes, log)
     {
@@ -534,6 +575,8 @@ mod tests {
             stderr: CapturedOutput::default(),
             rlimits_applied: true,
             cgroup,
+            address_space_limited: cfg!(target_os = "linux"),
+            container_oom: false,
         }
     }
 
