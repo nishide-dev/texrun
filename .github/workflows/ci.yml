@@ -103,6 +103,80 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --all-features --locked --doc
 
+  # TeX Live integration tests (#10) in the Docker dev image
+  # (docker/dev/Dockerfile), so CI and local runs use the same TeX Live and
+  # preview tools. TEXRUN_REQUIRE_TEXLIVE / TEXRUN_REQUIRE_PREVIEW_TOOLS turn
+  # a missing tool into a test failure instead of a silent skip.
+  integration:
+    name: integration
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE: texrun-dev:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # TeX Live tests are selected at run time (TEXRUN_REQUIRE_TEXLIVE), and
+      # this job does not pass `--ignored`: an `#[ignore]`d TeX test would
+      # silently never run here.
+      - name: Check that no TeX Live test is ignored
+        run: |
+          if git grep -niE '#\[ignore.*(tex ?live|latexmk|pdflatex)' -- '*.rs'; then
+            echo "::error::TeX Live tests must use require_texlive!() instead of #[ignore] (docs/development.md)"
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Layers are cached in the GitHub Actions cache, so the image is only
+      # rebuilt when the Dockerfile (or its base image digest) changes. The
+      # cache is written from main pushes only, like the cargo cache below;
+      # PRs read it.
+      - name: Build dev image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/dev
+          file: docker/dev/Dockerfile
+          tags: ${{ env.IMAGE }}
+          load: true
+          cache-from: type=gha,scope=texrun-dev
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=texrun-dev,mode=max' || '' }}
+      # Build output and the cargo registry of the container. Saved from main
+      # only; PRs restore the latest main cache.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/docker
+            ${{ runner.temp }}/cargo-registry
+          key: integration-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'docker/dev/Dockerfile') }}
+          restore-keys: integration-
+      - name: Tool versions
+        run: |
+          docker run --rm "${IMAGE}" sh -c \
+            'cargo --version && latexmk -v | head -n 2 && pdflatex --version | head -n 1 && mutool -v 2>&1 | head -n 1 && pdfinfo -v 2>&1 | head -n 1'
+      - name: Run tests (TeX Live required)
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cargo-registry"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
+            -v "${RUNNER_TEMP}/cargo-registry:/usr/local/cargo/registry" \
+            -e CARGO_TARGET_DIR=/workspace/target/docker \
+            -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL -e RUST_BACKTRACE \
+            -e TEXRUN_REQUIRE_TEXLIVE=1 \
+            -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+            "${IMAGE}" \
+            cargo test --workspace --all-features --locked
+      - name: Save cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/docker
+            ${{ runner.temp }}/cargo-registry
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   deny:
     name: deny
     runs-on: ubuntu-latest
@@ -126,7 +200,7 @@ jobs:
   ci-success:
     name: ci-success
     if: always() && github.event_name != 'schedule'
-    needs: [fmt, check, clippy, test, deny]
+    needs: [fmt, check, clippy, test, integration, deny]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

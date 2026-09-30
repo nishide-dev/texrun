@@ -806,11 +806,29 @@ mod tests {
 
     /// Without the start token, latexmk stops inside the rc before running
     /// or writing anything.
+    ///
+    /// Needs TeX Live; skipped without it unless `TEXRUN_REQUIRE_TEXLIVE=1`
+    /// (like the integration tests, see `tests/common/mod.rs`).
     #[test]
-    #[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
     fn gated_rc_does_nothing_without_the_start_token() {
+        use std::io::Write as _;
+
         let engine = LatexmkEngine::default();
-        let latexmk = engine.locate().expect("latexmk");
+        let latexmk = match engine.locate() {
+            Ok(latexmk) => latexmk,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("TEXRUN_REQUIRE_TEXLIVE").is_none_or(|v| v != "1"),
+                    "TeX Live is required (TEXRUN_REQUIRE_TEXLIVE=1): {e}"
+                );
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "texrun-texlive unit tests: SKIPPED gated_rc_does_nothing_without_the_start_token: \
+                     latexmk not found (set TEXRUN_REQUIRE_TEXLIVE=1 to fail instead)"
+                );
+                return;
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("main.tex"),

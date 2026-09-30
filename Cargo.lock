@@ -453,6 +453,7 @@ dependencies = [
  "tempfile",
  "texrun-core",
  "texrun-latex-log",
+ "texrun-preview",
  "texrun-workspace",
 ]
 

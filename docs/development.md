@@ -3,7 +3,7 @@
 texrun は TeX Live / latexmk / PDF preview tool を外部コマンドとして呼び出す。
 host に TeX Live を直接インストールしなくても開発・integration test ができるよう、
 Rust toolchain と軽量な TeX Live を含む Docker 環境を用意している。
-TeX Live が必要な CI の integration job（#11 の後続、#10 の fixture が揃った段階で追加）でも同じ構成を使い、TeX distribution の差異による fixture の揺れを抑えることを目的とする。現在の CI（fmt / check / clippy / test / deny）は TeX Live を必要としないため、この image は使わず runner 上で直接実行している。
+CI の `integration` job も同じ image を build して使い、TeX distribution の差異による fixture の揺れを抑える（[TeX Live integration test](#tex-live-integration-test)）。そのほかの CI job（fmt / check / clippy / test / deny）は TeX Live を必要としないため、この image は使わず runner 上で直接実行している。
 
 ## 構成
 
@@ -21,7 +21,9 @@ image に含まれるもの:
   - image サイズを抑えるため `--no-install-recommends` とし、ドキュメント類（`/usr/share/doc`、TeX Live の `doc/` など）は入れていない
 - PDF preview tool（#8）: MuPDF `mutool`（`mupdf-tools`）、Poppler `pdftoppm` / `pdfinfo`（`poppler-utils`）
 
-Rust / TeX Live のバージョンを変更する場合は `docker/dev/Dockerfile` の `RUST_VERSION` / `DEBIAN_RELEASE` と `rust-toolchain.toml` を揃えて更新する。
+Rust / TeX Live のバージョンを変更する場合は、`docker/dev/Dockerfile` の `FROM` 行（`rust:<version>-slim-<Debian release>@sha256:<digest>`）と `rust-toolchain.toml` を揃えて更新する。
+base image は multi-arch index の digest で固定している。同じ tag の digest の更新は Dependabot（docker ecosystem）が PR を作る。tag（Rust の version）は `rust-toolchain.toml` と一緒に手で上げる（Dependabot では version の更新を無視している）。
+digest（multi-arch index のもの）は `docker buildx imagetools inspect rust:<tag>` の `Digest:` 行で確認できる。buildx が必要なので、buildx の無い環境（OrbStack 同梱の `docker` など）では、`docker pull rust:<tag>` の後に `docker image inspect rust:<tag> --format '{{json .RepoDigests}}'` で確認する（`docker manifest inspect rust:<tag>` は index の中身の platform ごとの digest を表示するもので、index 自体の digest は出ない）。
 
 ## 前提
 
@@ -64,9 +66,9 @@ host に Rust toolchain がある場合は host で直接実行してもよい�
 `crates/texrun-preview` の実ツールを使う test（`tests/real_tools.rs`）は、`mutool` / `pdftoppm` が見つからない backend を skip する。
 - skip した backend は、test binary ごとに 1 回だけ stderr に `SKIPPED` と表示する。
   - libtest の出力 capture を通さずに書くので、`cargo test` では `--nocapture` を付けなくても表示される。
-  - `cargo nextest run` は process の出力全体を capture するため、`--no-capture` を付けた場合にだけ表示される。
-- test 自体は pass 扱いになる。CI の ubuntu / macos runner には tool が無いので、現状の CI では実ツールの test は実行されていない。
-- 両方がそろっているコンテナや、将来の integration job（#10 / #11）では、skip を失敗にして確実に実行させる:
+  - `cargo nextest run` は test ごとに process を分けて出力を capture する。`.config/nextest.toml` で、この test binary と `crates/texrun-texlive` の test は成功時の出力も実行の最後にまとめて表示するようにしてある（test ごとに process が分かれるので、`SKIPPED` 行は binary ごとではなく test ごとに出る）。
+- test 自体は pass 扱いになる。CI の `test (linux)` / `test (macos)` の runner には tool が無いので、そこでは skip される。
+- 両方がそろっているコンテナや CI の `integration` job では、skip を失敗にして確実に実行させる（TeX Live の test と同じ方式。[TeX Live integration test](#tex-live-integration-test)）:
 
 ```bash
 docker compose run --rm -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 dev cargo test -p texrun-preview
@@ -99,14 +101,62 @@ docker compose down --volumes
 
 ## TeX Live integration test
 
-TeX Live を必要とする integration test の実行方法（`#[ignore]` + `--ignored`、環境変数、cargo feature のいずれで有効化するか）は #10 で決める。
-決まり次第このセクションに追記する。いずれの方式でも、この dev コンテナ内で実行すれば `latexmk` / `mutool` / `pdftoppm` が揃った状態でテストできる。
+実際の TeX Live / preview tool を使う test は、`#[ignore]` や cargo feature ではなく **実行時の検出 + 環境変数** で選別する（#10）。
 
-それまでの間、TeX Live engine（`crates/texrun-texlive`）の integration test は `#[ignore]` にしてある。dev コンテナ内で次のように実行する。latexmk が無い環境では skip せずに失敗する。
+| 環境変数 | 対象 | tool が無いとき（未設定） | `=1` のとき |
+| --- | --- | --- | --- |
+| `TEXRUN_REQUIRE_TEXLIVE` | `crates/texrun-texlive` の TeX Live を使う test（`latexmk` を検出） | skip | 失敗 |
+| `TEXRUN_REQUIRE_PREVIEW_TOOLS` | `crates/texrun-preview` の実ツール test、`crates/texrun-texlive` の PDF ページ数と preview の確認 | skip | 失敗 |
+
+- tool があれば、環境変数が無くても test は実行される。host に TeX Live がある場合、`cargo test --workspace` で host の TeX Live を使って実行される（version の違いで失敗した場合は、コンテナ内の結果を正とする）。
+- skip したときは、test binary ごとに 1 回だけ stderr に `SKIPPED ... (set TEXRUN_REQUIRE_...=1 to fail instead)` と表示する。libtest の capture を通さずに書くので `cargo test` でそのまま見える。`cargo nextest run`（CI の `test (linux)` / `test (macos)`）では、`.config/nextest.toml` の設定で成功した test の出力も実行の最後に表示されるので、そこに `SKIPPED` 行が出る。nextest は test ごとに process を分けるため、この場合は binary ごとではなく test ごとに 1 行出る。nextest の集計の `skipped` は 0 のままである（test としては pass 扱い）。
+- `=1` 以外の値は未設定と同じ扱いになる。
+- CI の `integration` job は両方を `1` にしてコンテナ内で全 test を実行するので、tool が無いことで黙って成功することはない。
+- TeX Live / preview tool を使う test に `#[ignore]` は使わない。`integration` job は `--ignored` を付けないので、ignore された test は CI で一度も実行されない。これを防ぐため、job の最初の step で、TeX Live に言及する `#[ignore]` が repo 内に無いことを確認している。
+
+dev コンテナ内で TeX Live の test を含めて全件実行する（CI の `integration` job と同じ条件）:
 
 ```bash
-docker compose run --rm dev cargo test -p texrun-texlive -- --ignored
+docker compose run --rm \
+  -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+  dev cargo test --workspace --all-features --locked
 ```
+
+TeX Live engine の test だけを実行する:
+
+```bash
+docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+  dev cargo test -p texrun-texlive
+```
+
+### test と fixture の構成
+
+`crates/texrun-texlive/tests/` に置いている。
+
+| ファイル | 内容 |
+| --- | --- |
+| `common/mod.rs` | 選別（`require_texlive!`）、fixture の compile、構造化結果の assert などの共通 helper |
+| `scenarios.rs` | 典型的な文書の fixture（下表）を workspace 経由で compile し、結果を検証する |
+| `security.rs` | [docs/security.md](security.md) §2 の保証が、workspace + engine の経路で効いていることを検証する |
+| `latexmk.rs` | engine 自体の挙動（probe、cancel、プロセスツリー、出力上限など） |
+| `fixtures/<name>/` | fixture の TeX project。そのまま project root として `Workspace::create` に渡す（コピーされるので、test が fixture の隣に書き込むことはない） |
+
+| fixture | 確認すること |
+| --- | --- |
+| `minimal` | 成功、PDF と log の artifact（size・PDF 1 ページ）、`collect_artifacts` で host にコピーされる |
+| `syntax-error` | 環境の対応の誤り: `Failed`、`latex_error` の file / line |
+| `undefined-command` | `Failed`、`undefined_control_sequence` の file / line |
+| `missing-package` | `Failed`、`missing_file`（file のみ。TeX は停止位置しか出さない） |
+| `references` | bibtex（biber は使わない）で解決した引用と、未定義の参照・引用の warning（`Succeeded` のまま） |
+| `overfull-box` | `overfull_box` warning の file / line |
+| `timeout` | 無限ループを短い timeout（2 秒）で `TimedOut` にし、プロセスを残さない |
+| `multi-file` | サブディレクトリの `\input` / `\include`: workspace へのコピー、子ファイルの `.aux`、ページ数、子ファイルに帰属する diagnostic、preview の生成 |
+| `unicode-names` | 日本語・空白・全角空白を含むファイル名 |
+| `security/*` | shell escape、workspace 外の読み書き、rc ファイル、先頭行の format 指定、補助ツールの起動 |
+
+- 検証は構造化された結果（outcome、diagnostic の kind / file / line、artifact の有無と size、PDF のページ数）に対して行い、ログ全文の snapshot には依存しない。TeX Live の minor な差で壊れにくくするためである。
+- PDF のページ数は `texrun-preview`（`mutool` または `pdfinfo`）で読む。
+- fixture を追加・変更したときは、コンテナ内で上のコマンドを実行して確認する。
 
 ## 注意事項
 
@@ -125,7 +175,7 @@ docker compose run --rm dev cargo test -p texrun-texlive -- --ignored
 
 - `docker compose run --rm --user "$(id -u):$(id -g)" dev ...` のように host ユーザーで実行する方法は、現状ではサポートしていない。OrbStack で試したところ、registry の cache がすでにある場合は `cargo test` が通った。しかし cache が空の volume では、`cargo fetch` が root 所有の `/usr/local/cargo/registry` に書き込めず、Permission denied で失敗した。HOME も未設定になる。対応する場合は、image 側で `CARGO_HOME` と volume の権限を調整する必要があるため、将来の選択肢とする
 - image tag `texrun-dev:latest` は全 checkout で共有している。`Dockerfile` を変更した checkout で build すると、ほかの checkout が使う image も置き換わる。変更前の image に戻すときは、元の checkout で `docker compose build dev` をやり直す
-- base image は tag 指定（digest 固定なし）で、apt パッケージも version を固定していない。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）
+- base image は digest で固定しているが、apt パッケージは version を固定していない（image を build した時点の Debian の版が入る）。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）。CI の `integration` job は `Tool versions` step で実際の version を表示する
   - `texlive-binaries` 2024.20240313.70630+ds-6（pdfTeX 1.40.26）
   - `texlive-latex-base` / `texlive-latex-recommended` 2024.20250309-1
   - `latexmk` 4.86、`mupdf-tools` 1.25.1、`poppler-utils` 25.03.0

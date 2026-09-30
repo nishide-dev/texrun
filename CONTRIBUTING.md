@@ -191,7 +191,19 @@ CI では test を [cargo-nextest](https://nexte.st/) で実行します（`carg
 - 上記は #2 / #11 で定義し、`.github/workflows/ci.yml` で実行している品質ゲートと同一です。CI 側のチェックが変わった場合は、このドキュメントも合わせて更新してください。
 
 - CI を source of truth とし、開発者固有の git hook の導入は必須にしません。
-- TeX Live が必要な integration test の実行方法は、開発環境の整備（Docker ベースの TeX Live 環境など）に合わせて README 等に記載します。
+
+### TeX Live integration test
+
+TeX Live（latexmk）や preview tool（`mutool` / `pdftoppm`）を使う test は、tool が見つからなければ `SKIPPED` と表示して skip します。そのため、上記の `cargo test --workspace` は TeX Live が無い環境でも通ります。
+TeX Live を使う compile の経路（engine・fixture・security）や diagnostics parser を変更した場合は、TeX Live を含む Docker 開発環境で skip を失敗に変えて全件を実行してください。CI の `integration` job と同じ条件です。
+
+```bash
+docker compose run --rm \
+  -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+  dev cargo test --workspace --all-features --locked
+```
+
+環境変数の意味・fixture の一覧・image の build 方法は [docs/development.md](docs/development.md#tex-live-integration-test) を参照してください。
 
 ## Issue
 
@@ -212,7 +224,8 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 | `fmt` | `cargo fmt --all -- --check` |
 | `check` | `cargo check --workspace --all-targets --all-features --locked` |
 | `clippy` | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` |
-| `test (linux)` / `test (macos)` | `cargo nextest run` と doctest（`cargo test --doc`） |
+| `test (linux)` / `test (macos)` | `cargo nextest run` と doctest（`cargo test --doc`）。TeX Live / preview tool を使う test は skip される |
+| `integration` | Docker 開発環境の image（`docker/dev/Dockerfile`）を build し、その中で `TEXRUN_REQUIRE_TEXLIVE=1` / `TEXRUN_REQUIRE_PREVIEW_TOOLS=1` を付けて `cargo test --workspace --all-features --locked` を実行する（TeX Live integration test、上記） |
 | `deny` | `cargo deny --locked check`（advisories / licenses / bans / sources、設定は `deny.toml`） |
 | `ci-success` | 上記すべての成功を確認する集約 check |
 | `pr-title` | PR タイトルが Conventional Commits 形式か（type は上記の type 一覧に限定、scope は任意、description は小文字始まり・末尾ピリオドなし） |
@@ -220,8 +233,9 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 - merge 前に `ci-success` と `pr-title` が成功していることを確認してください（branch protection の required check として設定する想定です）。
 - squash merge では PR タイトルが最終コミットのタイトルになるため、自動検証の対象は PR タイトルです。feature branch 内の個々のコミットメッセージは自動検証しないので、レビュー時に目視で確認します。
 - 新しい RustSec advisory を検出するため、`deny` は週次の schedule でも実行されます（schedule のときは `deny` 以外の job はスキップされます）。
-- 依存 crate と GitHub Actions の更新は Dependabot が週次で `chore(deps): ...` の PR を作成します。
-- TeX Live が必要な integration test の CI job は、fixture（#10）と Docker 開発環境（#14）が揃った段階で追加します。
+- 依存 crate・GitHub Actions・開発環境の base image（digest）の更新は、Dependabot が週次で `chore(deps): ...` の PR を作成します。
+- `integration` の image の layer と cargo の build 成果物は GitHub Actions の cache（buildx の `type=gha` と `actions/cache`）から再利用するので、`Dockerfile` を変えない限り build はほぼ cache で済みます。cache への保存は main への push のときだけで、PR は main の cache を読むだけです。
+- `integration` は、TeX Live に言及する `#[ignore]` が残っていないことも確認します。TeX Live を使う test は `#[ignore]` ではなく `require_texlive!()` で選別してください（[docs/development.md](docs/development.md#tex-live-integration-test)）。
 
 ## License
 

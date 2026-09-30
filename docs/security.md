@@ -58,7 +58,7 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
      - kpsewhich の呼び出しは無効にする
      - texrun が使わないツールは未実装扱い（`NONE`）にする
    - **多層防御の一段として、entrypoint と output dir の名前を検査する**（§3.5）。この検査だけでは、上の保証は成り立たない。
-   - 検証は #10 の security fixture で行う。
+   - 検証は #10 の security fixture で行う（下の「保証の検証」）。
 2. **workspace の外にあるファイルを、次の経路で読み書きさせない。**
    - `\input` / `\include` / `\openin` / `\openout` による読み書き
    - 画像の読み込み（`\includegraphics` / `\pdfximage`）
@@ -74,6 +74,26 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
 3. **host 由来の環境変数に依存しない。漏らさない**（env allowlist、§3.4）。
 4. **資源消費に上限を設ける。** 対象は wall-clock timeout、1 ファイルあたりの書き込みサイズ、output の合計サイズ、入力サイズ（§3.1〜3.3）。
 5. **timeout / cancel 時に子孫プロセスを残さない**（process group 単位の kill、§3.6）。
+
+### 保証の検証（#10）
+
+上の保証は、`crates/texrun-texlive/tests/` の integration test で、workspace の作成から engine の compile までを通して確認している。
+fixture は `tests/fixtures/security/` にあり、防御が効いていることを確かめる最小限の内容だけを置く。
+拒否を確かめる test では、同じ仕組みが許される場合（workspace 内への読み書きなど）の対照も実行し、fixture の誤りで「拒否された」ように見えることを防ぐ。
+CI の `integration` job で毎回実行する（[development.md](development.md#tex-live-integration-test)）。
+
+| 保証 | test |
+| --- | --- |
+| shell escape（`\write18` は `\immediate` あり・なしの両方、pipe による open）が実行されない | `security.rs`: `shell_escape_*` |
+| 入力・workspace・HOME（`~/.latexmkrc`、`~/.config/latexmk/latexmkrc`）の latexmk rc が読まれない（workspace へのコピーでも除外される） | `security.rs`: `rc_files_in_the_project_are_not_copied_or_read` |
+| 先頭行の format 指定が無視される | `security.rs`: `format_line_is_ignored`（対照: 先頭行を解釈させた pdflatex では同じ fixture が失敗する） |
+| pdflatex・bibtex・makeindex が shell を経由せずに起動される | `security.rs`: `auxiliary_tools_are_started_without_a_shell`、`latexmk.rs`: `no_shell_between_latexmk_and_pdflatex` |
+| `\input` / `\openin` / `\openout` で、絶対パスと `..` を含むパスが拒否される | `security.rs`: `input_*` / `openin_*` / `openout_*`（対照: `reading_inside_the_workspace_works` / `writing_inside_the_output_directory_works`） |
+| root 外を指す symlink で workspace を作れない | `security.rs`: `symlink_outside_the_root_is_rejected_before_compiling` |
+| timeout / cancel で子孫プロセスを残さない | `scenarios.rs`: `timeout`、`latexmk.rs`: `cancel_stops_the_whole_process_tree` |
+| 出力の上限 | `latexmk.rs`: `output_directory_limit_stops_the_compile` / `per_file_limit_stops_the_compile` |
+
+画像・bibtex の database・pdfTeX のファイル情報系 primitive の経路は、§6 の実験で確認したもので、fixture にはまだ含めていない。
 
 ### 保証しない（MVP の in-process 実行の限界）
 

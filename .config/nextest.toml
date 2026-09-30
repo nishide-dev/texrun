@@ -1,0 +1,12 @@
+# cargo-nextest configuration (used by the `test (linux)` / `test (macos)`
+# CI jobs, see CONTRIBUTING.md).
+
+# Tests that need TeX Live or a preview tool pass with a `SKIPPED ...` line
+# on stderr when the tool is missing (docs/development.md, "TeX Live
+# integration test"). nextest captures each test's output and hides it for
+# passing tests, so show it at the end of the run for those binaries.
+# nextest runs every test in its own process, so the line appears once per
+# skipped test rather than once per binary.
+[[profile.default.overrides]]
+filter = 'package(texrun-texlive) | binary(real_tools)'
+success-output = 'final'
