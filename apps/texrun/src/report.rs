@@ -126,7 +126,8 @@ pub struct CompileReport {
 pub struct Note {
     /// `warning` or `info`.
     pub severity: Severity,
-    /// Stable code: `parent_directory_input`, `broad_project_root`.
+    /// Stable code: `parent_directory_input`, `broad_project_root`,
+    /// `output_contains_entrypoint`.
     pub kind: &'static str,
     pub message: String,
     /// Already printed on stderr when it happened (human mode).
@@ -407,6 +408,7 @@ mod tests {
             kind::SIGNAL_SETUP,
             "parent_directory_input",
             "broad_project_root",
+            "output_contains_entrypoint",
         ] {
             assert!(
                 readme.contains(&format!("`{code}`")),

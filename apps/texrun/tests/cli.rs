@@ -879,6 +879,14 @@ fn nested_output_inside_the_project_is_not_copied_on_the_next_run() {
     fs::remove_dir_all(kept).unwrap();
 }
 
+/// The `output_contains_entrypoint` note of a JSON report, if any.
+fn contains_entrypoint_note(doc: &Value) -> Option<&Value> {
+    doc["notes"]
+        .as_array()?
+        .iter()
+        .find(|n| n["kind"] == "output_contains_entrypoint")
+}
+
 #[test]
 fn output_directory_containing_the_entrypoint_is_still_copied() {
     let env = Env::new(FAKE_SUCCEED);
@@ -898,6 +906,34 @@ fn output_directory_containing_the_entrypoint_is_still_copied() {
     let doc = json(&out);
     let excluded = doc["workspace"]["excluded"].as_array().unwrap();
     assert!(!excluded.iter().any(|e| e["path"] == "src"), "{excluded:?}");
+    let note = contains_entrypoint_note(&doc).unwrap_or_else(|| panic!("{doc:#}"));
+    assert_eq!(note["severity"], "info");
+
+    let out = env.run(&["compile", "--root", ".", "-o", "src", "src/doc.tex"]);
+    assert!(
+        stdout(&out).contains("note: the output directory src contains the entrypoint"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// Regression (PR #38 review S1): the entrypoint is a symlink into the
+/// output directory, so leaving that out would drop the document.
+#[test]
+fn output_directory_containing_the_entrypoint_through_a_symlink_is_copied() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.file("proj/a/b/real.tex", MINIMAL);
+    std::os::unix::fs::symlink("a/b/real.tex", env.path("proj/main.tex")).unwrap();
+    let args = ["compile", "--json", "-o", "a/b", "main.tex"];
+    let out = env.run(&args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = env.run(&args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let doc = json(&out);
+    assert!(doc.get("error").is_none(), "{doc:#}");
+    let excluded = doc["workspace"]["excluded"].as_array().unwrap();
+    assert!(!excluded.iter().any(|e| e["path"] == "a/b"), "{excluded:?}");
+    assert!(contains_entrypoint_note(&doc).is_some(), "{doc:#}");
 }
 
 #[test]

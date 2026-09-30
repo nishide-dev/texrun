@@ -135,7 +135,8 @@ fn execute(
     let output = output_dir(args);
     let existing_output =
         output::walk(&output, input.root(), false).map_err(|e| output_error(&output, e))?;
-    let config = workspace_config(args, &input, existing_output.as_deref());
+    let (config, note) = workspace_config(args, &input, existing_output.as_deref());
+    report.notes.extend(note);
 
     let engine =
         LatexmkEngine::new(LatexmkConfig::default().with_source_date_epoch(args.source_date_epoch));
@@ -424,40 +425,91 @@ fn check_root(root: &Path, explicit: bool) -> Result<Option<Note>, ErrorInfo> {
 /// Workspace settings: `--keep-workspace`, and earlier outputs are not
 /// copied back in: `texrun-out` anywhere, and the output directory
 /// (`existing_output`, its canonical path if it already exists) at any depth
-/// when it is inside the project root.
+/// when it is inside the project root. When the output directory cannot be
+/// left out because it contains the entrypoint, an info note says so.
 fn workspace_config(
     args: &CompileArgs,
     input: &ProjectInput,
     existing_output: Option<&Path>,
-) -> WorkspaceConfig {
+) -> (WorkspaceConfig, Option<Note>) {
     let mut config = WorkspaceConfig::default().with_keep(args.keep_workspace);
     config
         .excluded_names
         .push(DEFAULT_OUTPUT_DIR_NAME.to_owned());
-    if let Some(rel) = existing_output
-        .and_then(|dir| output_path_to_exclude(dir, input.root(), input.entrypoint()))
-    {
-        config.excluded_paths.push(rel);
-    }
-    config
+    let Some(dir) = existing_output else {
+        return (config, None);
+    };
+    let entrypoints = entrypoint_paths(input);
+    let note = match output_exclusion(dir, input.root(), &entrypoints) {
+        OutputExclusion::Exclude(rel) => {
+            config.excluded_paths.push(rel);
+            None
+        }
+        OutputExclusion::ContainsEntrypoint => Some(Note {
+            severity: Severity::Info,
+            kind: "output_contains_entrypoint",
+            message: format!(
+                "the output directory {} contains the entrypoint, so it is copied into the \
+                 workspace with the project, including the output of earlier runs; use an \
+                 output directory that does not contain the document to keep them out",
+                human::show(&output_dir(args))
+            ),
+            printed: false,
+        }),
+        OutputExclusion::NotInProject => None,
+    };
+    (config, note)
 }
 
-/// The output directory `dir` (canonical) relative to the project `root`
-/// (canonical), if it is inside the root and does not contain the
-/// entrypoint.
+/// The entrypoint relative to the project root as given and, if it differs,
+/// as resolved (the entrypoint or one of its directories may be a symlink
+/// to somewhere else inside the root; the workspace layer follows it).
+fn entrypoint_paths(input: &ProjectInput) -> Vec<WorkspacePath> {
+    let given = input.entrypoint().clone();
+    let resolved = fs::canonicalize(input.root().join(given.as_path()))
+        .ok()
+        .and_then(|real| WorkspacePath::from_path(real.strip_prefix(input.root()).ok()?).ok());
+    match resolved {
+        Some(real) if real != given => vec![given, real],
+        _ => vec![given],
+    }
+}
+
+/// What to do with the output directory when creating the workspace.
+#[derive(Debug, PartialEq, Eq)]
+enum OutputExclusion {
+    /// Leave out this path relative to the project root.
+    Exclude(WorkspacePath),
+    /// It contains (one of the paths of) the entrypoint, so it holds the
+    /// sources too and cannot be left out.
+    ContainsEntrypoint,
+    /// It is outside the project: nothing to do.
+    NotInProject,
+}
+
+/// Decides about the output directory `dir` (canonical) for the project
+/// `root` (canonical) with the entrypoint at `entrypoints` (see
+/// [`entrypoint_paths`]).
 ///
 /// Both paths are canonical, so `dir` is spelled as stored on disk; the
 /// workspace layer also matches other spellings of it (case, Unicode
-/// normalization). A directory that does not exist yet has nothing to
-/// copy. An output directory that contains the entrypoint (e.g. `-o .`)
-/// holds the sources too and cannot be left out.
-fn output_path_to_exclude(
-    dir: &Path,
-    root: &Path,
-    entrypoint: &WorkspacePath,
-) -> Option<WorkspacePath> {
-    let rel = WorkspacePath::from_path(dir.strip_prefix(root).ok()?).ok()?;
-    (!entrypoint.starts_with(&rel)).then_some(rel)
+/// normalization). A directory that does not exist yet has nothing to copy
+/// and is not passed here.
+fn output_exclusion(dir: &Path, root: &Path, entrypoints: &[WorkspacePath]) -> OutputExclusion {
+    let Ok(rel) = dir.strip_prefix(root) else {
+        return OutputExclusion::NotInProject;
+    };
+    if rel.as_os_str().is_empty() {
+        return OutputExclusion::ContainsEntrypoint;
+    }
+    let Ok(rel) = WorkspacePath::from_path(rel) else {
+        return OutputExclusion::NotInProject;
+    };
+    if entrypoints.iter().any(|e| e.starts_with(&rel)) {
+        OutputExclusion::ContainsEntrypoint
+    } else {
+        OutputExclusion::Exclude(rel)
+    }
 }
 
 /// What [`copy_artifacts`] did.
@@ -543,18 +595,26 @@ mod tests {
 
     #[test]
     fn output_inside_the_root_is_excluded_by_path() {
+        use OutputExclusion::{ContainsEntrypoint, Exclude, NotInProject};
         let root = Path::new("/p");
-        let entry = WorkspacePath::new("src/main.tex").unwrap();
-        let rel = |dir: &str| output_path_to_exclude(Path::new(dir), root, &entry);
-        let wp = |s: &str| Some(WorkspacePath::new(s).unwrap());
-        assert_eq!(rel("/p/build"), wp("build"));
-        assert_eq!(rel("/p/build/pdf"), wp("build/pdf"));
-        assert_eq!(rel("/p/src/texrun-out/a/b"), wp("src/texrun-out/a/b"));
-        assert_eq!(rel("/p/srcs"), wp("srcs"));
-        // Outside the root, the root itself, or containing the entrypoint.
-        assert_eq!(rel("/q/build"), None);
-        assert_eq!(rel("/pp/build"), None);
-        assert_eq!(rel("/p"), None);
-        assert_eq!(rel("/p/src"), None);
+        let wp = |s: &str| WorkspacePath::new(s).unwrap();
+        // `main.tex` is a symlink to `a/b/real.tex`.
+        let entries = [wp("src/main.tex"), wp("a/b/real.tex")];
+        let decide = |dir: &str| output_exclusion(Path::new(dir), root, &entries);
+        assert_eq!(decide("/p/build"), Exclude(wp("build")));
+        assert_eq!(decide("/p/build/pdf"), Exclude(wp("build/pdf")));
+        assert_eq!(
+            decide("/p/src/texrun-out/a/b"),
+            Exclude(wp("src/texrun-out/a/b"))
+        );
+        assert_eq!(decide("/p/srcs"), Exclude(wp("srcs")));
+        assert_eq!(decide("/p/a/bb"), Exclude(wp("a/bb")));
+        assert_eq!(decide("/q/build"), NotInProject);
+        assert_eq!(decide("/pp/build"), NotInProject);
+        // The root itself, or containing the entrypoint as given or resolved.
+        assert_eq!(decide("/p"), ContainsEntrypoint);
+        assert_eq!(decide("/p/src"), ContainsEntrypoint);
+        assert_eq!(decide("/p/a/b"), ContainsEntrypoint);
+        assert_eq!(decide("/p/a"), ContainsEntrypoint);
     }
 }

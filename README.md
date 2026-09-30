@@ -106,7 +106,10 @@ The workspace never contains VCS metadata, `texrun-out/`, `.texrun/`,
 precompiled formats or tool configuration such as `latexmkrc` (texrun never
 runs it; a warning is printed when one is left out). An `--output` directory
 inside the project is left out too, at any depth (reported with reason
-`excluded_path`), unless it contains the entrypoint. TeX cannot read files
+`excluded_path`; any other files kept there are not copied either), unless
+it contains the entrypoint (also through a symlink): then it is copied with
+the project, including the output of earlier runs, and an info note
+`output_contains_entrypoint` says so. TeX cannot read files
 above the entrypoint's directory (`\input{../x}`); keep the entrypoint in the
 project root.
 
@@ -182,9 +185,11 @@ without changing `schema_version`.
   `unsafe_output_path`, `io`.
 
 `notes[].kind` is one of `parent_directory_input` (a file above the
-entrypoint's directory was not found; `--root` does not help) and
+entrypoint's directory was not found; `--root` does not help),
 `broad_project_root` (an explicit `--root` is `$HOME` or a temporary
-directory).
+directory) and `output_contains_entrypoint` (the output directory contains
+the entrypoint, so it is not left out of the workspace and earlier outputs
+are copied into it).
 
 ### Exit codes
 
