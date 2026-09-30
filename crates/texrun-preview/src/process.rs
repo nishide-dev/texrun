@@ -2,13 +2,14 @@
 //!
 //! Supervision (cleared environment, own process group killed with
 //! `SIGKILL` on timeout / cancellation / an outgrown image and after every
-//! exit, kill-before-reap, bounded output, `prlimit(2)` on Linux) is that of
+//! exit, kill-before-reap, bounded output, resource limits) is that of
 //! `texrun-process`. This module adds the tool-specific values:
 //!
 //! - the environment allowlist (`PATH`, `HOME`, `LC_ALL`);
 //! - the working directory, held as a descriptor ([`ToolEnv::work`]);
-//! - on Linux, `RLIMIT_AS` and `RLIMIT_FSIZE` set right after the tool is
-//!   spawned ([`TOOL_ADDRESS_SPACE`], [`MIN_FILE_SIZE_LIMIT`]);
+//! - `RLIMIT_AS` and `RLIMIT_FSIZE` ([`TOOL_ADDRESS_SPACE`],
+//!   [`MIN_FILE_SIZE_LIMIT`]), set by the exec gate before the tool starts
+//!   (or, without a gate, right after it was spawned on Linux);
 //! - a watch on the size of the image being rendered.
 
 use std::ffi::OsString;
@@ -19,7 +20,9 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use texrun_core::CancelToken;
-use texrun_process::{Capture, Cwd, EnvAllowlist, Resource, Rlimits, Spec, Stop, Watch};
+use texrun_process::{
+    Capture, Cwd, EnvAllowlist, ExecGate, Resource, Rlimits, Spec, StartMode, Stop, Watch,
+};
 
 use crate::fsops;
 
@@ -28,21 +31,19 @@ pub(crate) const STDOUT_LIMIT: usize = 1024 * 1024;
 /// Kept prefix of stderr.
 pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
 
-/// Address space limit of one tool process on Linux (`RLIMIT_AS`): 2 GiB.
+/// Address space limit of one tool process (`RLIMIT_AS`, Linux only): 2 GiB.
 /// A 4096 x 4096 px page needs about 64 MiB of pixels; the rest is room for
 /// decoding embedded images.
 ///
-/// Best effort only: the limits are set with `prlimit(2)` after the tool was
-/// spawned ([`StartMode::Immediate`](texrun_process::StartMode::Immediate);
-/// there is no `pre_exec` without `unsafe`, and the tools cannot wait for a
-/// start signal). The gap until then is not bounded in time, what the tool
-/// allocates or writes in it is not undone, and a descendant started in it
-/// would stay unlimited (the tools start none). The primary bounds are the
-/// long-edge limit and the size polling; an exec gate that sets the limits
-/// before the tool starts is #41.
+/// With an exec gate ([`Previewer::with_exec_gate`](crate::Previewer::with_exec_gate),
+/// which the texrun CLI uses) the limits are set before the tool starts.
+/// Without one they are set with `prlimit(2)` after the tool was spawned
+/// ([`StartMode::Immediate`]), which is best effort only: the gap until then
+/// is not bounded in time, and what the tool allocates or writes in it is
+/// not undone (the tools start no descendants).
 pub(crate) const TOOL_ADDRESS_SPACE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Smallest `RLIMIT_FSIZE` given to a tool on Linux: 16 MiB. The tools may
+/// Smallest `RLIMIT_FSIZE` given to a tool: 16 MiB. The tools may
 /// write caches (e.g. fontconfig) into their private `HOME`, and hitting the
 /// limit kills them with `SIGXFSZ`, so it is never set below this even when
 /// the remaining image budget is smaller; the poll loop enforces the budget.
@@ -80,6 +81,8 @@ impl ToolEnv {
 /// What to watch while the tool runs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits<'a> {
+    /// Start the tool through this exec gate.
+    pub(crate) gate: Option<&'a ExecGate>,
     pub(crate) deadline: Instant,
     pub(crate) cancel: &'a CancelToken,
     /// Kill the tool if this file in [`ToolEnv::work`] grows beyond this
@@ -103,6 +106,9 @@ pub(crate) struct RunOutput {
     pub(crate) end: RunEnd,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    /// Why the exec gate was not used for this run
+    /// ([`texrun_process::Finished::gate_fallback`]).
+    pub(crate) gate_fallback: Option<String>,
 }
 
 impl RunOutput {
@@ -111,6 +117,7 @@ impl RunOutput {
             end,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            gate_fallback: None,
         }
     }
 
@@ -158,7 +165,10 @@ pub(crate) fn run(
                 // `SIGXFSZ` dumps core by default; like the TeX engine,
                 // never leave core files behind.
                 .with(Resource::Core, 0),
-        );
+        )
+        .with_start(limits.gate.map_or(StartMode::Immediate, |gate| {
+            StartMode::ExecGate(gate.clone())
+        }));
 
     let mut watch = Watch::new()
         .with_deadline(limits.deadline)
@@ -181,6 +191,7 @@ pub(crate) fn run(
             },
             stdout: done.stdout.bytes,
             stderr: done.stderr.bytes,
+            gate_fallback: done.gate_fallback,
         },
         // The notice names the program already.
         Err(texrun_process::RunError::Spawn { source, .. }) => {

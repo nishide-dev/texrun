@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use texrun_core::{Artifact, ArtifactKind, WorkspacePath};
+use texrun_process::ExecGate;
 
 use crate::backend::Invocation;
 use crate::error::PreviewError;
@@ -19,6 +20,17 @@ use crate::report::{
     NoticeKind, PageInfo, PagePreview, PdfInfo, PreviewNotice, PreviewReport, PreviewStatus,
 };
 use crate::tools::{Backend, Toolset};
+
+/// The notice for tools started without the exec gate because of `reason`.
+fn fallback_notice(reason: &str) -> PreviewNotice {
+    PreviewNotice::warning(
+        NoticeKind::ResourceLimits,
+        format!(
+            "the resource limits of the preview tools are set only after they start \
+             (best effort), because the exec gate cannot be used ({reason})"
+        ),
+    )
+}
 
 /// Characters of tool stderr kept in a notice.
 const DETAIL_CHARS: usize = 2000;
@@ -32,12 +44,31 @@ const PIXEL_SLACK: u32 = 2;
 #[derive(Debug, Clone)]
 pub struct Previewer {
     tools: Toolset,
+    gate: Option<ExecGate>,
 }
 
 impl Previewer {
     /// Uses the tools of `tools`.
     pub fn new(tools: Toolset) -> Self {
-        Self { tools }
+        Self { tools, gate: None }
+    }
+
+    /// Starts the tools through `gate`, which sets their resource limits
+    /// before they start (docs/security.md §3.2; see
+    /// [`StartMode::ExecGate`](texrun_process::StartMode::ExecGate)).
+    ///
+    /// Without a gate the limits are set with `prlimit(2)` right after each
+    /// tool was spawned (Linux only, best effort). If `gate` cannot be used
+    /// ([`ExecGate::check`]), the report says so with a
+    /// [`NoticeKind::ResourceLimits`] warning, and
+    ///
+    /// - with [`ExecGate::with_required`], no tool is run: the status is
+    ///   [`PreviewStatus::Skipped`] (the texrun CLI does this);
+    /// - otherwise the tools run with the best-effort limits above.
+    #[must_use]
+    pub fn with_exec_gate(mut self, gate: ExecGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Uses the tools found on this process's `PATH`.
@@ -101,8 +132,25 @@ impl Previewer {
             }
         };
         report.backend = Some(backend.kind());
+        if let Some(gate) = &self.gate
+            && let Err(reason) = gate.check()
+        {
+            if gate.is_required() {
+                report.push(PreviewNotice::warning(
+                    NoticeKind::ResourceLimits,
+                    format!(
+                        "previews were not rendered: the preview tools must start with \
+                         their resource limits in place, but the exec gate cannot be \
+                         used ({reason})"
+                    ),
+                ));
+                return Ok(report);
+            }
+            report.push(fallback_notice(&reason));
+        }
         let mut run = Run {
             backend,
+            gate: self.gate.as_ref(),
             options,
             deadline: Instant::now() + options.timeout,
             report,
@@ -116,6 +164,7 @@ impl Previewer {
 
 struct Run<'a> {
     backend: Backend<'a>,
+    gate: Option<&'a ExecGate>,
     options: &'a PreviewOptions,
     deadline: Instant,
     report: PreviewReport,
@@ -246,18 +295,36 @@ impl Run<'_> {
         }
     }
 
-    fn invoke(&self, inv: &Invocation<'_>, env: &ToolEnv, watch: Option<(&str, u64)>) -> RunOutput {
-        process::run(
+    fn invoke(
+        &mut self,
+        inv: &Invocation<'_>,
+        env: &ToolEnv,
+        watch: Option<(&str, u64)>,
+    ) -> RunOutput {
+        let out = process::run(
             inv.program,
             &inv.args,
             env,
             watch.is_none(),
             Limits {
+                gate: self.gate,
                 deadline: self.deadline,
                 cancel: &self.options.cancel,
                 watch,
             },
-        )
+        );
+        // Reported once per preview run (e.g. the gate disappeared since the
+        // check up front).
+        if let Some(reason) = &out.gate_fallback
+            && !self
+                .report
+                .notices
+                .iter()
+                .any(|n| n.kind == NoticeKind::ResourceLimits)
+        {
+            self.report.push(fallback_notice(reason));
+        }
+        out
     }
 
     /// Turns a run that did not exit on its own into a notice. Returns `true`

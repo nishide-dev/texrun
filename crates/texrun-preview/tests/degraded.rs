@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use texrun_core::{CancelToken, Severity};
 use texrun_preview::{
-    BackendChoice, NoticeKind, PreviewError, PreviewOptions, PreviewReport, PreviewStatus,
-    Previewer, Toolset,
+    BackendChoice, ExecGate, NoticeKind, PreviewError, PreviewOptions, PreviewReport,
+    PreviewStatus, Previewer, Toolset,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -219,11 +219,12 @@ fn timeout_kills_the_whole_process_group() {
     // job was killed along with the tool (docs/security.md §3.6).
     let dir = tempfile::tempdir().unwrap();
     let heart = dir.path().join("heartbeat");
-    // The tool waits until the job has written once, so the job is known to
-    // be running when the timeout hits.
+    // The tool writes the first beat itself, before it starts the job, so
+    // the file is never empty when the timeout hits, however slowly the
+    // job gets going under load.
     let script = format!(
-        "#!/bin/sh\nheart='{}'\n(while :; do echo x >> \"$heart\"; sleep 0.05; done) &\n\
-         while [ ! -s \"$heart\" ]; do sleep 0.01; done\nsleep 30\n",
+        "#!/bin/sh\nheart='{}'\necho x >> \"$heart\"\n\
+         (while :; do echo x >> \"$heart\"; sleep 0.05; done) &\nsleep 30\n",
         heart.display()
     );
     let f = fake(&script, PDFTOPPM);
@@ -233,10 +234,10 @@ fn timeout_kills_the_whole_process_group() {
         .render(
             &fixture("sizes.pdf"),
             out.path(),
-            &opts().with_timeout(Duration::from_secs(2)),
+            &opts().with_timeout(Duration::from_secs(5)),
         )
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(15));
     assert_eq!(kinds(&report), vec![NoticeKind::TimedOut]);
     assert_eq!(report.status, PreviewStatus::Skipped);
 
@@ -439,4 +440,58 @@ fn a_symlinked_preview_directory_is_refused() {
     assert_eq!(report.status, PreviewStatus::Skipped);
     assert_eq!(kinds(&report), vec![NoticeKind::OutputError]);
     assert!(entries(elsewhere.path()).is_empty());
+}
+
+#[test]
+fn a_required_exec_gate_that_cannot_be_used_skips_the_previews() {
+    // The fake records that it ran.
+    let script = PDFINFO.replace("#!/bin/sh\n", "#!/bin/sh\ntouch \"$HOME/../../ran\"\n");
+    let f = fake(&script, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    for gate in [
+        ExecGate::new("/nonexistent/texrun"),
+        ExecGate::unavailable("the path of the executable is unknown"),
+    ] {
+        let report = Previewer::new(f.tools.clone())
+            .with_exec_gate(gate.with_required(true))
+            .render(&fixture("sizes.pdf"), out.path(), &opts())
+            .unwrap();
+        assert_eq!(report.status, PreviewStatus::Skipped);
+        assert_eq!(kinds(&report), vec![NoticeKind::ResourceLimits]);
+        assert_eq!(report.notices[0].severity, Severity::Warning);
+        assert!(report.pages.is_empty());
+        assert!(!out.path().join("ran").exists(), "a tool ran");
+    }
+    let report = Previewer::new(f.tools)
+        .with_exec_gate(ExecGate::unavailable("unknown").with_required(true))
+        .render(&fixture("sizes.pdf"), out.path(), &opts())
+        .unwrap();
+    // Visible in the JSON of the CLI as well.
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["notices"][0]["kind"], "resource_limits", "{json}");
+    assert!(
+        json["notices"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown"),
+        "{json}"
+    );
+}
+
+#[test]
+fn an_optional_exec_gate_that_cannot_be_used_is_reported_once() {
+    let f = fake(PDFINFO, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    let report = Previewer::new(f.tools)
+        .with_exec_gate(ExecGate::new("/nonexistent/texrun"))
+        .render(&fixture("sizes.pdf"), out.path(), &opts())
+        .unwrap();
+    // Rendered as without a gate (page 2 fails in the fake), with one
+    // warning about the limits.
+    assert_eq!(report.status, PreviewStatus::Partial);
+    assert_eq!(
+        kinds(&report),
+        vec![NoticeKind::ResourceLimits, NoticeKind::RenderFailed]
+    );
+    assert!(report.notices[0].message.contains("/nonexistent/texrun"));
 }

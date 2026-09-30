@@ -346,6 +346,7 @@ fn render_previews(
     let pdf = output_root.join(pdf.path.as_path());
     // Options were validated up front; `render` cannot fail otherwise.
     Previewer::detect()
+        .with_exec_gate(crate::gate::exec_gate())
         .render(&pdf, &output_root, &options)
         .ok()
 }

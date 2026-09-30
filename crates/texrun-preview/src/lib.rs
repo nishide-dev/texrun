@@ -65,10 +65,11 @@
 //! cleared environment (`PATH` with only its absolute entries, `LC_ALL=C` and
 //! a private empty `HOME`), in their own process group that is killed with
 //! `SIGKILL` on timeout, cancellation or when an image outgrows the remaining
-//! size budget. On Linux, `RLIMIT_AS` (2 GiB) and `RLIMIT_FSIZE` are set on
-//! each tool with `prlimit(2)` right after it is spawned; macOS has no
-//! `prlimit`, so there only the limits above apply and a tool's memory use is
-//! not capped. Tool output is parsed defensively. Images are written to a
+//! size budget. `RLIMIT_FSIZE`, `RLIMIT_CORE` and (Linux only) `RLIMIT_AS`
+//! (2 GiB) are set on each tool before it starts, by an exec gate
+//! ([`Previewer::with_exec_gate`]; the texrun CLI hosts one). Without a gate
+//! they are set with `prlimit(2)` right after the spawn (best effort, Linux
+//! only). A tool's memory use is not capped on macOS. Tool output is parsed defensively. Images are written to a
 //! private scratch directory (created with `mkdirat` below the output root
 //! and held open; the tools run in its held `work` directory), checked
 //! (regular file, PNG header, size and
@@ -103,4 +104,6 @@ pub use report::{
     BackendKind, ImageFormat, NoticeKind, PageInfo, PagePreview, PdfInfo, PreviewNotice,
     PreviewReport, PreviewStatus,
 };
+/// The exec gate for [`Previewer::with_exec_gate`] (from `texrun-process`).
+pub use texrun_process::ExecGate;
 pub use tools::{MUTOOL, PDFINFO, PDFTOPPM, Toolset};

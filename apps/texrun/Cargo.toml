@@ -19,6 +19,8 @@ serde_json.workspace = true
 signal-hook.workspace = true
 texrun-core.workspace = true
 texrun-preview.workspace = true
+# The exec gate hosted by `texrun __exec-gate`.
+texrun-process.workspace = true
 texrun-texlive.workspace = true
 texrun-workspace.workspace = true
 

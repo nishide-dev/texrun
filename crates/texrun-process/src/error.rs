@@ -28,6 +28,12 @@ pub enum RunError {
     /// `prlimit(2)`.
     #[error("unsupported on this platform: {0}")]
     Unsupported(String),
+    /// The exec gate ([`StartMode::ExecGate`](crate::StartMode::ExecGate))
+    /// could not be started, or ended without starting the program for a
+    /// reason other than a failed `exec` ([`RunError::Spawn`]) or limit
+    /// ([`RunError::Io`]).
+    #[error("exec gate: {0}")]
+    ExecGate(String),
     /// Another operation on the child failed (preparing its working
     /// directory, setting a limit, waiting for it).
     #[error("{context}: {source}")]

@@ -10,8 +10,9 @@ rust-version.workspace = true
 [dependencies]
 texrun-core.workspace = true
 thiserror.workspace = true
-# Unix only: process groups, `killpg`, `waitid`, `prlimit` and `fstat`.
-rustix = { workspace = true, features = ["fs", "process"] }
+# Unix only: process groups, `killpg`, `waitid`, `prlimit` / `setrlimit`,
+# `fstat`, and the socket and stdin redirection of the exec gate.
+rustix = { workspace = true, features = ["fs", "net", "process", "stdio"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,12 +1,15 @@
-//! Resource limits set on the child with `prlimit(2)` (docs/security.md
-//! §3.2).
+//! Resource limits, set on the child with `prlimit(2)` from the parent or
+//! by the exec gate on itself with `setrlimit(2)` (docs/security.md §3.2).
 
 use std::io;
 
-/// Whether [`Rlimits`] are applied on this platform (`prlimit(2)` exists on
-/// Linux only). Elsewhere they are ignored, and a
-/// [`StartMode::StdinGate`](crate::StartMode::StdinGate) only delays the
-/// start.
+/// Whether the parent can set [`Rlimits`] on a running child on this
+/// platform (`prlimit(2)` exists on Linux only), as done for
+/// [`StartMode::Immediate`](crate::StartMode::Immediate) and
+/// [`StartMode::StdinGate`](crate::StartMode::StdinGate). Elsewhere they
+/// are not applied in those modes, and a `StdinGate` only delays the start.
+/// The exec gate ([`StartMode::ExecGate`](crate::StartMode::ExecGate)) does
+/// not need it.
 pub const PRLIMIT_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 /// A resource that can be limited.
@@ -20,6 +23,11 @@ pub enum Resource {
     /// `RLIMIT_CORE`: largest core file, in bytes (0: none).
     Core,
     /// `RLIMIT_AS`: address space, in bytes.
+    ///
+    /// Linux only: macOS refuses values below the address space a process
+    /// has already mapped (which is large for every process there) and
+    /// does not enforce it, so it is never set on macOS (see
+    /// [`Finished::rlimits_applied`](crate::Finished::rlimits_applied)).
     AddressSpace,
     /// `RLIMIT_CPU`: CPU time, in seconds (#25). Exceeding it raises
     /// `SIGXCPU`, whose default action dumps core, so combine it with
@@ -98,7 +106,6 @@ pub(crate) fn apply(pid: rustix::process::Pid, limits: &Rlimits) -> io::Result<(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn to_rustix(resource: Resource) -> rustix::process::Resource {
     use rustix::process::Resource as R;
     match resource {
@@ -108,6 +115,58 @@ fn to_rustix(resource: Resource) -> rustix::process::Resource {
         Resource::Cpu => R::Cpu,
         Resource::Processes => R::Nproc,
     }
+}
+
+/// Whether `resource` can be set on this platform (by `prlimit` or by the
+/// exec gate). See [`Resource::AddressSpace`].
+pub(crate) const fn settable(resource: Resource) -> bool {
+    match resource {
+        Resource::AddressSpace => !cfg!(target_vendor = "apple"),
+        Resource::FileSize | Resource::Core | Resource::Cpu | Resource::Processes => true,
+    }
+}
+
+/// Sets `resource` of this process to `value` (soft and hard), capped at
+/// its current hard limit. Used by the exec gate.
+pub(crate) fn set_own(resource: Resource, value: u64) -> io::Result<()> {
+    use rustix::process::{Rlimit, getrlimit, setrlimit};
+
+    let resource = to_rustix(resource);
+    let value = getrlimit(resource)
+        .maximum
+        .map_or(value, |hard| hard.min(value));
+    setrlimit(
+        resource,
+        Rlimit {
+            current: Some(value),
+            maximum: Some(value),
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// The name of `resource` on the exec gate's command line.
+pub(crate) const fn gate_name(resource: Resource) -> &'static str {
+    match resource {
+        Resource::FileSize => "fsize",
+        Resource::Core => "core",
+        Resource::AddressSpace => "as",
+        Resource::Cpu => "cpu",
+        Resource::Processes => "nproc",
+    }
+}
+
+/// The resource called `name` on the exec gate's command line.
+pub(crate) fn from_gate_name(name: &str) -> Option<Resource> {
+    [
+        Resource::FileSize,
+        Resource::Core,
+        Resource::AddressSpace,
+        Resource::Cpu,
+        Resource::Processes,
+    ]
+    .into_iter()
+    .find(|&r| gate_name(r) == name)
 }
 
 /// No `prlimit(2)`: nothing is applied (see [`PRLIMIT_SUPPORTED`]).
