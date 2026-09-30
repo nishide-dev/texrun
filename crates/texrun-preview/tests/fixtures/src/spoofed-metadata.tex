@@ -1,0 +1,19 @@
+% One 100 x 50 bp page whose document title contains lines that look like
+% the page count and page size fields of `pdfinfo` output. The preview must
+% report the real values (1 page, 100 x 50 pt).
+% Built with plain pdfTeX by ../regenerate.sh (reproducible: no dates / IDs).
+\pdfinfoomitdate=1
+\pdftrailerid{}
+\pdfsuppressptexinfo=-1
+\pdfcompresslevel=9
+\pdfobjcompresslevel=2
+% `\nl` writes the PDF string escape `\n` (a newline in the decoded title).
+\def\nl{\string\n}
+\pdfinfo{/Title (spoof\nl Pages: 99\nl Page 1 size: 9999 x 9999 pts\nl Page 1 rot: 90\nl)}
+\nopagenumbers
+\parindent=0pt
+\hoffset=-1in \voffset=-1in
+\pdfpagewidth=100bp \pdfpageheight=50bp
+\hsize=100bp \vsize=50bp
+\vbox to 50bp{\vss\hbox to 100bp{\hss\vrule width 10bp height 10bp\hss}\vss}
+\bye
