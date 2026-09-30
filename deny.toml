@@ -1,0 +1,47 @@
+# cargo-deny configuration.
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally with: cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database. Vulnerabilities are always errors.
+# Unmaintained crates are reported for the whole dependency graph.
+unmaintained = "all"
+yanked = "deny"
+# Add entries as { id = "RUSTSEC-YYYY-NNNN", reason = "..." } only with a reason.
+ignore = []
+
+[licenses]
+# texrun is MIT licensed. Only permissive licenses compatible with MIT
+# distribution are allowed. Copyleft licenses (GPL/LGPL/MPL/...) are rejected.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Keep the allow list stable even if no current dependency uses an entry.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate versions are reported but do not fail the build; they are often
+# unavoidable transitively (e.g. windows-sys). Revisit if it becomes noisy.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal path dependencies are allowed without a version.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
