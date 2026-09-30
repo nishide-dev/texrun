@@ -32,6 +32,8 @@ rustix = { version = "1.1.5", features = ["fs"] }
 tempfile = "3.27"
 unicode-normalization = "0.1.25"
 thiserror = "2.0.21"
+# Only the signal iterator (SIGINT / SIGTERM / SIGHUP -> CancelToken).
+signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
 
 # Dev-only external crates
 # `std` only: no fork / timeout support (and their tempfile / wait-timeout deps).
