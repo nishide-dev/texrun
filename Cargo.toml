@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["apps/texrun", "crates/texrun-core", "crates/texrun-workspace"]
+members = [
+    "apps/texrun",
+    "crates/texrun-core",
+    "crates/texrun-latex-log",
+    "crates/texrun-workspace",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +17,7 @@ rust-version = "1.98"
 [workspace.dependencies]
 # Internal crates
 texrun-core = { path = "crates/texrun-core", version = "0.1.0" }
+texrun-latex-log = { path = "crates/texrun-latex-log", version = "0.1.0" }
 texrun-workspace = { path = "crates/texrun-workspace", version = "0.1.0" }
 
 # External crates (add only when an issue actually needs them)
@@ -22,6 +28,10 @@ rustix = { version = "1.1.5", features = ["fs"] }
 tempfile = "3.27"
 unicode-normalization = "0.1.25"
 thiserror = "2.0.21"
+
+# Dev-only external crates
+# `std` only: no fork / timeout support (and their tempfile / wait-timeout deps).
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

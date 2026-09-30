@@ -1,7 +1,7 @@
 //! Structured diagnostics.
 //!
-//! Only the data model lives here; extracting diagnostics from engine logs is
-//! implemented separately (#7).
+//! Only the data model lives here; extracting diagnostics from TeX logs is
+//! implemented in the `texrun-latex-log` crate.
 
 use serde::{Deserialize, Serialize};
 
