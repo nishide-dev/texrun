@@ -1,10 +1,10 @@
 //! The typesetting engine interface.
 
 use std::io;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::CompileContext;
 use crate::request::CompileRequest;
 use crate::result::CompileResult;
 
@@ -42,7 +42,8 @@ impl EngineInfo {
 /// A document error (the engine ran and reported errors) or a timeout is a
 /// [`CompileResult`] with outcome
 /// [`Failed`](crate::CompileOutcome::Failed) /
-/// [`TimedOut`](crate::CompileOutcome::TimedOut). An `EngineError` means no
+/// [`TimedOut`](crate::CompileOutcome::TimedOut) /
+/// [`Cancelled`](crate::CompileOutcome::Cancelled). An `EngineError` means no
 /// meaningful result could be produced at all.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -75,8 +76,9 @@ pub enum EngineError {
         #[source]
         source: io::Error,
     },
-    /// The request is not valid for this workspace (e.g. the entrypoint does
-    /// not exist).
+    /// The request is invalid, either in itself (see
+    /// [`CompileRequest::validate`]) or for this workspace (e.g. the
+    /// entrypoint does not exist).
     #[error("invalid compile request: {0}")]
     InvalidRequest(String),
     /// The request uses an option this engine does not support.
@@ -137,19 +139,32 @@ pub trait TypesetEngine: Send + Sync {
         Ok(self.info())
     }
 
-    /// Compiles `request` inside `workspace`.
+    /// Compiles `request` inside the workspace given by `ctx`.
     ///
-    /// `workspace` is the host directory of a workspace prepared by the
-    /// caller; every path in `request` and in the returned result is relative
-    /// to it. The engine must honour
-    /// [`CompileOptions::timeout`](crate::CompileOptions::timeout) and report
-    /// expiry as [`CompileOutcome::TimedOut`](crate::CompileOutcome::TimedOut).
+    /// Contract for implementations:
     ///
-    /// Returns `Ok` for every completed attempt — including document errors
-    /// and timeouts — and `Err` only when the attempt could not be carried out.
+    /// - call [`CompileRequest::validate`] first;
+    /// - resolve request paths against
+    ///   [`CompileContext::workspace`] and write outputs below
+    ///   [`CompileOptions::output_dir`](crate::CompileOptions::output_dir);
+    /// - report [`Artifact`](crate::Artifact) paths relative to that output
+    ///   directory and [`Diagnostic`](crate::Diagnostic) files relative to the
+    ///   workspace root;
+    /// - pass paths to subprocesses via
+    ///   [`WorkspacePath::to_cli_arg`](crate::WorkspacePath::to_cli_arg) (or an
+    ///   absolute path), never as a bare string that may start with `-`;
+    /// - honour [`CompileOptions::timeout`](crate::CompileOptions::timeout)
+    ///   and [`CompileContext::cancel`], reporting them as
+    ///   [`CompileOutcome::TimedOut`](crate::CompileOutcome::TimedOut) /
+    ///   [`CompileOutcome::Cancelled`](crate::CompileOutcome::Cancelled) and
+    ///   leaving no child processes behind.
+    ///
+    /// Returns `Ok` for every completed attempt — including document errors,
+    /// timeouts and cancellation — and `Err` only when the attempt could not
+    /// be carried out.
     fn compile(
         &self,
-        workspace: &Path,
+        ctx: &CompileContext<'_>,
         request: &CompileRequest,
     ) -> Result<CompileResult, EngineError>;
 }

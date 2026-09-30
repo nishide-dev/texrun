@@ -15,6 +15,10 @@ use crate::schema::duration_ms;
 /// logs and artifacts. Failures of texrun or the engine infrastructure itself
 /// (engine missing, cannot spawn, ...) are reported as
 /// [`EngineError`](crate::EngineError) instead.
+///
+/// There is no fallback variant: the Rust `Deserialize` impl is meant for
+/// round-tripping documents of the same schema version and rejects unknown
+/// values. Non-Rust consumers must tolerate unknown values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -26,6 +30,10 @@ pub enum CompileOutcome {
     /// The compile exceeded its time limit and was stopped. Diagnostics and
     /// artifacts collected up to that point are still reported.
     TimedOut,
+    /// The compile was stopped because the caller requested cancellation via
+    /// [`CancelToken`](crate::CancelToken). Partial output is reported as for
+    /// [`CompileOutcome::TimedOut`].
+    Cancelled,
 }
 
 /// Termination information of the engine process, when the engine is a
@@ -75,6 +83,11 @@ impl From<std::process::ExitStatus> for ProcessExit {
 
 /// The result of a completed compile attempt.
 ///
+/// Path bases: [`Artifact::path`] is relative to the output root and
+/// [`Diagnostic::file`] to the workspace root (see their docs). This type never
+/// contains host paths, so it stays valid after the temporary workspace is
+/// cleaned up; turning paths into host locations is the caller's job (#6).
+///
 /// `#[non_exhaustive]`: construct with [`CompileResult::new`], then set or push
 /// into the public fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +107,8 @@ pub struct CompileResult {
     /// could not be parsed; the raw log is still available as an artifact).
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
-    /// Produced files, including the raw log ([`ArtifactKind::Log`]).
+    /// Produced files, including the raw log ([`ArtifactKind::Log`]), relative
+    /// to the output root.
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
 }
@@ -134,9 +148,18 @@ impl CompileResult {
 
     /// Diagnostics with [`Severity::Error`].
     pub fn errors(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.diagnostics_of(Severity::Error)
+    }
+
+    /// Diagnostics with [`Severity::Warning`].
+    pub fn warnings(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.diagnostics_of(Severity::Warning)
+    }
+
+    fn diagnostics_of(&self, severity: Severity) -> impl Iterator<Item = &Diagnostic> {
         self.diagnostics
             .iter()
-            .filter(|d| d.severity == Severity::Error)
+            .filter(move |d| d.severity == severity)
     }
 }
 
@@ -166,7 +189,7 @@ mod tests {
         ));
         r.artifacts.push(Artifact::new(
             ArtifactKind::Log,
-            WorkspacePath::new("out/main.log").unwrap(),
+            WorkspacePath::new("main.log").unwrap(),
         ));
         r
     }
@@ -186,7 +209,7 @@ mod tests {
                     { "severity": "warning", "kind": "overfull_box",
                       "message": "Overfull \\hbox" }
                 ],
-                "artifacts": [ { "kind": "log", "path": "out/main.log" } ]
+                "artifacts": [ { "kind": "log", "path": "main.log" } ]
             })
         );
     }
@@ -204,6 +227,7 @@ mod tests {
             (CompileOutcome::Succeeded, "succeeded"),
             (CompileOutcome::Failed, "failed"),
             (CompileOutcome::TimedOut, "timed_out"),
+            (CompileOutcome::Cancelled, "cancelled"),
         ] {
             assert_eq!(serde_json::to_value(outcome).unwrap(), json!(text));
         }
@@ -213,9 +237,14 @@ mod tests {
     fn accessors() {
         let r = sample();
         assert!(!r.is_success());
-        assert_eq!(r.log().unwrap().path.as_str(), "out/main.log");
+        assert_eq!(r.log().unwrap().path.as_str(), "main.log");
         assert!(r.pdf().is_none());
         assert_eq!(r.errors().count(), 1);
+        assert_eq!(r.warnings().count(), 1);
+        assert_eq!(
+            r.warnings().next().unwrap().kind,
+            DiagnosticKind::OverfullBox
+        );
     }
 
     #[cfg(unix)]

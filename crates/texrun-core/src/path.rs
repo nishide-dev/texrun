@@ -1,10 +1,17 @@
 //! Workspace-relative paths.
 //!
-//! Every path that crosses the core API (entrypoints, artifacts, diagnostic
-//! locations) is expressed relative to the compile workspace. [`WorkspacePath`]
-//! enforces this *lexically* at construction time: absolute paths, drive
+//! Every path that crosses the core API is relative, never a host path:
+//!
+//! - entrypoints, [`CompileOptions::output_dir`](crate::CompileOptions::output_dir)
+//!   and [`Diagnostic::file`](crate::Diagnostic::file) are relative to the
+//!   workspace root (= the input project root);
+//! - [`Artifact::path`](crate::Artifact::path) is relative to the output root.
+//!
+//! Resolving them to host paths is up to the layer that knows the host
+//! locations (the workspace layer #4 and the CLI #6). [`WorkspacePath`]
+//! enforces relativity *lexically* at construction time: absolute paths, drive
 //! prefixes and `..` components are rejected, so a value of this type can never
-//! name a location outside the workspace by itself.
+//! name a location outside its base directory by itself.
 //!
 //! Filesystem-level concerns such as symlinks pointing outside the workspace
 //! cannot be decided without touching the disk and are handled by the
@@ -30,7 +37,8 @@ pub enum WorkspacePathError {
     /// The path contains a `..` component.
     #[error("workspace path must not contain `..`: {0:?}")]
     ParentTraversal(String),
-    /// The path contains a character that is not allowed (NUL or `\`).
+    /// The path contains a character that is not allowed (a control
+    /// character or `\`).
     #[error("workspace path contains a forbidden character {ch:?}: {path:?}")]
     ForbiddenCharacter {
         /// The offending path.
@@ -49,14 +57,31 @@ pub enum WorkspacePathError {
 ///
 /// - non-empty and relative (no leading `/`, no Windows drive or UNC prefix);
 /// - no `..` components;
-/// - no NUL or `\` characters (`\` is rejected so the meaning of a path does
-///   not depend on the host platform);
+/// - no control characters (C0, DEL, C1): they would allow terminal escape
+///   injection when paths are displayed and cannot be reported reliably in
+///   `file:line:` style logs;
+/// - no `\` (rejected so the meaning of a path does not depend on the host
+///   platform);
 /// - valid UTF-8, so it serializes losslessly to JSON.
 ///
 /// The stored form uses `/` as separator with `.` and empty components removed,
 /// e.g. `./chapters//intro.tex` is stored as `chapters/intro.tex`.
 ///
-/// Serialized as a plain JSON string; deserialization re-validates.
+/// Equality, ordering and hashing compare the stored bytes. No Unicode
+/// normalization is applied, so `caf\u{e9}.tex` and `cafe\u{301}.tex` are
+/// different values even though some filesystems (e.g. APFS) treat them as
+/// the same file.
+///
+/// A path may begin with `-` (e.g. `-draft.tex`), which a command-line tool
+/// would parse as an option. When passing a path as a process argument, use
+/// [`WorkspacePath::to_cli_arg`] instead of [`WorkspacePath::as_str`].
+///
+/// What a path is relative to depends on where it appears (the workspace root
+/// for inputs and diagnostics, the output root for artifacts); see the
+/// documentation of the containing field.
+///
+/// Serialized as a plain JSON string; deserialization re-validates and
+/// normalizes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct WorkspacePath(String);
@@ -64,7 +89,7 @@ pub struct WorkspacePath(String);
 impl WorkspacePath {
     /// Validates and normalizes `path`.
     pub fn new(path: &str) -> Result<Self, WorkspacePathError> {
-        if let Some(ch) = path.chars().find(|c| matches!(c, '\0' | '\\')) {
+        if let Some(ch) = path.chars().find(|&c| c.is_control() || c == '\\') {
             return Err(WorkspacePathError::ForbiddenCharacter {
                 path: path.to_owned(),
                 ch,
@@ -104,14 +129,24 @@ impl WorkspacePath {
         Self::new(text)
     }
 
-    /// Returns the normalized `/`-separated form.
+    /// Returns the normalized `/`-separated form. May start with `-`; see
+    /// [`WorkspacePath::to_cli_arg`].
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Returns the path as a [`Path`] (still relative; join it onto a root).
+    /// Returns the path as a [`Path`] (still relative; join it onto a root, or
+    /// use [`WorkspaceRoot::resolve`](crate::WorkspaceRoot::resolve)).
     pub fn as_path(&self) -> &Path {
         Path::new(&self.0)
+    }
+
+    /// Returns the path prefixed with `./`, safe to pass as a positional
+    /// process argument (it can never be mistaken for an option such as
+    /// `-shell-escape`). Engines building argv (#5) must use this for
+    /// relative paths.
+    pub fn to_cli_arg(&self) -> String {
+        format!("./{}", self.0)
     }
 
     /// Returns the final component.
@@ -138,6 +173,10 @@ impl WorkspacePath {
 }
 
 /// `C:`, `c:foo` etc. — meaningful as a drive prefix on Windows.
+///
+/// This is only a guard against Windows-style absolute input being accepted by
+/// mistake; it checks the start of the path only. `:` elsewhere (`a/C:b`,
+/// `main.tex:ads`) is allowed, since Windows hosts are not supported.
 fn has_drive_prefix(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -247,6 +286,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_control_characters() {
+        for (input, ch) in [
+            ("a\nb.tex", '\n'),
+            ("a\tb.tex", '\t'),
+            ("\u{1b}[31mx.tex", '\u{1b}'),
+            ("a\u{7f}.tex", '\u{7f}'),
+            ("a\u{85}.tex", '\u{85}'),
+        ] {
+            assert_eq!(
+                WorkspacePath::new(input),
+                Err(WorkspacePathError::ForbiddenCharacter {
+                    path: input.to_owned(),
+                    ch
+                }),
+                "{input:?}"
+            );
+        }
+        assert!(serde_json::from_str::<WorkspacePath>(r#""a\u001b.tex""#).is_err());
+    }
+
+    #[test]
+    fn allows_leading_dash_but_cli_arg_neutralizes_it() {
+        let p = wp("-shell-escape");
+        assert_eq!(p.as_str(), "-shell-escape");
+        assert_eq!(p.to_cli_arg(), "./-shell-escape");
+        assert_eq!(wp("sub/main.tex").to_cli_arg(), "./sub/main.tex");
+    }
+
+    #[test]
+    fn no_unicode_normalization() {
+        assert_ne!(wp("caf\u{e9}.tex"), wp("cafe\u{301}.tex"));
+    }
+
+    #[test]
     fn from_path_rejects_absolute_host_paths() {
         let abs = std::env::current_dir().unwrap().join("main.tex");
         assert!(matches!(
@@ -275,6 +348,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&p).unwrap(), r#""a/b.tex""#);
         let back: WorkspacePath = serde_json::from_str(r#""a/b.tex""#).unwrap();
         assert_eq!(back, p);
+        let normalized: WorkspacePath = serde_json::from_str(r#""./a//b.tex/""#).unwrap();
+        assert_eq!(normalized.as_str(), "a/b.tex");
         assert!(serde_json::from_str::<WorkspacePath>(r#""../x""#).is_err());
         assert!(serde_json::from_str::<WorkspacePath>(r#""/x""#).is_err());
     }

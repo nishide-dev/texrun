@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::path::WorkspacePath;
 
 /// How serious a diagnostic is.
+///
+/// Variants are declared from least to most serious, and the derived `Ord`
+/// follows declaration order; any variant added later is inserted at the
+/// position matching its seriousness.
+///
+/// There is no fallback variant: the Rust `Deserialize` impl is meant for
+/// round-tripping documents of the same schema version and rejects unknown
+/// values. Non-Rust consumers must tolerate unknown values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -23,8 +31,9 @@ pub enum Severity {
 /// A stable, engine-independent classification of a diagnostic.
 ///
 /// Consumers (e.g. AI agents) can branch on this without parsing messages.
-/// New kinds may be added as the log parser learns more patterns; consumers
-/// must treat unknown values like [`DiagnosticKind::Other`].
+/// New kinds may be added as the log parser learns more patterns without a
+/// schema version bump; consumers must treat unknown values like
+/// [`DiagnosticKind::Other`]. The Rust `Deserialize` impl does exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -47,7 +56,9 @@ pub enum DiagnosticKind {
     UndefinedCitation,
     /// The engine asks for another run (e.g. changed labels).
     RerunRequired,
-    /// Recognized as a diagnostic but not classified further.
+    /// Recognized as a diagnostic but not classified further. Unknown values
+    /// are deserialized as this variant.
+    #[serde(other)]
     Other,
 }
 
@@ -64,9 +75,11 @@ pub struct Diagnostic {
     pub kind: DiagnosticKind,
     /// Human-readable, single-paragraph message.
     pub message: String,
-    /// Source file, if it could be attributed to a file inside the workspace.
-    /// Files outside the workspace (e.g. installed packages) are left `None`;
-    /// the original text is still available in [`Diagnostic::raw_excerpt`].
+    /// Source file, relative to the workspace root (= the input project root),
+    /// if it could be attributed to a file there. Files outside the workspace
+    /// (e.g. installed packages) are left `None`; the original text is still
+    /// available in [`Diagnostic::raw_excerpt`]. Mapping it back to the
+    /// user's original host file is up to the caller (#6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<WorkspacePath>,
     /// 1-based line number in [`Diagnostic::file`].
@@ -149,6 +162,16 @@ mod tests {
             serde_json::to_value(&d).unwrap(),
             json!({ "severity": "info", "kind": "rerun_required", "message": "rerun" })
         );
+    }
+
+    #[test]
+    fn unknown_kind_deserializes_as_other() {
+        let d: Diagnostic = serde_json::from_value(json!({
+            "severity": "warning", "kind": "missing_package_from_the_future", "message": "m"
+        }))
+        .unwrap();
+        assert_eq!(d.kind, DiagnosticKind::Other);
+        assert!(serde_json::from_value::<Severity>(json!("fatal")).is_err());
     }
 
     #[test]
