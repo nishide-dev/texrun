@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      # Produces "chore(deps): ..." as required by CONTRIBUTING.md for both
+      # normal and dev-dependencies. (`include: scope` would produce
+      # "chore(deps-dev): ..." for dev-dependency updates.)
+      prefix: chore(deps)
+      prefix-development: chore(deps)
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      github-actions:
+        patterns: ["*"]

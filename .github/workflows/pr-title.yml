@@ -1,0 +1,42 @@
+name: PR title
+
+# Squash merge uses the PR title as the final commit title on main,
+# so the title must follow Conventional Commits (see CONTRIBUTING.md).
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep in sync with the type table in CONTRIBUTING.md.
+          types: |
+            feat
+            fix
+            docs
+            test
+            refactor
+            perf
+            chore
+            build
+          # Scope is optional; candidates in CONTRIBUTING.md are guidance only.
+          requireScope: false
+          # Description: starts with a lowercase letter and has no trailing period.
+          subjectPattern: ^[a-z0-9`].*[^.]$
+          subjectPatternError: |
+            The description "{subject}" in PR title "{title}" must start with
+            a lowercase letter and must not end with a period.
