@@ -55,7 +55,10 @@
 //!   line as the looked-ahead token; with the source file
 //!   ([`LogParser::parse_with_sources`]) the lines before it are read too,
 //!   provided the source line matches the context line in the log.
-//!   Otherwise `line = None` (the file name is in the message). The
+//!   Otherwise `line = None` (the file name is in the message). Known
+//!   cases of `None`: a date argument (`\usepackage{pkg}[2020/01/01]`,
+//!   which LaTeX reads before loading), requests inside macros, changed
+//!   catcodes, and very long requests (see Volume). The
 //!   `Emergency stop.` that follows keeps no line either, since it reports
 //!   the looked-ahead position.
 //! - `file`: the `file:line:` prefix, otherwise the innermost file of the
@@ -86,6 +89,16 @@
 //! is linear in the log size (about 0.9 GB for 100 MB of very short lines).
 //! A streaming parser that keeps only a window of recent lines is possible
 //! if that ever matters.
+//!
+//! Callers typically parse after the compile, outside its timeout, and the
+//! log and sources come from an untrusted document, so the cost is bounded
+//! for any input: parsing is linear in the log size (the scans for context
+//! and help lines after a message are capped at a constant number of lines).
+//! Locating a missing package reads at most 4 source files per log (TeX
+//! stops at the first missing package; document output could fake more),
+//! each linearly up to the context line, and scans at most 100 lines /
+//! 64 KiB characters before it linearly. Callers should bound the size of
+//! the log and of the source files they hand over.
 //!
 //! # Assumed engine settings
 //!

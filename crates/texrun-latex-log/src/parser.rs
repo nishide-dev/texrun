@@ -22,6 +22,10 @@ const MAX_MESSAGE_BYTES: usize = 2048;
 const MAX_EXCERPT_BYTES: usize = 4096;
 /// Upper bound of the number of lines in [`Diagnostic::raw_excerpt`].
 const MAX_EXCERPT_LINES: usize = 32;
+/// At most this many source files are read per log. TeX stops at the first
+/// missing package, so a real log needs one; document output could fake
+/// more, and each read may cost up to the caller's size limit.
+const MAX_SOURCE_READS: usize = 4;
 
 pub(crate) struct Config<'a> {
     pub workspace_root: Option<&'a WorkspaceRoot>,
@@ -56,6 +60,7 @@ pub(crate) fn parse(lines: &Lines, config: &Config<'_>) -> ParsedLog {
         out: Collector::new(config.max_diagnostics),
         stopped: false,
         errors_reported: 0,
+        source_reads: std::cell::Cell::new(0),
         undefined_reported: false,
         untrusted_stop_line: false,
     };
@@ -87,6 +92,8 @@ struct Parser<'a> {
     stopped: bool,
     /// Number of errors reported so far (whether or not they were kept).
     errors_reported: usize,
+    /// Number of [`SourceFiles::read`] calls so far.
+    source_reads: std::cell::Cell<usize>,
     /// An undefined reference or citation has been reported.
     undefined_reported: bool,
     /// The next `Emergency stop.` repeats a line that was found to be wrong.
@@ -261,7 +268,11 @@ impl<'a> Parser<'a> {
         let after = second
             .get(first.len()..)
             .filter(|_| second.as_bytes()[..first.len()].iter().all(|&b| b == b' '))?;
-        let source = file.and_then(|f| self.config.sources.read(f));
+        let reads = self.source_reads.get();
+        let source = file.filter(|_| reads < MAX_SOURCE_READS).and_then(|f| {
+            self.source_reads.set(reads + 1);
+            self.config.sources.read(f)
+        });
         request::locate(
             missing,
             request::Context {

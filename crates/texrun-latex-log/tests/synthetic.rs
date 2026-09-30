@@ -282,6 +282,32 @@ fn runaway_argument_is_part_of_the_excerpt() {
     );
 }
 
+/// Document output can fake many missing-package errors; the sources are
+/// read only a few times per log.
+#[test]
+fn source_reads_are_bounded_per_log() {
+    let block = "! LaTeX Error: File `tikz.sty' not found.\n\nEnter file name: \n\
+                 ./main.tex:3: Emergency stop.\n<read *> \n         \n\
+                 l.3 \\begin\n          {document}^^M\n";
+    let log = format!("(./main.tex\n{}", block.repeat(500));
+    let reads = std::cell::Cell::new(0);
+    let sources = |_: &WorkspacePath| {
+        reads.set(reads.get() + 1);
+        Some(b"\\documentclass{article}\n\\usepackage{tikz}\n\\begin{document}\n".to_vec())
+    };
+    let parsed = LogParser::new().parse_with_sources(log.as_bytes(), &sources);
+    assert_eq!(reads.get(), 4);
+    let lines: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.kind == K::MissingFile)
+        .map(|d| d.line)
+        .collect();
+    assert_eq!(lines.len(), 500);
+    assert!(lines[..4].iter().all(|l| *l == Some(2)), "{lines:?}");
+    assert!(lines[4..].iter().all(Option::is_none), "{lines:?}");
+}
+
 fn missing_tikz(context: &str) -> Vec<Diagnostic> {
     parse(&format!(
         "(./main.tex\n! LaTeX Error: File `tikz.sty' not found.\n\n\

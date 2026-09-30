@@ -19,6 +19,21 @@
 //! comments (a blank line would itself be the token, `\par`), so the text
 //! before the token must end with `\usepackage[<options>]{<list>}` whose list
 //! names the missing package. Anything else yields `None`.
+//!
+//! # Cost
+//!
+//! The log parser runs after the compile, outside its timeout, so this must
+//! stay cheap for any source: splitting the source into lines is linear and
+//! stops at line `n`, at most [`MAX_LINES_BACK`] lines / [`MAX_ITEMS`]
+//! characters before the looked-ahead token are read (more yields `None`),
+//! and the backward scan is linear in them (escapes are computed once, front
+//! to back).
+//!
+//! # Known limitations
+//!
+//! - `\usepackage{pkg}[<date>]`: LaTeX reads the date before loading, so
+//!   the text before the looked-ahead token ends with `]`; this yields `None`.
+//! - Requests made inside macros, or with changed catcodes, yield `None`.
 
 /// A missing package or class, from ``File `<name>.sty' not found.``.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +47,11 @@ const CLASS_COMMANDS: &[&str] = &["documentclass", "LoadClass", "LoadClassWithOp
 
 /// How many source lines before the context line are read at most.
 const MAX_LINES_BACK: usize = 100;
+
+/// How many characters before the looked-ahead token are read at most; a
+/// request with more before the token (e.g. a huge option list) yields
+/// `None`.
+const MAX_ITEMS: usize = 64 * 1024;
 
 impl<'a> Missing<'a> {
     /// `name` is the missing file name; `None` unless it is a `.sty` or
@@ -85,8 +105,8 @@ pub(crate) fn locate(
     let mut items = Vec::new();
     match source {
         Some(source) => {
-            let lines = source_lines(source)?;
             let index = usize::try_from(n).ok()?.checked_sub(1)?;
+            let lines = source_lines(source, index)?;
             // TeX drops trailing spaces of input lines.
             let text = lines.get(index)?.trim_end_matches([' ', '\t']);
             let token_end = if par {
@@ -112,6 +132,9 @@ pub(crate) fn locate(
             let first = index.saturating_sub(MAX_LINES_BACK);
             for (i, line) in lines.iter().enumerate().take(index).skip(first) {
                 push_source_line(&mut items, line, line_number(i)?);
+                if items.len() > MAX_ITEMS {
+                    return None;
+                }
             }
             if !par {
                 let before = strip_last_token(&text[..token_end])?;
@@ -126,6 +149,9 @@ pub(crate) fn locate(
             items.extend(before.chars().map(|c| Item::Char(c, n)));
         }
     }
+    if items.len() > MAX_ITEMS {
+        return None;
+    }
     request_line(&items, missing)
 }
 
@@ -137,15 +163,30 @@ enum Item {
     Par,
 }
 
-/// The source split at `\n` (TeX's line numbering), or `None` for a bare
-/// `\r` (which TeX may also take as a line end).
-fn source_lines(source: &[u8]) -> Option<Vec<String>> {
-    let text = String::from_utf8_lossy(source);
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
-        .collect();
-    (!lines.iter().any(|l| l.contains('\r'))).then_some(lines)
+/// The lines up to index `last` of the source split at `\n` (TeX's line
+/// numbering; fewer if the source is shorter), or `None` for a bare `\r`
+/// among them (which TeX may also take as a line end). Only the kept lines
+/// are decoded.
+fn source_lines(source: &[u8], last: usize) -> Option<Vec<String>> {
+    let first = last.saturating_sub(MAX_LINES_BACK);
+    let mut lines = Vec::new();
+    for (i, raw) in source
+        .split(|&b| b == b'\n')
+        .enumerate()
+        .take(last.saturating_add(1))
+    {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.contains(&b'\r') {
+            return None;
+        }
+        // Lines before the window only count.
+        lines.push(if i < first {
+            String::new()
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        });
+    }
+    Some(lines)
 }
 
 fn line_number(index: usize) -> Option<u32> {
@@ -243,8 +284,21 @@ fn ends_with_escape(text: &str) -> bool {
 /// Reads `\cmd[<options>]{<list>}` backwards from the end of `items` and
 /// returns the line of `\cmd` if it loads `missing`.
 fn request_line(items: &[Item], missing: Missing<'_>) -> Option<u32> {
+    // `escaped[i]`: `items[..i]` ends with an odd number of `\`.
+    let mut escaped = Vec::with_capacity(items.len() + 1);
+    let mut run = 0usize;
+    for item in items {
+        escaped.push(run % 2 == 1);
+        run = if matches!(item, Item::Char('\\', _)) {
+            run + 1
+        } else {
+            0
+        };
+    }
+    escaped.push(run % 2 == 1);
     let mut scan = Backwards {
         items,
+        escaped: &escaped,
         end: items.len(),
     };
     scan.skip_spaces();
@@ -282,6 +336,8 @@ fn request_line(items: &[Item], missing: Missing<'_>) -> Option<u32> {
 
 struct Backwards<'a> {
     items: &'a [Item],
+    /// See [`request_line`].
+    escaped: &'a [bool],
     /// Items before this index are not read yet.
     end: usize,
 }
@@ -307,13 +363,7 @@ impl Backwards<'_> {
 
     /// Whether the character just read is escaped by `\`.
     fn escaped(&self) -> bool {
-        self.items[..self.end]
-            .iter()
-            .rev()
-            .take_while(|i| matches!(i, Item::Char('\\', _)))
-            .count()
-            % 2
-            == 1
+        self.escaped[self.end]
     }
 
     fn skip_spaces(&mut self) {
@@ -486,6 +536,32 @@ mod tests {
         assert_eq!(at("\\foo", "^^M", 2, Some(src)), None);
         let src = "\\usepackage{nopkg}\r\n\\foo\r\n";
         assert_eq!(at("\\foo", "^^M", 2, Some(src)), Some(1));
+    }
+
+    /// Long runs of `\` (joined over lines by `%`) must not make the scan
+    /// quadratic: the parser runs outside the compile timeout.
+    #[test]
+    fn long_backslash_runs_are_cheap() {
+        let row = format!("{}%\n", "\\".repeat(2_000));
+        for rows in [20, 300] {
+            let src = format!(
+                "\\usepackage{{nopkg,%\n{}}}\n\\begin{{document}}\n",
+                row.repeat(rows)
+            );
+            let line = u32::try_from(rows).unwrap() + 3;
+            let start = std::time::Instant::now();
+            let found = at("\\begin", "{document}^^M", line, Some(&src));
+            let elapsed = start.elapsed();
+            // 40 000 backslashes fit in the window (an even number per row,
+            // so the `}` is not escaped); 600 000 do not.
+            assert_eq!(found, (rows == 20).then_some(1), "{rows}");
+            assert!(elapsed.as_millis() < 1000, "{rows}: {elapsed:?}");
+        }
+        // A huge line right before the token.
+        let src = format!("\\usepackage{{nopkg}}{}%\n\\foo\n", "\\".repeat(1_000_000));
+        let start = std::time::Instant::now();
+        assert_eq!(at("\\foo", "^^M", 2, Some(&src)), None);
+        assert!(start.elapsed().as_millis() < 1000, "{:?}", start.elapsed());
     }
 
     #[test]

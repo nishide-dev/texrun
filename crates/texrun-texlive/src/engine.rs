@@ -618,12 +618,19 @@ impl Plan {
 
 /// Reads a source file TeX read, for the log parser: a regular file inside
 /// the (canonical) workspace `root`, of at most [`MAX_SOURCE_BYTES`].
+///
+/// The file type is checked before opening, and it is opened with
+/// `O_NOFOLLOW | O_NONBLOCK` and checked again with `fstat`, so a FIFO or a
+/// device never blocks the read.
 fn read_source(root: &Path, path: &Path) -> Option<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+
     let real = fs::canonicalize(path).ok()?;
-    if !real.starts_with(root) {
+    if !real.starts_with(root) || !fs::symlink_metadata(&real).ok()?.is_file() {
         return None;
     }
-    let file = fs::File::open(&real).ok()?;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = fs::File::from(rustix::fs::open(&real, flags, Mode::empty()).ok()?);
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
         return None;
@@ -810,6 +817,18 @@ mod tests {
         assert_eq!(read_source(root.path(), &link), None);
         assert_eq!(read_source(root.path(), &secret), None);
         assert_eq!(read_source(root.path(), root.path()), None);
+        // A FIFO is refused without blocking.
+        let fifo = root.path().join("fifo.tex");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        assert_eq!(read_source(root.path(), &fifo), None);
+        let big = root.path().join("big.tex");
+        fs::write(
+            &big,
+            vec![b'x'; usize::try_from(MAX_SOURCE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert_eq!(read_source(root.path(), &big), None);
         assert_eq!(
             read_source(root.path(), &root.path().join("main.tex")),
             Some(Vec::new())
