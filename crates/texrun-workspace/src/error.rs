@@ -99,7 +99,9 @@ pub enum WorkspaceError {
     #[error("artifact `{0}` was not found in the output directory")]
     ArtifactMissing(WorkspacePath),
     /// An artifact is not a regular file inside the output directory (e.g. a
-    /// symlink or directory, or a path through a symlinked directory).
+    /// symlink or directory, or a path through a symlinked directory,
+    /// including a symlink swapped in for the output directory or one of its
+    /// ancestors inside the workspace, or a replaced workspace directory).
     #[error("artifact `{0}` is not a regular file in the output directory")]
     ArtifactNotFile(WorkspacePath),
     /// The destination already has a file of that name and
@@ -126,11 +128,16 @@ pub enum WorkspaceError {
     /// workspace was kept at `path` because
     /// [`WorkspaceConfig::keep`](crate::WorkspaceConfig::keep) is set.
     /// [`WorkspaceError::kind`] is that of `source`.
-    #[error("{source} (partial workspace kept at {path:?})")]
+    ///
+    /// The message does not repeat `source`; it is available through
+    /// [`std::error::Error::source`], so error-chain printers (e.g. `anyhow`)
+    /// show it exactly once.
+    #[error("workspace creation failed (partial workspace kept at {path:?})")]
     KeptAfterFailure {
         /// The kept workspace directory.
         path: PathBuf,
         /// The actual failure.
+        #[source]
         source: Box<WorkspaceError>,
     },
 }
@@ -249,5 +256,32 @@ mod tests {
         assert!(kept.to_string().contains("/tmp/x"));
         let io = WorkspaceError::io("copying", "a")(io::Error::other("x"));
         assert!(!io.kind().is_input_error());
+    }
+
+    #[test]
+    fn kept_after_failure_does_not_repeat_its_source() {
+        use std::error::Error as _;
+        let inner = WorkspaceError::LimitExceeded {
+            limit: Limit::Entries,
+            max: 7,
+        };
+        let inner_msg = inner.to_string();
+        let kept = WorkspaceError::KeptAfterFailure {
+            path: "/tmp/kept".into(),
+            source: Box::new(inner),
+        };
+        let msg = kept.to_string();
+        assert!(!msg.contains(&inner_msg), "{msg}");
+        assert!(msg.contains("/tmp/kept"), "{msg}");
+        assert_eq!(kept.source().unwrap().to_string(), inner_msg);
+
+        // Walking the chain like `anyhow`'s `{:#}` shows the cause once.
+        let mut chain = vec![kept.to_string()];
+        let mut cur = kept.source();
+        while let Some(e) = cur {
+            chain.push(e.to_string());
+            cur = e.source();
+        }
+        assert_eq!(chain.join(": ").matches(&inner_msg).count(), 1);
     }
 }

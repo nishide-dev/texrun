@@ -109,6 +109,8 @@ pub struct Workspace {
     request: CompileRequest,
     report: MaterializeReport,
     keep: bool,
+    /// Identity of the workspace directory, checked again when collecting.
+    root_id: FileId,
 }
 
 impl Workspace {
@@ -132,7 +134,7 @@ impl Workspace {
         let request = CompileRequest::new(input.entrypoint().clone()).with_options(options);
         request.validate().map_err(WorkspaceError::InvalidRequest)?;
         let exclusions = Exclusions::new(config, &request.options.output_dir);
-        if exclusions.excludes_path(request.entrypoint.as_path()) {
+        if exclusions.excludes_path(request.entrypoint.as_path(), false) {
             return Err(WorkspaceError::EntrypointExcluded(request.entrypoint));
         }
 
@@ -150,6 +152,10 @@ impl Workspace {
         let path =
             fs::canonicalize(dir.path()).map_err(WorkspaceError::io("resolving", dir.path()))?;
         let root = WorkspaceRoot::new(path).expect("canonical paths are absolute");
+        let root_id = FileId::of_metadata(
+            &fs::symlink_metadata(root.path())
+                .map_err(WorkspaceError::io("inspecting", root.path()))?,
+        );
 
         let report = match materialize(input, &request, &exclusions, config, &root) {
             Ok(report) => report,
@@ -169,6 +175,7 @@ impl Workspace {
             request,
             report,
             keep: config.keep,
+            root_id,
         })
     }
 
@@ -232,7 +239,10 @@ impl Workspace {
     /// - An existing file at the destination is handled per `policy`;
     ///   symlinks or directories in the way are always an error.
     /// - Artifacts that are missing, not regular files, or reached through a
-    ///   symlink inside the output directory are errors.
+    ///   symlink inside the output directory are errors. The output directory
+    ///   itself is reached from the workspace root one component at a time
+    ///   without following symlinks, and the workspace root must still be
+    ///   the directory created by [`Workspace::create`].
     /// - Artifacts are copied one by one, each atomically. If one fails, the
     ///   ones before it **remain** in `dest`; nothing is rolled back.
     pub fn collect_artifacts(
@@ -241,7 +251,14 @@ impl Workspace {
         dest: &Path,
         policy: OverwritePolicy,
     ) -> Result<Vec<Artifact>, WorkspaceError> {
-        collect::collect(&self.output_dir(), artifacts, dest, policy)
+        collect::collect(
+            self.root.path(),
+            self.root_id,
+            &self.request.options.output_dir,
+            artifacts,
+            dest,
+            policy,
+        )
     }
 
     /// Ends the workspace now: deletes the directory and reports errors, or,
