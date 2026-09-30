@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use texrun_core::{Artifact, ArtifactKind, WorkspacePath};
-use texrun_process::ExecGate;
+use texrun_process::{Cgroups, ExecGate};
 
 use crate::backend::Invocation;
 use crate::error::PreviewError;
@@ -32,6 +32,17 @@ fn fallback_notice(reason: &str) -> PreviewNotice {
     )
 }
 
+/// The notice for tools run without their cgroup because of `reason`.
+fn cgroup_notice(reason: &str) -> PreviewNotice {
+    PreviewNotice::warning(
+        NoticeKind::ResourceLimits,
+        format!(
+            "the preview tools run without a cgroup of their own (only their rlimits \
+             apply), because none can be used ({reason})"
+        ),
+    )
+}
+
 /// Characters of tool stderr kept in a notice.
 const DETAIL_CHARS: usize = 2000;
 /// File name the tool renders to, inside the private working directory.
@@ -45,12 +56,17 @@ const PIXEL_SLACK: u32 = 2;
 pub struct Previewer {
     tools: Toolset,
     gate: Option<ExecGate>,
+    cgroups: Option<Cgroups>,
 }
 
 impl Previewer {
     /// Uses the tools of `tools`.
     pub fn new(tools: Toolset) -> Self {
-        Self { tools, gate: None }
+        Self {
+            tools,
+            gate: None,
+            cgroups: None,
+        }
     }
 
     /// Starts the tools through `gate`, which sets their resource limits
@@ -68,6 +84,18 @@ impl Previewer {
     #[must_use]
     pub fn with_exec_gate(mut self, gate: ExecGate) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Runs every tool in a cgroup of its own, with limits on its memory,
+    /// processes and CPU use (Linux, docs/security.md §3.10; see
+    /// [`Cgroups`]). If `cgroups` cannot be used, the report says so with a
+    /// [`NoticeKind::ResourceLimits`] warning, and with
+    /// [`Cgroups::with_required`] no tool is run (as for a required exec
+    /// gate); otherwise the tools run with their rlimits only.
+    #[must_use]
+    pub fn with_cgroups(mut self, cgroups: Cgroups) -> Self {
+        self.cgroups = Some(cgroups);
         self
     }
 
@@ -148,9 +176,25 @@ impl Previewer {
             }
             report.push(fallback_notice(&reason));
         }
+        if let Some(cgroups) = &self.cgroups
+            && let Err(reason) = cgroups.check()
+        {
+            if cgroups.is_required() {
+                report.push(PreviewNotice::warning(
+                    NoticeKind::ResourceLimits,
+                    format!(
+                        "previews were not rendered: the preview tools must run in a cgroup \
+                         of their own, but none can be used ({reason})"
+                    ),
+                ));
+                return Ok(report);
+            }
+            report.push(cgroup_notice(&reason));
+        }
         let mut run = Run {
             backend,
             gate: self.gate.as_ref(),
+            cgroups: self.cgroups.as_ref().filter(|c| c.check().is_ok()),
             options,
             deadline: Instant::now() + options.timeout,
             report,
@@ -165,6 +209,7 @@ impl Previewer {
 struct Run<'a> {
     backend: Backend<'a>,
     gate: Option<&'a ExecGate>,
+    cgroups: Option<&'a Cgroups>,
     options: &'a PreviewOptions,
     deadline: Instant,
     report: PreviewReport,
@@ -308,6 +353,8 @@ impl Run<'_> {
             watch.is_none(),
             Limits {
                 gate: self.gate,
+                cgroups: self.cgroups,
+                cpu_seconds: process::cpu_seconds(self.options.timeout),
                 deadline: self.deadline,
                 cancel: &self.options.cancel,
                 watch,
@@ -315,14 +362,14 @@ impl Run<'_> {
         );
         // Reported once per preview run (e.g. the gate disappeared since the
         // check up front).
-        if let Some(reason) = &out.gate_fallback
-            && !self
-                .report
-                .notices
-                .iter()
-                .any(|n| n.kind == NoticeKind::ResourceLimits)
-        {
-            self.report.push(fallback_notice(reason));
+        let degraded = [
+            out.gate_fallback.as_deref().map(fallback_notice),
+            out.cgroup_unavailable.as_deref().map(cgroup_notice),
+        ];
+        for notice in degraded.into_iter().flatten() {
+            if !self.report.notices.contains(&notice) {
+                self.report.push(notice);
+            }
         }
         out
     }
@@ -347,6 +394,17 @@ impl Run<'_> {
                 format!(
                     "the preview images would exceed the size limit of {} bytes",
                     self.options.max_total_bytes
+                ),
+            ),
+            RunEnd::LimitExceeded(what) => PreviewNotice::warning(
+                NoticeKind::LimitExceeded,
+                format!("preview generation stopped: {} {what}", program_name(inv)),
+            ),
+            RunEnd::LimitsUnavailable(reason) => PreviewNotice::warning(
+                NoticeKind::ResourceLimits,
+                format!(
+                    "{} was not run: its resource limits cannot be put in place ({reason})",
+                    program_name(inv)
                 ),
             ),
             RunEnd::Failed(e) => PreviewNotice::warning(

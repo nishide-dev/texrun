@@ -6,6 +6,7 @@ use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cgroup::{CgroupLimits, Cgroups};
 use crate::env::EnvAllowlist;
 use crate::error::RunError;
 use crate::gate::ExecGate;
@@ -139,6 +140,15 @@ pub struct Spec<'a> {
     /// (including an unusable [`StartMode::ExecGate`]).
     /// Default: `false` (best effort).
     pub require_rlimits: bool,
+    /// Run the program and all its descendants in a cgroup of their own
+    /// with these limits (Linux, docs/security.md §3.10; see [`Cgroups`]).
+    /// The child is moved into it right after the spawn, so with
+    /// [`StartMode::ExecGate`] or [`StartMode::StdinGate`] every descendant
+    /// is inside. Where the cgroups cannot be used the run goes on without
+    /// (recorded in [`Finished::cgroup`](crate::Finished::cgroup)), unless
+    /// they are [required](Cgroups::with_required). Ignored (not requested)
+    /// when [`Launcher::apply_rlimits`] is `false`.
+    pub cgroup: Option<(&'a Cgroups, CgroupLimits)>,
     /// How the child is started.
     pub start: StartMode,
 }
@@ -159,6 +169,7 @@ impl<'a> Spec<'a> {
             stderr: Capture::Keep(Self::DEFAULT_CAPTURE),
             rlimits: Rlimits::new(),
             require_rlimits: false,
+            cgroup: None,
             start: StartMode::Immediate,
         }
     }
@@ -209,6 +220,13 @@ impl<'a> Spec<'a> {
         self
     }
 
+    /// Sets [`Spec::cgroup`].
+    #[must_use]
+    pub fn with_cgroup(mut self, cgroups: &'a Cgroups, limits: CgroupLimits) -> Self {
+        self.cgroup = Some((cgroups, limits));
+        self
+    }
+
     /// Sets [`Spec::start`].
     #[must_use]
     pub fn with_start(mut self, start: StartMode) -> Self {
@@ -241,8 +259,11 @@ impl<'a> Spec<'a> {
 ///
 /// The hooks receive the leader's PID so that one launcher can serve
 /// several runs at once. Their exact shape (e.g. a per-run handle returned
-/// by `on_spawn`) will be revisited with the first real implementations
-/// (#25 cgroups, #26 containers).
+/// by `on_spawn`) will be revisited with the first real implementation
+/// (#26 containers). The cgroups of #25 are not a launcher: the supervisor
+/// handles them itself ([`Spec::cgroup`]), after the spawn and before
+/// [`Launcher::on_spawn`], and kills them with every group kill before
+/// [`Launcher::on_kill`].
 pub trait Launcher {
     /// The command for `spec`: program, arguments, environment (after
     /// `env_clear()`) and working directory. Stdio and the process group are
@@ -257,12 +278,12 @@ pub trait Launcher {
     }
 
     /// Called right after spawning, before the limits are set and the start
-    /// gate is released (e.g. to move the child into a cgroup). An error
-    /// kills the child and fails the run.
+    /// gate is released (after moving the child into its cgroup, if
+    /// [`Spec::cgroup`]). An error kills the child and fails the run.
     ///
     /// With [`StartMode::Immediate`] the child already runs when this is
     /// called, so descendants it starts before this hook finishes are not
-    /// covered (e.g. they stay outside the cgroup). To include every
+    /// covered (the same holds for [`Spec::cgroup`]). To include every
     /// descendant, combine it with [`StartMode::StdinGate`] or
     /// [`StartMode::ExecGate`]: then `pid` is still waiting at the gate.
     fn on_spawn(&self, _pid: u32) -> io::Result<()> {
@@ -270,15 +291,15 @@ pub trait Launcher {
     }
 
     /// Called whenever the process group of leader `pid` is killed, after
-    /// `killpg` and before the leader is reaped (e.g. to kill a whole
-    /// cgroup, including processes that left the group).
+    /// `killpg` (and `cgroup.kill`, [`Spec::cgroup`]) and before the leader
+    /// is reaped (e.g. to stop a container).
     ///
     /// Also called from a drop guard while unwinding, so it must not panic
     /// (a panic there aborts the process).
     fn on_kill(&self, _pid: u32) {}
 
     /// Called once after the leader `pid` has been reaped (e.g. to remove a
-    /// cgroup). Not called when spawning failed. Must not panic, like
+    /// container). Not called when spawning failed. Must not panic, like
     /// [`Launcher::on_kill`].
     fn on_reaped(&self, _pid: u32) {}
 }

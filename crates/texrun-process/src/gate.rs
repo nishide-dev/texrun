@@ -16,12 +16,13 @@
 //! The command line is
 //!
 //! ```text
-//! <gate> [<gate args>...] texrun-exec-gate/1 [--rlimit <name>=<value>]... -- <program> [<arg>...]
+//! <gate> [<gate args>...] texrun-exec-gate/1 [--rlimit <name>=<soft>[:<hard>]]... -- <program> [<arg>...]
 //! ```
 //!
 //! where `<gate args>` are those of [`ExecGate::with_args`] (e.g. a hidden
 //! subcommand) and `<name>` is one of `fsize`, `core`, `as`, `cpu`,
-//! `nproc`. Everything after `--` is the program (an absolute path) and its
+//! `nproc` (a single value is both the soft and the hard limit;
+//! each is capped at the gate's own, see [`Rlimits`]). Everything after `--` is the program (an absolute path) and its
 //! arguments, which the gate passes to `exec` unchanged: the gate never
 //! parses or expands them, and never hands them to a shell. (`exec` goes
 //! through the C library's `execvp`, which runs a file without a known
@@ -41,20 +42,20 @@
 //! the other:
 //!
 //! 1. the gate checks its arguments, then waits for the start token. The
-//!    supervisor sends it after [`Launcher::on_spawn`](crate::Launcher::on_spawn)
-//!    (the extension point for #25: moving the gate into a cgroup there
-//!    covers the program and every descendant);
-//! 2. the gate sets the limits on itself (each capped at its own hard
-//!    limit), replaces its stdin by `/dev/null` and reports `ok`;
+//!    supervisor sends it after moving the gate into the run's cgroup
+//!    ([`Spec::cgroup`](crate::Spec::cgroup)), so that the program and
+//!    every descendant are inside, and after
+//!    [`Launcher::on_spawn`](crate::Launcher::on_spawn);
+//! 2. the gate sets the limits on itself (each capped at its own soft and
+//!    hard limit), replaces its stdin by `/dev/null` and reports `ok`;
 //! 3. it `exec`s the program. The report channel is close-on-exec, so a
 //!    successful `exec` closes it; a failed one is reported (`error exec
 //!    <errno>`) and the gate exits.
 //!
 //! Every failure is reported as `error <stage> <errno or ->` and ends the
 //! gate without running the program, with one of the `EXIT_*` statuses of
-//! [`ExecGate`]. Further steps before `exec` (e.g. the gate attaching
-//! itself to a cgroup, #25) belong between steps 2 and 3, as a new option
-//! before `--`.
+//! [`ExecGate`]. Further steps before `exec` belong between steps 2 and 3,
+//! as a new option before `--`.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -65,7 +66,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use crate::rlimit::{self, Resource, Rlimits};
+use crate::rlimit::{self, Pair, Resource, Rlimits};
 
 /// First protocol argument: name and version of the protocol.
 const PROTOCOL: &str = "texrun-exec-gate/1";
@@ -195,15 +196,20 @@ impl ExecGate {
     /// `limits`.
     pub(crate) fn command_args<'s>(
         &self,
-        limits: impl Iterator<Item = (Resource, u64)>,
+        limits: impl Iterator<Item = (Resource, Pair)>,
         program: &Path,
         args: impl Iterator<Item = &'s OsString>,
     ) -> Vec<OsString> {
         let mut out = self.args.clone();
         out.push(PROTOCOL.into());
-        for (resource, value) in limits {
+        for (resource, Pair { soft, hard }) in limits {
+            let name = rlimit::gate_name(resource);
             out.push("--rlimit".into());
-            out.push(format!("{}={value}", rlimit::gate_name(resource)).into());
+            out.push(if soft == hard {
+                format!("{name}={hard}").into()
+            } else {
+                format!("{name}={soft}:{hard}").into()
+            });
         }
         out.push("--".into());
         out.push(program.as_os_str().to_owned());
@@ -261,8 +267,8 @@ where
             ExecGate::EXIT_NOT_RELEASED,
         );
     }
-    for (resource, value) in request.limits.iter() {
-        if let Err(e) = rlimit::set_own(resource, value) {
+    for (resource, pair) in request.limits.pairs() {
+        if let Err(e) = rlimit::set_own(resource, pair) {
             return fail(
                 "rlimit",
                 Some(&e),
@@ -320,12 +326,22 @@ fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Request, String> {
         let value = args
             .next()
             .ok_or_else(|| "--rlimit needs a value".to_owned())?;
-        let (resource, value) = value
+        let number = |text: &str| {
+            let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+            digits.then(|| text.parse::<u64>().ok()).flatten()
+        };
+        let (resource, soft, hard) = value
             .to_str()
             .and_then(|v| v.split_once('='))
             .and_then(|(name, value)| {
-                let value = value.bytes().all(|b| b.is_ascii_digit()).then_some(value)?;
-                Some((rlimit::from_gate_name(name)?, value.parse::<u64>().ok()?))
+                let resource = rlimit::from_gate_name(name)?;
+                match value.split_once(':') {
+                    None => Some((resource, number(value)?, number(value)?)),
+                    Some((soft, hard)) => {
+                        let (soft, hard) = (number(soft)?, number(hard)?);
+                        (soft <= hard).then_some((resource, soft, hard))
+                    }
+                }
             })
             .ok_or_else(|| format!("invalid --rlimit value {}", value.display()))?;
         if limits.get(resource).is_some() {
@@ -334,7 +350,7 @@ fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Request, String> {
                 rlimit::gate_name(resource)
             ));
         }
-        limits = limits.with(resource, value);
+        limits = limits.with_soft_hard(resource, soft, hard);
     }
     let program = PathBuf::from(args.next().ok_or_else(|| "missing program".to_owned())?);
     if !program.is_absolute() {
@@ -498,10 +514,10 @@ mod tests {
             .with(Resource::FileSize, 1000)
             .with(Resource::Core, 0)
             .with(Resource::AddressSpace, 1 << 31)
-            .with(Resource::Cpu, 5)
+            .with_soft_hard(Resource::Cpu, 5, 8)
             .with(Resource::Processes, 7);
         let tool_args = args(&["--", "-x", "a b; c", "$(x)"]);
-        let line = gate.command_args(limits.iter(), Path::new("/bin/tool"), tool_args.iter());
+        let line = gate.command_args(limits.pairs(), Path::new("/bin/tool"), tool_args.iter());
         assert_eq!(line[0], "__exec-gate");
         let request = parse(line.into_iter().skip(1)).unwrap();
         assert_eq!(request.limits, limits);
@@ -526,6 +542,10 @@ mod tests {
             &[PROTOCOL, "--rlimit", "fsize=+1", "--", "/bin/true"],
             &[PROTOCOL, "--rlimit", "fsize=1x", "--", "/bin/true"],
             &[PROTOCOL, "--rlimit", "stack=1", "--", "/bin/true"],
+            &[PROTOCOL, "--rlimit", "cpu=5:", "--", "/bin/true"],
+            &[PROTOCOL, "--rlimit", "cpu=:5", "--", "/bin/true"],
+            &[PROTOCOL, "--rlimit", "cpu=6:5", "--", "/bin/true"],
+            &[PROTOCOL, "--rlimit", "cpu=1:2:3", "--", "/bin/true"],
             &[
                 PROTOCOL,
                 "--rlimit",

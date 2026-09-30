@@ -72,6 +72,10 @@ pub fn render_result(
             "Compiled {entry} in {elapsed}{counts}, but the output could not be copied to {output}"
         ),
         CompileOutcome::Succeeded => writeln!(out, "Compiled {entry} in {elapsed}{counts}"),
+        CompileOutcome::Failed if limit_reached(result) => writeln!(
+            out,
+            "Failed to compile {entry} in {elapsed}: a resource limit was reached{counts}"
+        ),
         CompileOutcome::Failed => writeln!(out, "Failed to compile {entry} in {elapsed}{counts}"),
         CompileOutcome::TimedOut => writeln!(
             out,
@@ -121,6 +125,14 @@ pub fn render_result(
         let _ = writeln!(out, "{label}: {}", escape(&note.message));
     }
     out
+}
+
+/// Whether texrun stopped the compile at a resource limit (docs/security.md
+/// §3.10).
+fn limit_reached(result: &CompileResult) -> bool {
+    result
+        .errors()
+        .any(|d| d.kind == DiagnosticKind::ResourceLimit)
 }
 
 /// `previews: <first> .. <last> (N of M pages, backend)` and the notices.
@@ -353,6 +365,33 @@ mod tests {
              paper/main.tex:9: warning: Overfull \\hbox\n\
              Failed to compile paper/main.tex in 840ms (1 error, 1 warning)\n  \
              log: paper/texrun-out/main.log\n"
+        );
+    }
+
+    #[test]
+    fn a_reached_resource_limit_is_named_in_the_summary() {
+        let mut r = CompileResult::new(
+            CompileOutcome::Failed,
+            EngineInfo::new("texlive"),
+            Duration::from_millis(2100),
+        );
+        r.diagnostics.push(Diagnostic::new(
+            Severity::Error,
+            DiagnosticKind::ResourceLimit,
+            "resource limit exceeded: a process of the compile used more than 70 s of CPU time",
+        ));
+        let text = render_result(
+            &CompileReport::default(),
+            &r,
+            &paths(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            text,
+            "error: resource limit exceeded: a process of the compile used more than 70 s of \
+             CPU time\n\
+             Failed to compile paper/main.tex in 2.10s: a resource limit was reached (1 error, 0 \
+             warnings)\n"
         );
     }
 

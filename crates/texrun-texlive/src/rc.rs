@@ -100,9 +100,12 @@ pub(crate) const EMPTY_VARIABLES: &[&str] = &[
 pub(crate) struct RcOptions {
     /// Make latexmk wait, before doing anything else, until the parent has
     /// written [`START_TOKEN`] to its stdin, and exit with
-    /// [`GATE_EXIT_CODE`] if stdin ends first. Used on Linux so the parent
-    /// can apply `RLIMIT_FSIZE` to latexmk with `prlimit(2)` before latexmk
-    /// writes a file or starts a child.
+    /// [`GATE_EXIT_CODE`] if stdin ends first. Used on Linux when latexmk
+    /// is not started through an exec gate, so that the parent can set the
+    /// rlimits on latexmk with `prlimit(2)` (and move it into its cgroup)
+    /// before latexmk writes a file or starts a child. With an exec gate
+    /// the limits are in place before latexmk starts, and its stdin is
+    /// `/dev/null`.
     pub(crate) stdin_gate: bool,
 }
 
@@ -125,11 +128,15 @@ const GATE: &str = r#"# Wait until texrun has applied resource limits to this pr
 /// get the exit code), so the sub returns one:
 ///
 /// - normal exit with code `c`: `c * 256` (0 only for success);
-/// - killed by signal `s`: `(128 + s) * 256`;
+/// - killed by signal `s`: `(128 + s) * 256`, except for `SIGXCPU` and
+///   `SIGXFSZ` (a resource limit texrun set, docs/security.md §3.10):
+///   then latexmk itself exits at once with status `128 + s`, which the
+///   engine reports as the limit (latexmk's own statuses are below 128);
 /// - program could not be started (or no program given): `127 * 256`.
 const RUN_SUB_DEFINITION: &str = r#"# Runs a program without a shell. Returns a wait status in the encoding
 # of Perl's system(): exit code c -> c * 256; killed by signal s ->
-# (128 + s) * 256; could not be started -> 127 * 256.
+# (128 + s) * 256 (for SIGXCPU / SIGXFSZ latexmk exits with 128 + s); could
+# not be started -> 127 * 256.
 sub texrun_run {
     my @cmd = @_;
     return 127 * 256 unless @cmd;
@@ -140,7 +147,15 @@ sub texrun_run {
         return 127 * 256;
     }
     if ($status & 127) {
-        return (128 + ($status & 127)) * 256;
+        my $signal = $status & 127;
+        # A resource limit set by texrun (CPU time, file size) ended it:
+        # stop here, and tell texrun which through the exit status.
+        require POSIX;
+        if ($signal == POSIX::SIGXCPU() || $signal == POSIX::SIGXFSZ()) {
+            print STDERR "texrun: '$prog' reached a resource limit (signal $signal)\n";
+            exit(128 + $signal);
+        }
+        return (128 + $signal) * 256;
     }
     return ($status >> 8) * 256;
 }
@@ -259,7 +274,8 @@ mod tests {
         // argument.
         assert!(rc.contains("system { $prog } @cmd;"));
         assert!(rc.contains("return 127 * 256;"));
-        assert!(rc.contains("return (128 + ($status & 127)) * 256;"));
+        assert!(rc.contains("return (128 + $signal) * 256;"));
+        assert!(rc.contains("exit(128 + $signal);"));
         assert!(rc.contains("return ($status >> 8) * 256;"));
         // No other way of running programs.
         for forbidden in ["exec", "`", "qx", "open(", "open "] {

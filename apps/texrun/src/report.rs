@@ -85,6 +85,10 @@ pub mod kind {
     pub const IO: &str = "io";
     /// Signal handlers could not be installed.
     pub const SIGNAL_SETUP: &str = "signal_setup";
+    /// Something required is not available on this host (`--cgroup
+    /// required` without a usable cgroup); the same code as
+    /// `EngineErrorKind::Unsupported`.
+    pub const UNSUPPORTED: &str = "unsupported";
 }
 
 /// The payload of the `--json` document (wrapped in `Versioned`).
@@ -219,7 +223,7 @@ pub enum Stage {
     Output,
     /// Copying artifacts to the output directory.
     Collect,
-    /// Setting up texrun itself (signal handling).
+    /// Setting up texrun itself (signal handling, `--cgroup required`).
     Setup,
 }
 

@@ -81,6 +81,39 @@ impl From<std::process::ExitStatus> for ProcessExit {
     }
 }
 
+/// Which OS-level resource limits were in place for the engine's processes
+/// (docs/security.md §3.10). Informational: a limit that was reached shows
+/// up as a [`DiagnosticKind::ResourceLimit`](crate::DiagnosticKind::ResourceLimit)
+/// diagnostic.
+///
+/// `#[non_exhaustive]`: construct with [`ResourceLimits::new`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ResourceLimits {
+    /// Per-process limits (`setrlimit`: CPU time, file size and, on Linux,
+    /// address space) were set before the engine started, and are
+    /// inherited by every process it starts.
+    pub rlimits: bool,
+    /// The engine and all its descendants ran in a cgroup of their own,
+    /// with limits on their memory, number of processes and CPU use
+    /// together (Linux).
+    pub cgroup: bool,
+    /// Why a layer was not used (e.g. no delegated cgroup), one line each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl ResourceLimits {
+    /// Records which layers were used.
+    pub fn new(rlimits: bool, cgroup: bool) -> Self {
+        Self {
+            rlimits,
+            cgroup,
+            notes: Vec::new(),
+        }
+    }
+}
+
 /// The result of a completed compile attempt.
 ///
 /// Path bases: [`Artifact::path`] is relative to the output root and
@@ -111,6 +144,10 @@ pub struct CompileResult {
     /// to the output root.
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    /// Which OS-level resource limits were in place for the engine, if the
+    /// engine reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 impl CompileResult {
@@ -123,6 +160,7 @@ impl CompileResult {
             elapsed,
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
+            resource_limits: None,
         }
     }
 
@@ -219,6 +257,24 @@ mod tests {
         let r = sample();
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<CompileResult>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn resource_limits_json() {
+        let mut r = sample();
+        let mut limits = ResourceLimits::new(true, false);
+        limits.notes.push("cgroup: none".to_owned());
+        r.resource_limits = Some(limits);
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json["resource_limits"],
+            json!({ "rlimits": true, "cgroup": false, "notes": ["cgroup: none"] })
+        );
+        assert_eq!(serde_json::from_value::<CompileResult>(json).unwrap(), r);
+        assert_eq!(
+            serde_json::to_value(ResourceLimits::new(true, true)).unwrap(),
+            json!({ "rlimits": true, "cgroup": true })
+        );
     }
 
     #[test]

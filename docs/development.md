@@ -157,6 +157,29 @@ docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TO
 - 検証は構造化された結果（outcome、diagnostic の kind / file / line、artifact の有無と size、PDF のページ数）に対して行い、ログ全文の snapshot には依存しない。TeX Live の minor な差で壊れにくくするためである。
 - PDF のページ数は `texrun-preview`（`mutool` または `pdfinfo`）で読む。
 - fixture を追加・変更したときは、コンテナ内で上のコマンドを実行して確認する。
+- CPU 時間・memory・プロセス数の上限（[docs/security.md](security.md) §3.10）は `limits.rs` で確認する。fixture は既存のもの（`timeout` の無限ループ、`minimal`）を小さい上限で compile し、長い文書は test の中で生成する。
+
+### cgroup test
+
+cgroup による上限（[docs/security.md](security.md) §3.10）の test は、texrun が子 cgroup を作れる委譲 cgroup を必要とする。次の場所にある test で、名前に `cgroup` を含む。
+
+- `crates/texrun-process/tests/limits.rs`（fake script: memory、process 数、group 外に出たプロセスの kill）
+- `crates/texrun-texlive/tests/limits.rs`（TeX Live）
+- `apps/texrun/tests/texlive.rs`（`texlive_uses_a_delegated_cgroup_of_its_own`: texrun が自分の cgroup の leaf に移る経路）、`apps/texrun/tests/cli.rs`（`--cgroup`）
+
+通常の dev コンテナ（`docker compose run`）では cgroup の mount が read-only なので、cgroup は使えない。GitHub Actions の runner（`test (linux)`）でも、runner のユーザーに委譲された cgroup は無い。どちらでも、これらの test は `skipped: no delegated cgroup (...)` を出して何もしない（`cli.rs` の test は、使えない場合の挙動を確認する）。
+
+`TEXRUN_REQUIRE_CGROUP=1` にすると、cgroup が使えないことを test の失敗にする。`docker/dev/with-cgroup.sh` は、`--privileged` のコンテナの中で、コンテナの全プロセスを cgroup namespace の root から leaf（`init`）に移し、root の子に controller を渡せるようにしてから、この変数を付けてコマンドを実行する。CI の `integration` job は、通常の test の後に、この方法で cgroup test をもう一度実行する。
+
+```bash
+docker run --rm --privileged -v "$PWD:/workspace" -w /workspace \
+  -e CARGO_TARGET_DIR=/workspace/target/docker -e TEXRUN_REQUIRE_TEXLIVE=1 \
+  -v texrun_cargo-registry:/usr/local/cargo/registry \
+  texrun-dev:latest docker/dev/with-cgroup.sh \
+  cargo test --workspace --all-features --locked -- cgroup
+```
+
+`--privileged` のコンテナは host からの隔離が弱いので、この用途（texrun 自身の test）以外では使わない。
 
 ## 注意事項
 

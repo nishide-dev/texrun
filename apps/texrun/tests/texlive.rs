@@ -78,6 +78,9 @@ fn texlive_compiles_a_document_with_includes() {
     let pdf = Path::new(doc["output_dir"].as_str().unwrap()).join("main.pdf");
     assert!(fs::read(&pdf).unwrap().starts_with(b"%PDF-"));
     assert!(dir.path().join("texrun-out/main.pdf").is_file());
+    // latexmk started through the exec gate (texrun itself), so the
+    // rlimits were in place on every platform.
+    assert_eq!(doc["resource_limits"]["rlimits"], true, "{doc:#}");
 
     // Human-readable mode.
     let out = texrun(dir.path(), &["compile", "main.tex"])
@@ -281,4 +284,69 @@ fn texlive_sigint_stops_pdflatex() {
     // Workspace, rc and probe directories are gone: cleanup ran.
     let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// texrun started alone in a delegated cgroup (as with `systemd-run --user
+/// --scope -p Delegate=yes`) moves itself into a leaf of it and runs the
+/// engine and the preview tools in cgroups of their own. Needs a cgroup
+/// this test can create one in (docs/development.md, "cgroup tests");
+/// skipped otherwise, unless `TEXRUN_REQUIRE_CGROUP=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn texlive_uses_a_delegated_cgroup_of_its_own() {
+    common::require_texlive!();
+    let cgroups = texrun_process::Cgroups::detect();
+    let parent = match cgroups.check() {
+        Ok(()) => cgroups.parent().unwrap().to_owned(),
+        Err(reason) if std::env::var_os("TEXRUN_REQUIRE_CGROUP").is_some_and(|v| v == "1") => {
+            panic!("TEXRUN_REQUIRE_CGROUP=1, but no cgroup can be used: {reason}")
+        }
+        Err(reason) => {
+            eprintln!("skipped: no delegated cgroup ({reason})");
+            return;
+        }
+    };
+    let own = parent.join(format!("texrun-cli-test-{}", std::process::id()));
+    fs::create_dir(&own).unwrap();
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n",
+    )]);
+    let out = Command::new("/bin/sh")
+        .args(["-c", "echo $$ > \"$0/cgroup.procs\" && exec \"$@\""])
+        .arg(&own)
+        .args([
+            env!("CARGO_BIN_EXE_texrun"),
+            "compile",
+            "--json",
+            "--cgroup",
+            "required",
+        ])
+        .arg("main.tex")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    // The leaf texrun moved itself into, then the cgroup itself.
+    for entry in fs::read_dir(&own).unwrap().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    let _ = fs::remove_dir(&own);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let doc: Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
+    assert_eq!(out.status.code(), Some(0), "{doc:#}\n{stderr}");
+    assert_eq!(
+        doc["resource_limits"],
+        serde_json::json!({ "rlimits": true, "cgroup": true }),
+        "{doc:#}"
+    );
+    assert!(
+        doc["preview"]["notices"]
+            .as_array()
+            .is_none_or(|n| n.iter().all(|n| n["kind"] != "resource_limits")),
+        "{doc:#}"
+    );
+    assert!(!own.exists(), "the test cgroup was removed");
 }

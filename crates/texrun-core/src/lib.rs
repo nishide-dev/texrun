@@ -34,7 +34,7 @@ pub use diagnostic::{Diagnostic, DiagnosticKind, Severity};
 pub use engine::{EngineError, EngineErrorKind, EngineInfo, TypesetEngine};
 pub use path::{WorkspacePath, WorkspacePathError};
 pub use request::{CompileOptions, CompileRequest};
-pub use result::{CompileOutcome, CompileResult, ProcessExit};
+pub use result::{CompileOutcome, CompileResult, ProcessExit, ResourceLimits};
 
 /// The version of the texrun core library.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

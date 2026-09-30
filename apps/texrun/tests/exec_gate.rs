@@ -120,6 +120,59 @@ fn preview_tools_start_with_their_limits() {
     }
 }
 
+/// A required gate that passes the check up front but is gone when the
+/// next tool starts (e.g. the binary was removed meanwhile): that tool is
+/// not run, and the notice says it is about the resource limits.
+#[test]
+fn a_required_gate_that_disappears_is_a_resource_limits_notice() {
+    let bin = tempfile::tempdir().unwrap();
+    let copy = bin.path().join("texrun-copy");
+    fs::copy(TEXRUN, &copy).unwrap();
+    // `pdfinfo` runs through the gate, then removes it.
+    let pdfinfo = PDFINFO.replace(
+        "#!/bin/sh\n",
+        &format!("#!/bin/sh\nrm -f '{}'\n", copy.display()),
+    );
+    let tools = fake_tools(bin.path());
+    fs::write(bin.path().join("pdfinfo"), pdfinfo).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let pdf = out.path().join("in.pdf");
+    fs::write(&pdf, "%PDF-1.4\n").unwrap();
+    let report = Previewer::new(tools)
+        .with_exec_gate(
+            ExecGate::new(&copy)
+                .with_args(["__exec-gate"])
+                .with_required(true),
+        )
+        .render(
+            &pdf,
+            out.path(),
+            &PreviewOptions::default()
+                .with_backend(BackendChoice::Poppler)
+                .with_pages("1".parse().unwrap()),
+        )
+        .unwrap();
+    assert!(!copy.exists(), "pdfinfo ran through the gate");
+    assert_eq!(
+        report.status,
+        PreviewStatus::Skipped,
+        "{:?}",
+        report.notices
+    );
+    let json = serde_json::to_value(&report).unwrap();
+    let notices = json["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1, "{json}");
+    assert_eq!(notices[0]["kind"], "resource_limits", "{json}");
+    assert!(
+        notices[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("texrun-copy"),
+        "{json}"
+    );
+    assert!(!out.path().join("limits.txt").exists(), "pdftoppm ran");
+}
+
 #[test]
 fn the_gate_subcommand_refuses_other_arguments_and_is_hidden() {
     let dir = tempfile::tempdir().unwrap();

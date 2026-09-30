@@ -162,8 +162,13 @@ pub enum NoticeKind {
     /// started, because the exec gate cannot be used
     /// ([`Previewer::with_exec_gate`](crate::Previewer::with_exec_gate)):
     /// either nothing was rendered (a required gate), or the limits were
-    /// set only after each tool started (best effort).
+    /// set only after each tool started (best effort). Also used when the
+    /// cgroup of the tools ([`Previewer::with_cgroups`](crate::Previewer::with_cgroups))
+    /// cannot be used.
     ResourceLimits,
+    /// A preview tool was stopped by its CPU time, memory or process limit
+    /// (docs/security.md §3.10); rendering stopped there.
+    LimitExceeded,
     /// Anything else. Unknown values are deserialized as this variant.
     #[serde(other)]
     Other,

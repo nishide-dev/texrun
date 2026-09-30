@@ -23,8 +23,8 @@
 //! - **bounded output**: stdout / stderr are drained to EOF by reader
 //!   threads, keeping only a prefix of each ([`Capture::Keep`]); the readers
 //!   are waited for at most [`READER_GRACE`] after the group is gone;
-//! - **resource limits**: [`Rlimits`] never exceed texrun's own hard
-//!   limit. Setting them in the child between `fork` and `exec` would need
+//! - **resource limits**: [`Rlimits`] never exceed texrun's own soft and
+//!   hard limits. Setting them in the child between `fork` and `exec` would need
 //!   `pre_exec`, i.e. `unsafe`, which the workspace forbids, so there are
 //!   three start modes ([`StartMode`]):
 //!   - [`StartMode::ExecGate`]: the program is started through an exec gate
@@ -38,21 +38,27 @@
 //!   - [`StartMode::Immediate`]: `prlimit(2)` right after the spawn, best
 //!     effort only (see its documentation for the gap this leaves).
 //!
+//! - **cgroup** (Linux, [`Spec::cgroup`], docs/security.md §3.10): where a
+//!   delegated cgroup can be used ([`Cgroups`]), the run gets a child
+//!   cgroup with `memory.max` / `pids.max` / `cpu.max` ([`CgroupLimits`]).
+//!   The child is moved into it right after the spawn, while a gated child
+//!   still waits, so every descendant is inside; `cgroup.kill` goes with
+//!   every group kill (reaching processes that left the group), and the
+//!   cgroup's events (OOM kills, refused processes) are reported in
+//!   [`Finished::cgroup`] before it is removed.
+//!
 //! `EINTR` is retried everywhere (`waitid`, pipe reads).
 //!
 //! # Extension points
 //!
-//! - [`Resource`] already names `RLIMIT_CPU` / `RLIMIT_NPROC` for #25; the
-//!   values are the caller's choice.
-//! - The exec gate runs its steps before `exec` in a fixed order
-//!   ([`run_gate`]); a cgroup attach (#25) can be done by the parent in
-//!   [`Launcher::on_spawn`] while the gate waits, or added as a gate step.
 //! - A [`Launcher`] decides *how* a [`Spec`] is started. [`HostLauncher`]
 //!   runs it directly on the host; a container backend (#26) can turn the
-//!   same spec into a runtime invocation, and a cgroup-based limiter (#25)
-//!   can attach the child on spawn ([`Launcher::on_spawn`]) and kill the
-//!   whole cgroup together with the group ([`Launcher::on_kill`]) and
-//!   clean up after the reap ([`Launcher::on_reaped`]).
+//!   same spec into a runtime invocation and apply the limits itself
+//!   ([`Launcher::apply_rlimits`] `== false`, which also leaves out the
+//!   cgroup), stop it in [`Launcher::on_kill`] and clean up after the reap
+//!   ([`Launcher::on_reaped`]). The cgroup of #25 is built into the
+//!   supervisor instead of being a launcher, because its kill belongs to
+//!   every group kill and its events to the result.
 //!
 //! # Platform support
 //!
@@ -67,6 +73,7 @@
 compile_error!("texrun-process supports Unix hosts only");
 
 mod capture;
+mod cgroup;
 mod env;
 mod error;
 mod gate;
@@ -75,6 +82,7 @@ mod spec;
 mod supervise;
 
 pub use capture::CapturedOutput;
+pub use cgroup::{CgroupLimits, CgroupOutcome, CgroupUsage, Cgroups};
 pub use env::{EnvAllowlist, sanitize_path};
 pub use error::RunError;
 pub use gate::{ExecGate, run_gate};
