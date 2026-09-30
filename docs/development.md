@@ -146,7 +146,7 @@ docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TO
 | `minimal` | 成功、PDF と log の artifact（size・PDF 1 ページ）、`collect_artifacts` で host にコピーされる |
 | `syntax-error` | 環境の対応の誤り: `Failed`、`latex_error` の file / line |
 | `undefined-command` | `Failed`、`undefined_control_sequence` の file / line |
-| `missing-package` | `Failed`、`missing_file`（file のみ。TeX は停止位置しか出さない） |
+| `missing-package` | `Failed`、`missing_file`（`\usepackage` の行。TeX は先読み後の停止位置しか出さないので、parser が workspace の source から特定する）、後続の `emergency_stop` は `info` で error は 1 件 |
 | `references` | bibtex（biber は使わない）で解決した引用と、未定義の参照・引用の warning（`Succeeded` のまま） |
 | `overfull-box` | `overfull_box` warning の file / line |
 | `timeout` | 無限ループを短い timeout（2 秒）で `TimedOut` にし、プロセスを残さない |

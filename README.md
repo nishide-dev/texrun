@@ -162,6 +162,12 @@ project root.
 }
 ```
 
+`diagnostics[].severity` is `error`, `warning` or `info`. When TeX stops
+because of an error (`-halt-on-error`), the `emergency_stop` diagnostic that
+follows it is `info`, so the errors are the problems to fix; the human output
+does not show it. A missing package or class has the line of its
+`\usepackage` / `\documentclass` only when it can be told for certain.
+
 Check `error` first, then `outcome` (or just `texrun_exit_code`). `exit` is
 the latexmk process status and is informational only. `error` can appear
 together with an `outcome`, e.g. when the compile succeeded but its output

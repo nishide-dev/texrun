@@ -1,8 +1,10 @@
 //! Turns TeX / LaTeX engine logs (`main.log`) into structured
 //! [`Diagnostic`]s.
 //!
-//! The parser is a pure function of the log bytes: it runs no processes and
-//! touches no files, so it can be tested without a TeX installation. It is
+//! The parser is a pure function of the log bytes (and, optionally, of source
+//! files handed to it by the caller, see [`LogParser::parse_with_sources`]):
+//! it runs no processes and touches no files, so it can be tested without a
+//! TeX installation. It is
 //! deliberately best-effort. It recognizes a fixed set of common patterns,
 //! ignores every line it does not understand, never panics and never fails.
 //! The full log remains available as a compile artifact, so nothing is lost
@@ -15,7 +17,7 @@
 //! | `Undefined control sequence.` | `UndefinedControlSequence` | error |
 //! | `LaTeX Error: File `x.sty' not found.`, `I can't find file` | `MissingFile` | error |
 //! | `LaTeX Error: ...`, `Package x Error: ...`, `Class x Error: ...` | `LatexError` | error |
-//! | `Emergency stop.`, ` ==> Fatal error occurred` (if no stop was reported) | `EmergencyStop` | error |
+//! | `Emergency stop.`, ` ==> Fatal error occurred` (if no stop was reported) | `EmergencyStop` | error; info after an error |
 //! | any other TeX error (`Missing $ inserted.`, ...) | `Other` | error |
 //! | `Overfull \hbox` / `\vbox` | `OverfullBox` | warning |
 //! | `Underfull \hbox` / `\vbox` | `UnderfullBox` | warning |
@@ -30,14 +32,32 @@
 //! warning `There were undefined references.` is dropped when individual
 //! undefined references / citations were reported.
 //!
+//! TeX stops after the first error with `-halt-on-error` (and in nonstop mode
+//! when it cannot continue, e.g. at a missing file), printing `Emergency
+//! stop.` or `==> Fatal error occurred`. When an error was reported before
+//! it, that stop is a consequence of the error rather than a problem of its
+//! own, so it is reported with [`Severity::Info`]: the number of errors is
+//! the number of problems to fix. A stop without an earlier error (e.g. a
+//! job aborted for another reason) stays an error.
+//!
 //! # Locations
 //!
 //! - `line`: the `file:line:` prefix, the `l.<n>` context line, `on input
-//!   line <n>` or `at line(s) <n>`. For a missing package or class, TeX
-//!   reports the position after LaTeX looked ahead for an optional argument
-//!   (usually the next line); that line is only used when it shows the
-//!   `\usepackage` / `\documentclass` / ... command, otherwise `line = None`
-//!   (the file name is in the message).
+//!   line <n>` or `at line(s) <n>`.
+//! - For a missing package or class, TeX reports the position after LaTeX
+//!   looked ahead for an optional `[<date>]` argument: usually the next
+//!   line, possibly several lines later (comment lines are skipped). The
+//!   line of the requesting `\usepackage` / `\RequirePackage` /
+//!   `\documentclass` / `\LoadClass` is reported only when it is certain:
+//!   the text before the looked-ahead position must end with that command
+//!   (options and the package list may span lines) naming the package.
+//!   From the log alone this is only known when the request is on the same
+//!   line as the looked-ahead token; with the source file
+//!   ([`LogParser::parse_with_sources`]) the lines before it are read too,
+//!   provided the source line matches the context line in the log.
+//!   Otherwise `line = None` (the file name is in the message). The
+//!   `Emergency stop.` that follows keeps no line either, since it reports
+//!   the looked-ahead position.
 //! - `file`: the `file:line:` prefix, otherwise the innermost file of the
 //!   `(./chapter1.tex ... )` file stack TeX prints while reading. The stack is
 //!   tracked heuristically. Whenever the innermost name is uncertain, `file`
@@ -94,17 +114,46 @@
 mod lines;
 mod parser;
 mod patterns;
+mod request;
 mod stack;
 
 pub use parser::ParsedLog;
-use texrun_core::WorkspaceRoot;
 pub use texrun_core::{Diagnostic, DiagnosticKind, Severity};
+use texrun_core::{WorkspacePath, WorkspaceRoot};
 
 /// TeX's default `max_print_line`.
 const TEX_DEFAULT_MAX_PRINT_LINE: usize = 79;
 
 /// Default of [`LogParser::with_max_diagnostics`].
 pub const DEFAULT_MAX_DIAGNOSTICS: usize = 1000;
+
+/// Read access to the source files TeX read, for
+/// [`LogParser::parse_with_sources`].
+///
+/// Implemented for closures `Fn(&WorkspacePath) -> Option<Vec<u8>>`.
+pub trait SourceFiles {
+    /// The contents of `file`, a path relative to TeX's working directory
+    /// (the workspace root), or `None` if it cannot be read. The parser
+    /// only asks for files the log attributes a diagnostic to, and only
+    /// looks at a window of lines, but callers should still bound the size
+    /// they read.
+    fn read(&self, file: &WorkspacePath) -> Option<Vec<u8>>;
+}
+
+impl<F: Fn(&WorkspacePath) -> Option<Vec<u8>>> SourceFiles for F {
+    fn read(&self, file: &WorkspacePath) -> Option<Vec<u8>> {
+        self(file)
+    }
+}
+
+/// No source files.
+struct NoSources;
+
+impl SourceFiles for NoSources {
+    fn read(&self, _: &WorkspacePath) -> Option<Vec<u8>> {
+        None
+    }
+}
 
 /// Configurable log parser. [`parse_log`] is a shortcut for the default
 /// configuration.
@@ -167,6 +216,14 @@ impl LogParser {
     /// Parses a log. Never fails: unrecognized or malformed input (including
     /// invalid UTF-8) yields fewer diagnostics, not an error.
     pub fn parse(&self, log: &[u8]) -> ParsedLog {
+        self.parse_with_sources(log, &NoSources)
+    }
+
+    /// Like [`LogParser::parse`], also reading source files through
+    /// `sources` where the log alone does not locate a diagnostic (currently
+    /// only the request of a missing package or class; see the crate docs).
+    /// The files must be the ones TeX read, unchanged since.
+    pub fn parse_with_sources(&self, log: &[u8], sources: &dyn SourceFiles) -> ParsedLog {
         let lines = lines::split(log, self.max_print_line);
         let config = parser::Config {
             workspace_root: self.workspace_root.as_ref(),
@@ -175,6 +232,7 @@ impl LogParser {
                 None => Some(TEX_DEFAULT_MAX_PRINT_LINE),
             },
             max_diagnostics: self.max_diagnostics,
+            sources,
         };
         parser::parse(&lines, &config)
     }

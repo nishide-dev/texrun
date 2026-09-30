@@ -28,6 +28,35 @@ fn parse(name: &str) -> Vec<Diagnostic> {
         .diagnostics
 }
 
+/// Like [`parse`], with the fixture's documents in `src/<doc>/` as the
+/// source files (as the engine passes the workspace).
+fn parse_with_sources(name: &str, doc: &str) -> Vec<Diagnostic> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/src")
+        .join(doc);
+    let sources = |file: &WorkspacePath| std::fs::read(dir.join(file.as_path())).ok();
+    LogParser::new()
+        .with_max_print_line(ENGINE_MAX_PRINT_LINE)
+        .parse_with_sources(&read(name), &sources)
+        .diagnostics
+}
+
+/// A missing package / class: the file error and the stop that follows it.
+#[track_caller]
+fn assert_missing(d: &[Diagnostic], name: &str, at: (Option<&str>, Option<u32>)) {
+    assert_eq!(kinds(d), [K::MissingFile, K::EmergencyStop]);
+    assert_at(&d[0], Severity::Error, K::MissingFile, at);
+    assert!(
+        d[0].message.contains(&format!("File `{name}' not found")),
+        "{}",
+        d[0].message
+    );
+    // The stop is a consequence of the error, and its context line is where
+    // LaTeX looked ahead, not the request: no line.
+    assert_at(&d[1], Severity::Info, K::EmergencyStop, (at.0, None));
+    assert_eq!(d[1].message, "Emergency stop.");
+}
+
 fn kinds(diagnostics: &[Diagnostic]) -> Vec<K> {
     diagnostics.iter().map(|d| d.kind).collect()
 }
@@ -63,10 +92,10 @@ fn undefined_control_sequence() {
     assert!(excerpt.starts_with("./main.tex:5: Undefined control sequence."));
     assert!(excerpt.contains("l.5 \\foo"));
     assert!(excerpt.contains("{bar}"));
-    // `-halt-on-error` then stops TeX.
+    // `-halt-on-error` then stops TeX: a consequence, not a second error.
     assert_at(
         &d[1],
-        Severity::Error,
+        Severity::Info,
         K::EmergencyStop,
         (Some("main.tex"), Some(5)),
     );
@@ -95,34 +124,138 @@ fn classic_error_format_without_file_line_error() {
 
 #[test]
 fn missing_package() {
-    let d = parse("missing-package");
-    assert_eq!(kinds(&d), [K::MissingFile, K::EmergencyStop]);
-    // TeX reports the position where it stopped reading, which is the line
-    // after `\usepackage{...}` (`l.4 \begin`, LaTeX looked ahead for an
-    // optional argument). That would point at the wrong line, so the missing
-    // package has no line; its name is in the message.
-    assert_at(
-        &d[0],
-        Severity::Error,
-        K::MissingFile,
+    // `\usepackage{...}` is on line 3. TeX reports `l.4 \begin`, where LaTeX
+    // looked ahead for an optional `[<date>]`; from the log alone line 3 is
+    // unknown, so there is no line (the name is in the message).
+    let pkg = "texrunnonexistentpackage.sty";
+    assert_missing(&parse("missing-package"), pkg, (Some("main.tex"), None));
+    // With the source, the `\usepackage` before `\begin` is found.
+    assert_missing(
+        &parse_with_sources("missing-package", "missing-package"),
+        pkg,
+        (Some("main.tex"), Some(3)),
+    );
+}
+
+/// `l.3 \usepackage` shows the next `\usepackage{amsmath}`, not the request
+/// on line 2.
+#[test]
+fn missing_package_before_another_usepackage() {
+    let pkg = "texrunnonexistentpackage.sty";
+    let doc = "missing-package-before-usepackage";
+    assert_missing(&parse(doc), pkg, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("main.tex"), Some(2)),
+    );
+    // The same in the classic format (the file comes from the file stack).
+    assert_missing(
+        &parse("missing-package-traditional"),
+        pkg,
         (Some("main.tex"), None),
     );
-    assert!(
-        d[0].message
-            .contains("File `texrunnonexistentpackage.sty' not found"),
-        "{}",
-        d[0].message
+    assert_missing(
+        &parse_with_sources("missing-package-traditional", doc),
+        pkg,
+        (Some("main.tex"), Some(2)),
     );
-    // The stop that follows reports the same wrong position (even in its
-    // `./main.tex:4:` prefix), so it has no line either. The fatal-error
-    // summary after `Emergency stop.` is not repeated.
-    assert_at(
-        &d[1],
-        Severity::Error,
-        K::EmergencyStop,
+}
+
+/// `\usepackage[` on line 3, options with comments, `]{...}` on line 6, a
+/// comment line and a blank line (`l.8 ^^M`: the look-ahead found `\par`).
+#[test]
+fn missing_package_with_options_over_several_lines() {
+    let doc = "missing-package-options";
+    let pkg = "texrunnonexistentpackage.sty";
+    assert_missing(&parse(doc), pkg, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("main.tex"), Some(3)),
+    );
+}
+
+/// A package list over lines 2-3, then an indented comment line.
+#[test]
+fn missing_package_in_a_list() {
+    let doc = "missing-package-list";
+    let pkg = "texrunnonexistentpackage.sty";
+    assert_missing(&parse(doc), pkg, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("main.tex"), Some(2)),
+    );
+}
+
+/// Three `\usepackage` on line 2: the context line is line 2 itself
+/// (shortened by TeX to `l.2 ...ackage{texrunnonexistentpackage}\usepackage`).
+#[test]
+fn missing_package_among_others_on_one_line() {
+    let doc = "missing-package-same-line";
+    let pkg = "texrunnonexistentpackage.sty";
+    // The shortened context cuts `\usepackage` off: unknown from the log.
+    assert_missing(&parse(doc), pkg, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("main.tex"), Some(2)),
+    );
+}
+
+/// Indented lines: TeX prints the indentation (a tab as it is) in the
+/// context line `l.3  <TAB>\begin`.
+#[test]
+fn missing_package_on_indented_lines() {
+    let doc = "missing-package-indented";
+    let pkg = "texrunnonexistentpackage.sty";
+    assert_missing(&parse(doc), pkg, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("main.tex"), Some(2)),
+    );
+}
+
+/// `\RequirePackage` on line 4 of a package in the project.
+#[test]
+fn missing_package_required_by_a_local_package() {
+    let doc = "missing-package-in-sty";
+    let pkg = "texrunnonexistentpackage.sty";
+    assert_missing(&parse(doc), pkg, (Some("texrunlocal.sty"), None));
+    assert_missing(
+        &parse_with_sources(doc, doc),
+        pkg,
+        (Some("texrunlocal.sty"), Some(4)),
+    );
+}
+
+/// Sources that do not match the log are not used.
+#[test]
+fn mismatching_sources_are_ignored() {
+    let pkg = "texrunnonexistentpackage.sty";
+    // Another document (the `\usepackage` is on line 2 there, line 3 in the
+    // log's document).
+    assert_missing(
+        &parse_with_sources("missing-package", "missing-package-before-usepackage"),
+        pkg,
         (Some("main.tex"), None),
     );
-    assert_eq!(d[1].message, "Emergency stop.");
+    let log = read("missing-package");
+    for source in [
+        &b""[..],
+        b"\\documentclass{article}\n\\usepackage{amsmath}\n% \\usepackage{texrunnonexistentpackage}\n\\begin{document}\n",
+        b"\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage{texrunnonexistentpackage}\n\\begin{abstract}\n",
+        b"\\documentclass{article}\r\\usepackage{amsmath}\n\\usepackage{texrunnonexistentpackage}\n\\begin{document}\n",
+    ] {
+        let sources = |_: &WorkspacePath| Some(source.to_vec());
+        let d = LogParser::new()
+            .with_max_print_line(ENGINE_MAX_PRINT_LINE)
+            .parse_with_sources(&log, &sources)
+            .diagnostics;
+        assert_missing(&d, pkg, (Some("main.tex"), None));
+    }
 }
 
 #[test]
@@ -139,7 +272,7 @@ fn missing_input_file() {
     assert!(d[0].message.contains("chapters/nothere.tex"));
     assert_at(
         &d[1],
-        Severity::Error,
+        Severity::Info,
         K::EmergencyStop,
         (Some("main.tex"), Some(4)),
     );
@@ -321,6 +454,13 @@ fn installed_files_are_never_attributed() {
         "unusual-names",
         "unusual-names-traditional",
         "unbalanced-parens",
+        "missing-package-before-usepackage",
+        "missing-package-options",
+        "missing-package-list",
+        "missing-package-same-line",
+        "missing-package-in-sty",
+        "missing-package-traditional",
+        "missing-package-indented",
     ] {
         let log = read(name);
         for parser in [
@@ -342,21 +482,13 @@ fn installed_files_are_never_attributed() {
 
 #[test]
 fn missing_class() {
-    let d = parse("missing-class");
-    assert_eq!(kinds(&d), [K::MissingFile, K::EmergencyStop]);
-    // `l.2 \begin`: the class was requested on line 1, so no line.
-    assert_at(
-        &d[0],
-        Severity::Error,
-        K::MissingFile,
-        (Some("main.tex"), None),
-    );
-    assert!(d[0].message.contains("texrunnonexistentclass.cls"));
-    assert_at(
-        &d[1],
-        Severity::Error,
-        K::EmergencyStop,
-        (Some("main.tex"), None),
+    // `l.2 \begin`: the class was requested on line 1.
+    let cls = "texrunnonexistentclass.cls";
+    assert_missing(&parse("missing-class"), cls, (Some("main.tex"), None));
+    assert_missing(
+        &parse_with_sources("missing-class", "missing-class"),
+        cls,
+        (Some("main.tex"), Some(1)),
     );
 }
 
@@ -434,11 +566,12 @@ fn max_diagnostics_applies_to_real_logs() {
         .with_max_print_line(ENGINE_MAX_PRINT_LINE)
         .with_max_diagnostics(2)
         .parse(&read("multi-file"));
-    // The two errors are kept over the two earlier warnings.
+    // The error is kept over the earlier warnings, then the first of the
+    // rest (the stop after the error is info).
     assert_eq!(parsed.omitted, 2);
     assert_eq!(
         kinds(&parsed.diagnostics),
-        [K::UndefinedControlSequence, K::EmergencyStop, K::Other]
+        [K::UndefinedReference, K::UndefinedControlSequence, K::Other]
     );
     assert_eq!(parsed.diagnostics[2].severity, Severity::Info);
 }

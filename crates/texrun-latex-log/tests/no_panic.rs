@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use proptest::prelude::*;
-use texrun_core::WorkspaceRoot;
+use texrun_core::{WorkspacePath, WorkspaceRoot};
 use texrun_latex_log::{Diagnostic, LogParser};
 
 fn parsers() -> Vec<LogParser> {
@@ -113,6 +113,38 @@ fn fragment_log() -> impl Strategy<Value = Vec<u8>> {
     })
 }
 
+/// Fragments of LaTeX source around a package request.
+const SOURCE_FRAGMENTS: &[&str] = &[
+    "",
+    " ",
+    "\t",
+    "\n",
+    "\r",
+    "\r\n",
+    "%",
+    "\\",
+    "{",
+    "}",
+    "[",
+    "]",
+    ",",
+    "^^M",
+    "\\usepackage",
+    "\\RequirePackage",
+    "\\documentclass",
+    "{texrunnonexistentpackage}",
+    "texrunnonexistentpackage",
+    "\\begin{document}",
+    "\\begin",
+    "{amsmath}",
+    "é",
+];
+
+fn source_text() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(prop::sample::select(SOURCE_FRAGMENTS), 0..60)
+        .prop_map(|pieces| pieces.concat().into_bytes())
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/logs")
@@ -145,5 +177,42 @@ proptest! {
         }
         log.truncate(cut.index(log.len() + 1));
         check(&log);
+    }
+
+    /// Missing-package logs with random source files (and random edits of
+    /// the log): locating the request never panics, and a line it reports
+    /// exists in the source.
+    #[test]
+    fn locating_requests_never_panics(
+        name in prop::sample::select(&[
+            "missing-package",
+            "missing-package-options",
+            "missing-package-same-line",
+            "missing-class",
+        ][..]),
+        source in source_text(),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..8),
+    ) {
+        let mut log = fixture(name);
+        for (at, byte) in edits {
+            let i = at.index(log.len());
+            log[i] = byte;
+        }
+        let sources = |_: &WorkspacePath| Some(source.clone());
+        let lines = source.split(|&b| b == b'\n').count();
+        for parser in parsers() {
+            for d in parser.parse_with_sources(&log, &sources).diagnostics {
+                check_diagnostic(&d);
+                // (An edit may turn the name into a non-package file, whose
+                // line is the context line.)
+                let request = [".sty'", ".cls'"].iter().any(|ext| d.message.contains(ext));
+                if d.kind == texrun_latex_log::DiagnosticKind::MissingFile
+                    && request
+                    && let Some(line) = d.line
+                {
+                    prop_assert!(usize::try_from(line).unwrap() <= lines, "{d:?}");
+                }
+            }
+        }
     }
 }

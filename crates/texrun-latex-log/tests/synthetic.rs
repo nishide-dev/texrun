@@ -101,18 +101,22 @@ fn missing_class_in_classic_format() {
         "! Emergency stop.\n",
         "<read *> \n",
         "         \n",
-        "l.1 \\documentclass\n",
-        "                  {nosuchclass}^^M\n",
+        "l.1 \\documentclass{nosuchclass}\\begin\n",
+        "                                     {document}^^M\n",
         "*** (cannot \\read from terminal in nonstop modes)\n",
     ));
+    // The context line shows the request itself before the looked-ahead
+    // `\\begin`, so its line is certain; the stop has none.
     assert_eq!(
         d.iter().map(at).collect::<Vec<_>>(),
         [
             (K::MissingFile, Some("main.tex"), Some(1)),
-            (K::EmergencyStop, Some("main.tex"), Some(1)),
+            (K::EmergencyStop, Some("main.tex"), None),
         ]
     );
-    assert!(d.iter().all(|d| d.severity == Severity::Error));
+    // The stop follows the error: one error to fix.
+    let severities: Vec<_> = d.iter().map(|d| d.severity).collect();
+    assert_eq!(severities, [Severity::Error, Severity::Info]);
 }
 
 #[test]
@@ -278,20 +282,36 @@ fn runaway_argument_is_part_of_the_excerpt() {
     );
 }
 
+fn missing_tikz(context: &str) -> Vec<Diagnostic> {
+    parse(&format!(
+        "(./main.tex\n! LaTeX Error: File `tikz.sty' not found.\n\n\
+         Enter file name: \n./main.tex:7: Emergency stop.\n<read *> \n         \n{context}"
+    ))
+}
+
 #[test]
-fn missing_package_line_is_kept_when_the_context_shows_usepackage() {
-    let d = parse(concat!(
-        "(./main.tex\n",
-        "! LaTeX Error: File `tikz.sty' not found.\n",
-        "\n",
-        "Enter file name: \n",
-        "./main.tex:7: Emergency stop.\n",
-        "<read *> \n",
-        "         \n",
-        "l.7 \\usepackage{tikz}\n",
-        "                      ^^M\n",
-    ));
+fn missing_package_line_is_kept_when_the_context_shows_the_request() {
+    // `\\relax` is the looked-ahead token after `\\usepackage{tikz}`.
+    let d = missing_tikz("l.7 \\usepackage{tikz}\\relax\n                           ^^M\n");
     assert_eq!(at(&d[0]), (K::MissingFile, Some("main.tex"), Some(7)));
+    assert_eq!(at(&d[1]), (K::EmergencyStop, Some("main.tex"), None));
+    // `l.7 \\usepackage` is a later request looked ahead to (the missing
+    // one is on an earlier line).
+    let d = missing_tikz("l.7 \\usepackage\n               {tikz}^^M\n");
+    assert_eq!(at(&d[0]), (K::MissingFile, Some("main.tex"), None));
+    // Another package, a misaligned or macro context: unknown.
+    for context in [
+        "l.7 \\usepackage{tikzz}\\relax\n                            ^^M\n",
+        "l.7 \\usepackage{tikz}\\relax\n  ^^M\n",
+        "\\x ->\\usepackage{tikz}\\relax\nl.7 \\x\n       ^^M\n",
+    ] {
+        let d = missing_tikz(context);
+        assert_eq!(
+            at(&d[0]),
+            (K::MissingFile, Some("main.tex"), None),
+            "{context}"
+        );
+    }
 }
 
 /// Summaries after many diagnostics must not rescan them (this was
