@@ -1,0 +1,57 @@
+This is BibTeX, Version 0.99d (TeX Live 2025/dev/Debian)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: main.aux
+The style file: plain.bst
+Database file #1: refs.bib
+Unbalanced braces---line 6 of file refs.bib
+ : 
+ : }
+(Error may have been on previous line)
+I'm skipping whatever remains of this entry
+Warning--to sort, need author, editor, or key in knuth
+Warning--empty author and editor in knuth
+Warning--empty title in knuth
+Warning--empty publisher in knuth
+Warning--empty year in knuth
+You've used 2 entries,
+            2118 wiz_defined-function locations,
+            503 strings with 4068 characters,
+and the built_in function-call counts, 405 in all, are:
+= -- 29
+> -- 8
+< -- 0
++ -- 4
+- -- 2
+* -- 27
+:= -- 62
+add.period$ -- 4
+call.type$ -- 2
+change.case$ -- 5
+chr.to.int$ -- 0
+cite$ -- 7
+duplicate$ -- 25
+empty$ -- 47
+format.name$ -- 2
+if$ -- 83
+int.to.chr$ -- 0
+int.to.str$ -- 2
+missing$ -- 3
+newline$ -- 11
+num.names$ -- 2
+pop$ -- 21
+preamble$ -- 1
+purify$ -- 5
+quote$ -- 0
+skip$ -- 12
+stack$ -- 0
+substring$ -- 10
+swap$ -- 1
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 4
+warning$ -- 5
+while$ -- 2
+width$ -- 3
+write$ -- 16
+(There was 1 error message)

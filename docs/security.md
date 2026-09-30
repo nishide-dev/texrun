@@ -285,7 +285,7 @@ rc の骨子（設定項目名レベル）は次のとおり。正確な内容�
   - サブディレクトリへの `\include`
   - makeindex
 - `$kpsewhich = 'NONE'` の副作用が 2 つある。
-  - bibtex を使う文書では、latexmk の stderr に `Kpsewhich command needed but not set up` が出る。diagnostics は main の `.log` からだけ作るので、この行は diagnostics にならない。
+  - bibtex を使う文書では、latexmk の stderr に `Kpsewhich command needed but not set up` が出る。diagnostics は main の `.log` と BibTeX の `.blg`、および latexmk の BibTeX に関する決まった行（`.bib` が無いときの veto、BibTeX の error の要約）からだけ作るので、この行は diagnostics にならない。
   - latexmk は、texmf 内のファイルの依存関係を追跡しなくなる。texrun は毎回まっさらな workspace で compile するので、影響は無い。
 - latexmk 4.86 のソースで、shell を使う箇所は次の 3 つだった。
   - コマンドの実行
@@ -397,6 +397,13 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
 これらの扱いは次のとおりとする。
 
 - 収集する artifact は engine が報告したもの（PDF、log、preview）だけにする。`.fls` / `.fdb_latexmk` / `.aux` は収集しない（#4 / #5）。
+- BibTeX の `.blg` も artifact にしない（#27）。内容は diagnostics（`bibtex_error` / `bibtex_failed` / `missing_file` など）の `raw_excerpt` に入る。engine は output dir 以下の `.blg` を、compile の timeout の外で読むので、読む量に上限を設ける。
+  - output dir の走査: 最大 20,000 entry・深さ 16、symlink はたどらない
+  - 読む `.blg`: この compile で更新されたもの（mtime が latexmk の開始以降）を最大 16 個。通常ファイルだけを `O_NOFOLLOW | O_NONBLOCK` で開き、先頭 1 MiB まで読む
+  - `<stem>.blg` を先に読み、全 `.blg` を合わせて最大 200 個の diagnostics（各 `.blg` の要約と省略の通知は別）。parse は読んだ量に線形
+  - 文書は output dir に任意のファイルを書けるので、`.blg` の内容も main の `.log` と同じく文書が制御できる入力として扱う。file を付けるのは entrypoint のディレクトリに実在する `.bib` / `.bst` だけなので、`.blg` を偽造しても workspace 外や存在しないファイルを指す diagnostic にはならない
+  - output dir は compile ごとに新しい前提（CLI は毎回新しい workspace を作る）。mtime の判定は保険
+  - `.bib` / `.bst` の file は、`.blg` が database / style として名前を挙げ、entrypoint のディレクトリ（latexmk が BibTeX の `BIBINPUTS` / `BSTINPUTS` の先頭に置く）に workspace 内の通常ファイルとしてあるときだけ付ける。`.aux` 内の位置や installed な style には付けない
 - 既定では `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` を設定しないので、PDF の日時は compile した時刻になる。再現可能なビルドを求められた場合に限り、CLI の option（#6）で `SOURCE_DATE_EPOCH=<値>` と `FORCE_SOURCE_DATE=1` を env allowlist に加える。これで、PDF の日時が固定されることを確認した。
 - banner と log 内のパスは、MVP では抑制しない。生成物を第三者と共有する場合は、利用者の判断に委ねる。
 

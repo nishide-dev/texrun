@@ -17,11 +17,11 @@ const MAX_CONTEXT_SCAN: usize = 40;
 /// Maximum number of help / box detail lines consumed after a diagnostic.
 const MAX_TRAILING_LINES: usize = 24;
 /// Upper bound of [`Diagnostic::message`], in bytes.
-const MAX_MESSAGE_BYTES: usize = 2048;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 2048;
 /// Upper bound of [`Diagnostic::raw_excerpt`], in bytes.
-const MAX_EXCERPT_BYTES: usize = 4096;
+pub(crate) const MAX_EXCERPT_BYTES: usize = 4096;
 /// Upper bound of the number of lines in [`Diagnostic::raw_excerpt`].
-const MAX_EXCERPT_LINES: usize = 32;
+pub(crate) const MAX_EXCERPT_LINES: usize = 32;
 /// At most this many source files are read per log. TeX stops at the first
 /// missing package, so a real log needs one; document output could fake
 /// more, and each read may cost up to the caller's size limit.
@@ -448,7 +448,7 @@ impl<'a> Parser<'a> {
 /// memory stays bounded however long the log is, and warnings never push
 /// out a later error); [`Collector::finish`] then lets errors fill the limit
 /// first and restores log order.
-struct Collector {
+pub(crate) struct Collector {
     limit: usize,
     seen: usize,
     errors: Vec<(usize, Diagnostic)>,
@@ -456,7 +456,7 @@ struct Collector {
 }
 
 impl Collector {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
             seen: 0,
@@ -467,7 +467,7 @@ impl Collector {
 
     /// Counts one diagnostic of `severity` and returns whether it may be
     /// kept, so that callers skip building dropped ones.
-    fn accepts(&mut self, severity: Severity) -> bool {
+    pub(crate) fn accepts(&mut self, severity: Severity) -> bool {
         self.seen += 1;
         let bucket = if severity == Severity::Error {
             &self.errors
@@ -477,7 +477,7 @@ impl Collector {
         bucket.len() < self.limit
     }
 
-    fn push(&mut self, d: Diagnostic) {
+    pub(crate) fn push(&mut self, d: Diagnostic) {
         let seq = self.seen;
         if d.severity == Severity::Error {
             self.errors.push((seq, d));
@@ -486,7 +486,7 @@ impl Collector {
         }
     }
 
-    fn finish(self) -> ParsedLog {
+    pub(crate) fn finish(self) -> ParsedLog {
         let Self {
             limit,
             seen,
@@ -545,7 +545,7 @@ pub(crate) fn normalize_path(
 /// Replaces tabs by spaces and other control characters by U+FFFD (so a
 /// message is safe to print on a terminal), and bounds the length. Stops
 /// reading at the bound, so a huge line costs no more than `max` bytes.
-fn sanitize(text: &str, max: usize) -> String {
+pub(crate) fn sanitize(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max));
     for c in text.chars() {
         let c = match c {
@@ -562,7 +562,7 @@ fn sanitize(text: &str, max: usize) -> String {
 }
 
 /// The longest prefix of `text` of at most `max` bytes.
-fn prefix(text: &str, max: usize) -> &str {
+pub(crate) fn prefix(text: &str, max: usize) -> &str {
     if text.len() <= max {
         return text;
     }

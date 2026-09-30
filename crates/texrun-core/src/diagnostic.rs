@@ -56,6 +56,15 @@ pub enum DiagnosticKind {
     UndefinedCitation,
     /// The engine asks for another run (e.g. changed labels).
     RerunRequired,
+    /// An error BibTeX reported while reading a `.bib` database (e.g. a
+    /// syntax error or a repeated entry), the style or the `.aux` file.
+    /// A database or style file that cannot be opened is
+    /// [`DiagnosticKind::MissingFile`] instead.
+    BibtexError,
+    /// BibTeX failed, or was not run, so the bibliography is incomplete or
+    /// missing. Follows the individual BibTeX errors (then as
+    /// [`Severity::Info`]), or stands alone when there are none to report.
+    BibtexFailed,
     /// Recognized as a diagnostic but not classified further. Unknown values
     /// are deserialized as this variant.
     #[serde(other)]
@@ -162,6 +171,20 @@ mod tests {
             serde_json::to_value(&d).unwrap(),
             json!({ "severity": "info", "kind": "rerun_required", "message": "rerun" })
         );
+    }
+
+    #[test]
+    fn bibtex_kinds_are_snake_case() {
+        for (kind, name) in [
+            (DiagnosticKind::BibtexError, "bibtex_error"),
+            (DiagnosticKind::BibtexFailed, "bibtex_failed"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<DiagnosticKind>(json!(name)).unwrap(),
+                kind
+            );
+        }
     }
 
     #[test]
