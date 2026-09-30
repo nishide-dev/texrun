@@ -132,8 +132,9 @@ paths to the workspace, limit the environment passed to TeX and enforce a
 timeout, but in-process execution is **not** a complete sandbox (for example,
 parts of the host such as the TeX Live tree remain readable).
 
-The trust boundary, guarantees and limitations will be documented under
-`docs/` as part of [#9](https://github.com/nishide-dev/texrun/issues/9).
+See [docs/security.md](docs/security.md) for the trust boundary, guarantees,
+limitations and execution limits (Japanese), and [SECURITY.md](SECURITY.md) for
+reporting vulnerabilities.
 
 ## Contributing
 
