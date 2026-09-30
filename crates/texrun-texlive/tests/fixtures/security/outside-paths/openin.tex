@@ -1,0 +1,6 @@
+\documentclass{article}
+\input{probe-path}
+\begin{document}
+Text.
+\IfFileExists{\probepath.tex}{\input{\probepath}}{}
+\end{document}

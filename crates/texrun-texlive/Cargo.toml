@@ -17,6 +17,7 @@ texrun-latex-log.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+texrun-preview.workspace = true
 texrun-workspace.workspace = true
 
 [lints]

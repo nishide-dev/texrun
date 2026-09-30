@@ -1,0 +1,9 @@
+\documentclass{article}
+\input{probe-path}
+\newwrite\probe
+\begin{document}
+Text.
+\immediate\openout\probe=\probepath
+\immediate\write\probe{written}
+\immediate\closeout\probe
+\end{document}
