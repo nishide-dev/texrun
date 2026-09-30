@@ -285,13 +285,21 @@ impl ErrorInfo {
             _ => Category::Runtime,
         };
         let info = Self::new(stage, snake_case_name(&kind), category, error_chain(err));
-        if kind == K::Unavailable {
-            info.with_hint(
+        match err {
+            EngineError::Unavailable { engine, .. }
+                if engine == texrun_texlive::CONTAINER_ENGINE_NAME =>
+            {
+                info.with_hint(
+                    "--backend container needs Docker (or Podman) and the engine image: build it \
+                     with `docker build -t texrun-engine:latest docker/engine` in the texrun \
+                     repository, or pass --container-image",
+                )
+            }
+            EngineError::Unavailable { .. } => info.with_hint(
                 "install TeX Live with latexmk and make sure `latexmk` is on PATH, or use the \
-                 Docker development environment (docs/development.md)",
-            )
-        } else {
-            info
+                 Docker development environment (docs/development.md), or --backend container",
+            ),
+            _ => info,
         }
     }
 

@@ -1,0 +1,308 @@
+//! What the container backend guarantees on top of the host engine
+//! (docs/security.md §2, §4): the rest of the host is not visible to TeX,
+//! containers never outlive the compile, and the limits are enforced by
+//! the runtime.
+//!
+//! The #10 fixtures themselves run with the container backend through
+//! `TEXRUN_TEST_BACKEND=container` (`scenarios.rs`, `security.rs`). These
+//! tests always use it; they are skipped without a container runtime and
+//! the engine image, unless `TEXRUN_REQUIRE_SANDBOX=1`. See
+//! `tests/common/mod.rs`.
+
+mod common;
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use common::{
+    Compile, assert_location, assert_outcome, assert_pdf, container_engine, copy_tree, describe,
+    find, fixture, has, plain_tempdir, require_sandbox,
+};
+use tempfile::TempDir;
+use texrun_core::{
+    CancelToken, CompileOutcome, DiagnosticKind, EngineErrorKind, PathMapping, ResourceLimits,
+    TypesetEngine,
+};
+use texrun_texlive::{
+    CONTAINER_ENGINE_NAME, ContainerConfig, ContainerEngine, LatexmkEngine, Limits,
+};
+use texrun_workspace::WorkspaceConfig;
+
+/// The tests check for containers left behind by this process, so they
+/// run one at a time.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn engine() -> ContainerEngine {
+    container_engine(ContainerConfig::default())
+}
+
+/// Containers created by this test process that still exist.
+fn containers_of_this_process() -> Vec<String> {
+    let runtime = engine().runtime().unwrap();
+    let out = Command::new(runtime.program())
+        .args(["ps", "--all", "--quiet", "--filter"])
+        .arg(format!(
+            "label=org.texrun.sandbox.pid={}",
+            std::process::id()
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_result_names_the_container_backend() {
+    require_sandbox!();
+    let _serial = serial();
+    let (run, ws) = Compile::fixture("minimal", "main.tex")
+        .engine(engine())
+        .run();
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    assert_pdf(&run, &ws, "main.pdf");
+    assert_eq!(run.result.engine.name, CONTAINER_ENGINE_NAME);
+    assert_eq!(
+        run.result.resource_limits,
+        Some(ResourceLimits::new(true, true))
+    );
+    assert!(containers_of_this_process().is_empty());
+
+    let engine = engine();
+    let info = engine.probe().unwrap();
+    let version = info.version.unwrap();
+    assert!(version.starts_with("latexmk "), "{version}");
+    assert!(version.contains("image "), "{version}");
+}
+
+/// `P/project` is the `security/sandbox` fixture with `probe-path.tex`
+/// naming `probe_path`; `P/outside-probe.txt` is a host file outside the
+/// workspace.
+/// Returns the directory, the PDF (empty if there is none) and a
+/// description of the run.
+fn embed(probe_path: impl FnOnce(&Path) -> String) -> (TempDir, Vec<u8>, String) {
+    let dir = plain_tempdir();
+    let project = dir.path().join("project");
+    copy_tree(&fixture("security/sandbox"), &project);
+    fs::write(
+        dir.path().join("outside-probe.txt"),
+        "texrun-outside-marker\n",
+    )
+    .unwrap();
+    let path = probe_path(&fs::canonicalize(dir.path()).unwrap());
+    fs::write(
+        project.join("probe-path.tex"),
+        format!("\\def\\probepath{{{path}}}\n"),
+    )
+    .unwrap();
+    let (run, ws) = Compile::new(&project, "embed.tex")
+        .config(WorkspaceConfig::default().with_temp_parent(dir.path()))
+        .engine(engine())
+        .run();
+    let pdf = fs::read(ws.output_dir().join("embed.pdf")).unwrap_or_default();
+    let summary = describe(&run);
+    drop(ws);
+    (dir, pdf, summary)
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+#[test]
+fn files_outside_the_workspace_cannot_be_embedded() {
+    require_sandbox!();
+    let _serial = serial();
+    // Control: a file inside the workspace is embedded into the PDF.
+    let (_dir, pdf, run) = embed(|_| "inside-probe.txt".to_owned());
+    assert!(contains(&pdf, "texrun-inside-marker"), "{run}");
+
+    // The same primitive with a host path outside the workspace, absolute
+    // or through `..`: the host file does not exist in the container.
+    for probe in [
+        (|dir: &Path| format!("{}/outside-probe.txt", dir.display())) as fn(&Path) -> String,
+        |_| "../outside-probe.txt".to_owned(),
+        |_| "../../outside-probe.txt".to_owned(),
+    ] {
+        let (_dir, pdf, run) = embed(probe);
+        assert!(!contains(&pdf, "texrun-outside-marker"), "{run}");
+    }
+}
+
+#[test]
+fn the_texmf_tree_is_the_images() {
+    require_sandbox!();
+    let _serial = serial();
+    // The log names the class file TeX read: from the image's TeX Live, at
+    // the same place whatever the host has.
+    let (run, ws) = Compile::fixture("minimal", "main.tex")
+        .engine(engine())
+        .run();
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    let log = fs::read_to_string(ws.output_dir().join("main.log")).unwrap();
+    assert!(
+        log.contains("/usr/share/texlive/texmf-dist/tex/latex/base/article.cls"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_timeout_leaves_no_container() {
+    require_sandbox!();
+    let _serial = serial();
+    let started = Instant::now();
+    let (run, _ws) = Compile::fixture("timeout", "main.tex")
+        .engine(engine())
+        .timeout(Duration::from_secs(2))
+        .run();
+    assert_outcome(&run, CompileOutcome::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(containers_of_this_process().is_empty());
+}
+
+#[test]
+fn cancellation_leaves_no_container() {
+    require_sandbox!();
+    let _serial = serial();
+    let cancel = CancelToken::new();
+    let trigger = cancel.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        trigger.cancel();
+    });
+    let (run, _ws) = Compile::fixture("timeout", "main.tex")
+        .engine(engine())
+        .timeout(Duration::from_secs(60))
+        .cancel(cancel)
+        .run();
+    canceller.join().unwrap();
+    assert_outcome(&run, CompileOutcome::Cancelled);
+    assert!(containers_of_this_process().is_empty());
+}
+
+#[test]
+fn the_cpu_time_limit_applies_in_the_container() {
+    require_sandbox!();
+    let _serial = serial();
+    let limits = Limits::default().with_max_cpu_time(Some(Duration::from_secs(2)));
+    let (run, _ws) = Compile::fixture("timeout", "main.tex")
+        .engine(container_engine(
+            ContainerConfig::default().with_limits(limits),
+        ))
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_outcome(&run, CompileOutcome::Failed);
+    let d = find(&run, DiagnosticKind::ResourceLimit);
+    assert!(d.message.contains("CPU time"), "{d:#?}");
+}
+
+#[test]
+fn the_address_space_limit_applies_in_the_container() {
+    require_sandbox!();
+    let _serial = serial();
+    // Too small for pdflatex to start (docs/security.md §3.10).
+    let limits = Limits::default().with_max_address_space(64 * 1024 * 1024);
+    let (run, _ws) = Compile::fixture("minimal", "main.tex")
+        .engine(container_engine(
+            ContainerConfig::default().with_limits(limits),
+        ))
+        .run();
+    assert_outcome(&run, CompileOutcome::Failed);
+    let d = find(&run, DiagnosticKind::ResourceLimit);
+    assert!(d.message.contains("out of memory"), "{d:#?}");
+}
+
+#[test]
+fn bibtex_and_makeindex_run_in_the_container() {
+    require_sandbox!();
+    let _serial = serial();
+    let (run, ws) = Compile::fixture("security/aux-tools", "文献 main.tex")
+        .engine(engine())
+        .run();
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    assert!(
+        !has(&run, DiagnosticKind::UndefinedCitation),
+        "{}",
+        describe(&run)
+    );
+    let out = ws.output_dir();
+    assert!(
+        fs::read_to_string(out.join("文献 main.bbl"))
+            .unwrap()
+            .contains("knuth")
+    );
+    assert!(
+        fs::read_to_string(out.join("文献 main.ind"))
+            .unwrap()
+            .contains("word")
+    );
+}
+
+#[test]
+fn diagnostics_are_workspace_relative_with_any_mount_point() {
+    require_sandbox!();
+    let _serial = serial();
+    let engine = engine();
+    for guest in ["/workspace", "/srv/texrun ws/project"] {
+        let compile = Compile::fixture("multi-file", "broken.tex");
+        let ws = compile.workspace();
+        let ctx = ws
+            .context()
+            .with_path_mapping(PathMapping::new(guest).unwrap());
+        let run = engine.run(&ctx, ws.request()).unwrap();
+        assert_outcome(&run, CompileOutcome::Failed);
+        let d = find(&run, DiagnosticKind::UndefinedControlSequence);
+        assert_location(d, "chapters/broken.tex", 2);
+    }
+}
+
+#[test]
+fn a_mount_point_over_texruns_own_is_refused() {
+    require_sandbox!();
+    let compile = Compile::fixture("minimal", "main.tex");
+    let ws = compile.workspace();
+    for guest in ["/texrun", "/texrun/rc/x"] {
+        let ctx = ws
+            .context()
+            .with_path_mapping(PathMapping::new(guest).unwrap());
+        let err = engine().run(&ctx, ws.request()).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            EngineErrorKind::InvalidRequest,
+            "{guest}: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_host_engine_refuses_a_path_mapping() {
+    // No TeX needed: refused before latexmk is looked for.
+    let compile = Compile::fixture("minimal", "main.tex");
+    let ws = compile.workspace();
+    let ctx = ws
+        .context()
+        .with_path_mapping(PathMapping::new("/workspace").unwrap());
+    let err = LatexmkEngine::default()
+        .compile(&ctx, ws.request())
+        .unwrap_err();
+    assert_eq!(err.kind(), EngineErrorKind::Unsupported, "{err}");
+}
+
+#[test]
+fn a_missing_image_is_unavailable() {
+    require_sandbox!();
+    let engine =
+        ContainerEngine::new(ContainerConfig::default().with_image("texrun-no-such-image:0"));
+    let err = engine.probe().unwrap_err();
+    assert_eq!(err.kind(), EngineErrorKind::Unavailable, "{err}");
+}

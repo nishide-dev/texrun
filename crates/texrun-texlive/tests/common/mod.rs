@@ -92,6 +92,7 @@ pub fn container_engine(config: ContainerConfig) -> ContainerEngine {
 
 /// The engine a test compiles with.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "one value per compile")]
 pub enum TestEngine {
     /// latexmk on the host.
     Host(LatexmkEngine),
@@ -192,6 +193,7 @@ pub fn texlive_available() -> bool {
 }
 
 /// Returns from the calling test unless TeX Live is available.
+#[allow(unused_macros)]
 macro_rules! require_texlive {
     () => {
         if !common::texlive_available() {
@@ -199,6 +201,7 @@ macro_rules! require_texlive {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use require_texlive;
 
 /// Whether the container backend can be used (a runtime and the image).
