@@ -203,6 +203,70 @@ jobs:
             ${{ runner.temp }}/cargo-registry
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # Container backend (#26, docs/development.md "container backend test"):
+  # the engine image (docker/engine/Dockerfile) is built and the tests run
+  # on the runner against its Docker, as `texrun --backend container`
+  # would. TEXRUN_TEST_BACKEND=container runs the #10 fixtures (scenarios /
+  # security) in the container; TEXRUN_REQUIRE_SANDBOX / _TEXLIVE turn a
+  # missing runtime, image or TeX Live into a failure instead of a skip.
+  sandbox:
+    name: sandbox
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TEXRUN_SANDBOX_IMAGE: texrun-engine:ci
+      TEXRUN_REQUIRE_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Cached like the dev image (written from main pushes only).
+      - name: Build engine image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/engine
+          file: docker/engine/Dockerfile
+          tags: ${{ env.TEXRUN_SANDBOX_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=texrun-engine
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=texrun-engine,mode=max' || '' }}
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Tool versions
+        run: |
+          docker version --format 'docker {{.Server.Version}} ({{.Server.Os}}/{{.Server.Arch}})'
+          docker run --rm --network none --entrypoint /usr/bin/latexmk "${TEXRUN_SANDBOX_IMAGE}" -v | head -n 2
+      # Like the integration job, fail if any test is #[ignore]d.
+      - name: Run container backend tests
+        shell: bash
+        env:
+          TEXRUN_REQUIRE_TEXLIVE: "1"
+          TEXRUN_TEST_BACKEND: container
+        run: |
+          set -o pipefail
+          log="${RUNNER_TEMP}/sandbox.log"
+          cargo test --locked --all-features -p texrun-sandbox 2>&1 | tee "${log}"
+          cargo test --locked --all-features -p texrun-texlive \
+            --test container --test scenarios --test security 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun --test container 2>&1 | tee -a "${log}"
+          if grep -E 'test result: .* [1-9][0-9]* ignored' "${log}"; then
+            echo "::error::Some tests are #[ignore]d and never run in CI"
+            exit 1
+          fi
+      - name: No containers left behind
+        run: |
+          left="$(docker ps --all --quiet --filter label=org.texrun.sandbox)"
+          if [ -n "${left}" ]; then
+            docker ps --all --filter label=org.texrun.sandbox
+            echo "::error::texrun left containers behind"
+            exit 1
+          fi
+
   deny:
     name: deny
     runs-on: ubuntu-latest
@@ -226,7 +290,7 @@ jobs:
   ci-success:
     name: ci-success
     if: always() && github.event_name != 'schedule'
-    needs: [fmt, check, clippy, test, integration, deny]
+    needs: [fmt, check, clippy, test, integration, sandbox, deny]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

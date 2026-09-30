@@ -80,6 +80,7 @@ pub struct Runtime {
     kind: RuntimeKind,
     program: PathBuf,
     version: String,
+    rootless: bool,
     env: EnvAllowlist,
 }
 
@@ -127,6 +128,7 @@ impl Runtime {
             kind,
             program,
             version: String::new(),
+            rootless: false,
             env: runtime_env(),
         };
         // The server version (Docker): only answered when the daemon is
@@ -156,6 +158,14 @@ impl Runtime {
             }
         }
         version.clone_into(&mut runtime.version);
+        if kind == RuntimeKind::Podman {
+            // Rootless Podman maps container uids to subordinate ids of the
+            // user; `--userns keep-id` keeps texrun's uid, so that the
+            // container can write the output directory.
+            runtime.rootless = runtime
+                .query(&["info", "--format", "{{.Host.Security.Rootless}}"])
+                .is_ok_and(|out| out.trim() == "true");
+        }
         Ok(runtime)
     }
 
@@ -172,6 +182,11 @@ impl Runtime {
     /// The version reported by the runtime (the daemon's for Docker).
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Whether this is rootless Podman (containers get `--userns keep-id`).
+    pub fn is_rootless_podman(&self) -> bool {
+        self.kind == RuntimeKind::Podman && self.rootless
     }
 
     /// The ID of the local image `image`, or [`SandboxError::Unavailable`]
@@ -247,6 +262,7 @@ impl Runtime {
             kind: RuntimeKind::Docker,
             program: PathBuf::from("/nonexistent/texrun-test-docker"),
             version: "29.0.0".to_owned(),
+            rootless: false,
             env: EnvAllowlist::new(),
         }
     }

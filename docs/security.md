@@ -7,6 +7,7 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
 > **現状:** この文書は方針と検証結果である。
 > #5 の担当分（§3.1 の timeout、§3.2 の出力上限、§3.4〜3.7）は `crates/texrun-texlive` で実装した。§3.3 は `crates/texrun-workspace`（#21）で実装した。
 > 外部プロセスの制限付き実行（§3.2 の rlimit、§3.4 の env allowlist、§3.6 の停止、§3.10 の CPU・memory・プロセス数の上限）は、latexmk と preview tool で共通の `crates/texrun-process`（#32、#25）にまとめてある。
+> §4 の sandbox backend（container backend、#26）は、container の制限を `crates/texrun-sandbox`、container 内で latexmk を動かす engine を `crates/texrun-texlive`（`ContainerEngine`）に実装した。
 > それ以外の実装の進み具合は各 Issue を参照する。
 > 公開リポジトリのため、攻撃の再現手順や具体的な入力は書かず、「どの保証をどの層で担保するか」だけを書く。
 > 境界を破る方法を見つけた場合は [SECURITY.md](../SECURITY.md) の手順で非公開で報告してほしい。
@@ -21,7 +22,8 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
   - texrun の利用者（CLI を起動する人・エージェント）
   - texrun のバイナリ
   - host にインストールされた TeX Live
-- MVP の TeX engine は texrun と同じ host 上で、同じ OS ユーザー権限の子プロセスとして動く。これを以下「in-process 実行」と呼ぶ。texrun のプロセス内で動くわけではないが、OS レベルの隔離境界は無い。
+- MVP の TeX engine は texrun と同じ host 上で、同じ OS ユーザー権限の子プロセスとして動く。これを以下「in-process 実行」（CLI の `--backend host`、既定）と呼ぶ。texrun のプロセス内で動くわけではないが、OS レベルの隔離境界は無い。
+- sandbox backend（`--backend container`、§4）では、TeX engine は container の中で動く。container runtime（Docker / Podman）と engine image は信頼する。
 
 ### 守りたいもの
 
@@ -48,6 +50,8 @@ TeX engine（latexmk / pdflatex / bibtex / makeindex）のバイナリは信頼�
 engine が生成した log・PDF も信頼できない入力として扱う。diagnostics parser（#7）と preview（#8）は、壊れた入力や巨大な入力に耐える必要がある。
 
 ## 2. MVP で保証する境界 / 保証しない範囲
+
+この節の「保証する」「保証しない」は、両方の backend に共通の in-process 実行についてのものである。sandbox backend（`--backend container`）は、同じ設定をそのまま container の中で適用し、その上に OS の隔離を重ねる。sandbox backend で追加で保証するものは、下の「sandbox backend で追加で保証する」にまとめた。
 
 ### 保証する（この文書の決定事項を実装した時点で）
 
@@ -105,32 +109,64 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 
 画像・bibtex の database・pdfTeX のファイル情報系 primitive の経路は、§6 の実験で確認したもので、fixture にはまだ含めていない。
 
+### sandbox backend で追加で保証する（`--backend container`、§4）
+
+in-process 実行の「保証する」1〜5 は、sandbox backend でもそのまま成り立つ（同じ rc・argv・env allowlist・kpathsea 設定・上限を container の中で適用する）。その上で、次のことを **OS（container の namespace と cgroup）で** 保証する。下の「保証しない」のうち、ここに挙げたものは sandbox backend では保証する側に移る。
+
+1. **host の filesystem は、workspace 以外は見えない。**
+   - container に mount するのは、workspace（read-only）、その中の output dir と engine の `HOME`（書き込み可）、texrun 管理 rc のディレクトリ（read-only）だけである。
+   - TeX Live の texmf ツリーは engine image のもので、root filesystem ごと read-only である。host の TeX Live、host のユーザーの設定・秘密情報、入力プロジェクトそのものは container の中に存在しない。
+   - これは読み込み経路によらない。paranoid mode の検査が及ばない font 関連の読み込みや、PDF object にファイルを直接埋め込む pdfTeX の primitive でも、workspace と image の外は読めない。
+   - workspace の入力ファイルも書き換えられない（書き込めるのは output dir と `HOME` だけ）。
+2. **network は無い**（`--network none`。loopback だけ）。compile は network 無しで行われる（#24 の sandbox backend の部分）。
+3. **engine は権限を持たない。** non-root user（texrun を起動したユーザーの uid / gid。texrun が root の場合は 65534）で動き、capability は全て落とし（`--cap-drop ALL`）、`no-new-privileges` で setuid などによる権限の獲得もできない。root filesystem は read-only で、書き込めるのは `/tmp`（`noexec` の小さい tmpfs）と上の mount だけである。
+4. **process tree 全体の memory・プロセス数・CPU を常に制限する**（container の cgroup。§3.10 の値）。委譲された cgroup の有無（in-process 実行の `--cgroup`）に関係なく、macOS でも（runtime の VM の中で）効く。
+5. **timeout / cancel / texrun の終了で container を残さない。** container は texrun が名前と label を付けて作り、停止のたびに `rm --force` で消す。texrun 自身が強制終了された場合も、container の中の `timeout` が compile の timeout + 45 秒で engine を止める（§4）。
+6. **画像・PDF を解析するコードの脆弱性の影響は、container の中に閉じる**（1〜3 の範囲。container runtime と kernel の境界を信頼する）。
+
+検証は次の test で行い、CI の `sandbox` job で毎回実行する（[development.md](development.md#container-backend-test)）。#10 の fixture（`scenarios.rs`、`security.rs`）も、`TEXRUN_TEST_BACKEND=container` で sandbox backend を使って全て実行する（host の TeX Live を直接使う 2 件を除く）。
+
+| 保証 | test |
+| --- | --- |
+| 非 root、capability 無し、`no-new-privileges`、network は loopback だけ、root filesystem と workspace が read-only、output dir だけ書き込める、mount していない host のディレクトリが見えない、env が allowlist だけ、cgroup の `pids.max` / `memory.max` / `cpu.max`、rlimit | `crates/texrun-sandbox/tests/container.rs`（TeX を使わない `sh` の script） |
+| timeout・cancel・drop で container が消える、container 内の deadline、OOM kill の記録 | 同上 |
+| PDF object への埋め込みでも workspace 外の host のファイルが読めない（絶対パス、`..`。対照: workspace 内のファイルは埋め込める） | `crates/texrun-texlive/tests/container.rs`: `files_outside_the_workspace_cannot_be_embedded` |
+| texmf ツリーは image のもの | 同: `the_texmf_tree_is_the_images` |
+| container 内でも CPU 時間・address space の上限で `resource_limit` になる、timeout / cancel で container が残らない | 同: `the_cpu_time_limit_applies_in_the_container` など |
+| diagnostics の path が、mount 先（既定の `/workspace`、任意の path）によらず workspace 相対になる | 同: `diagnostics_are_workspace_relative_with_any_mount_point`、`apps/texrun/tests/container.rs` |
+
 ### 保証しない（MVP の in-process 実行の限界）
 
-完全な対策は、将来の sandbox backend（§4、#26）で扱う。
+完全な対策は sandbox backend（§4、#26）で扱う。各項目の末尾に、sandbox backend での扱いを書く。
 
-- **font 関連の読み込みは保証しない。** font・font map・encoding などの読み込みには、paranoid mode の検査が及ばない経路がある。
-- **PDF object にファイルを直接埋め込む pdfTeX の primitive は保証しない。** この経路は paranoid mode の検査対象外で、workspace 外のファイルを読めることを確認した。
+- **font 関連の読み込みは保証しない。** font・font map・encoding などの読み込みには、paranoid mode の検査が及ばない経路がある。sandbox backend では、host の filesystem が見えないことで保証する（上の 1）。
+- **PDF object にファイルを直接埋め込む pdfTeX の primitive は保証しない。** この経路は paranoid mode の検査対象外で、workspace 外のファイルを読めることを確認した。sandbox backend では保証する（上の 1。test あり）。
 - **TeX Live の texmf ツリー等、host の一部は名前で指定すれば読める。** paranoid mode の判定は「TeX に渡された名前」に対して行う。そのため、各ファイル種別の検索パスで見つかるファイルは読める。検索パスはファイル種別ごとに次のとおり。
   - TeX 入力（`\input` / `\openin`）: `TEXINPUTS`（texmf ツリーの `tex/` 以下と cwd）
   - 画像: `TEXINPUTS`
   - bibtex: `BIBINPUTS` / `BSTINPUTS`（`bibtex/` 以下）
   - font 関連: font 用の各パス（`fonts/` 以下と、OS の font ディレクトリ）
 
-  たとえば `\openin` では、`tex/` 以下の `.sty` / `.cls` は読めた。一方、`web2c/` にある `texmf.cnf`、`ls-R`、font map、`.bst` は見つからなかった。これらのファイルは通常公開情報だが、host 固有の設定やローカルにインストールしたパッケージが含まれうる。
-- **OS レベルの隔離は無い。** engine は texrun を起動したユーザーの権限で動く。画像や PDF を解析するコード（pdfTeX・libpng・libjpeg・poppler / MuPDF など）にメモリ安全性の脆弱性があれば、細工した入力で任意コード実行されうる。その場合、そのユーザーが読み書きできるものはすべて危険にさらされる。
-- **network は遮断していない**（§3.8、#24）。
-- **委譲された cgroup が使えない環境では、process tree 全体の memory とプロセス数を OS レベルで制限しない**（§3.10）。macOS、通常の Docker コンテナ、多くの Linux の端末 session がこれに当たる。
+  たとえば `\openin` では、`tex/` 以下の `.sty` / `.cls` は読めた。一方、`web2c/` にある `texmf.cnf`、`ls-R`、font map、`.bst` は見つからなかった。これらのファイルは通常公開情報だが、host 固有の設定やローカルにインストールしたパッケージが含まれうる。sandbox backend では、読めるのは engine image の TeX Live（公開の Debian パッケージ）だけで、host のものは読めない。
+- **OS レベルの隔離は無い。** engine は texrun を起動したユーザーの権限で動く。画像や PDF を解析するコード（pdfTeX・libpng・libjpeg・poppler / MuPDF など）にメモリ安全性の脆弱性があれば、細工した入力で任意コード実行されうる。その場合、そのユーザーが読み書きできるものはすべて危険にさらされる。sandbox backend では、engine（pdfTeX など）についてはその影響を container の中に閉じる（上の 3・6）。preview tool（poppler / MuPDF）は、どちらの backend でも host で動く（§4）。
+- **network は遮断していない**（§3.8、#24）。sandbox backend の compile では遮断する（上の 2）。preview は host で動くので遮断しない。
+- **委譲された cgroup が使えない環境では、process tree 全体の memory とプロセス数を OS レベルで制限しない**（§3.10）。macOS、通常の Docker コンテナ、多くの Linux の端末 session がこれに当たる。sandbox backend の compile では、container の cgroup で常に制限する（上の 4）。
   - その場合に効くのは、プロセスごとの `RLIMIT_CPU`（Linux・macOS）と `RLIMIT_AS`（Linux のみ）である。macOS では memory を OS レベルで制限しない。
   - pdfTeX のメモリは `texmf.cnf` の固定容量（`main_memory` 等）で頭打ちになる。LuaTeX など他の engine はこの限りではない。
   - プロセス数は、TeX が shell escape 無しではプロセスを起動できないことと、texrun 管理 rc の latexmk が決まったツールだけを順に起動することに頼る。
 - **workspace 内での書き込みは止めない。** TeX は output dir 配下に、任意の名前・任意の数のファイルを作れる。サイズは §3.2 の上限で抑えるが、ファイル数・inode は制限しない。
 - **上限に達するまでの資源消費は起こりうる。** ログを出し続ける文書では、ログと stdout がそれぞれ約 32 MB/s の速さで増えた（§6）。
-- **cgroup が使えない環境では、process group から抜けるプロセスは追えない。**
+- **cgroup が使えない環境では、process group から抜けるプロセスは追えない。** sandbox backend では、container ごと消すので残らない（上の 5）。
   - 新しい session を作った子孫は `killpg` の対象外になる。cgroup が使える場合は `cgroup.kill` で止まる（§3.10）。
   - shell escape を無効にした TeX と、texrun 管理 rc の latexmk は、そのようなプロセスを起動しない。ただし OS として保証するものではない。そのようなプロセスが CPU を使い続けられる時間は `RLIMIT_CPU` で抑える（§3.10）。
-- **生成物から host の情報が漏れる。** 詳細は §3.9。
-- **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。
+- **生成物から host の情報が漏れる。** 詳細は §3.9。sandbox backend では、log・`.fls` などに出る path は container の中のもの（`/workspace`、image の texmf）になり、host の temp dir 名やユーザー名は出ない。PDF の日時と banner は同じである。
+- **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。sandbox backend では、破れても上の 1〜4 の範囲に留まる。
+- **sandbox backend でも保証しないもの:**
+  - container runtime・OCI runtime（runc など）・Linux kernel の脆弱性による container からの脱出。より強い隔離（gVisor の `runsc`、microVM）は §4 の比較に留める。
+  - workspace と output dir の中身は container から読める・書ける（in-process 実行と同じ。入力は read-only だが、書き込める場所は §3.2 のサイズ上限だけで、ファイル数は制限しない）。
+  - プロセス数の上限（`pids.max`）に達したことの判定。container の cgroup の event を texrun は読まないので、fork の失敗を perl が再試行し続けた場合は timeout として報告される（memory の上限は OOM kill の記録で判定する）。
+  - rootless mode の Docker（`dockerd-rootless`）は想定していない。container の uid が host の subordinate uid に写るので、output dir に書けずに compile が失敗する（安全側には倒れる）。
+  - macOS では container は runtime の VM の中で動く。workspace は VM と共有された host の temp dir にある（Docker Desktop / OrbStack の既定の共有範囲）。
 - **表示上の偽装。** `WorkspacePath` は bidi 制御文字（U+202A〜U+202E、U+2066〜U+2069）とゼロ幅文字（U+200B〜U+200F、U+FEFF）を許容している。
   - 人間向けの出力でこれらを含む path を表示するときは、escape する（#6）。
   - JSON 出力はそのまま出す。JSON 文字列としては正しく、扱いは消費側の責任とする。
@@ -409,7 +445,8 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
 ### 3.8 network（#24）
 
 - compile と preview は、network を必要としない前提で設計する。package の自動インストール（`tlmgr`、MiKTeX の on-the-fly install 相当）は行わない。
-- MVP では network を遮断しない（§2）。どう強制するかは #24 で扱い、sandbox backend（#26）では network 無しを既定にする。
+- in-process 実行（`--backend host`）では network を遮断しない（§2）。Linux の network namespace（unprivileged user namespace が要る）や macOS の sandbox で遮断するかは #24 で扱う。
+- sandbox backend（`--backend container`、#26）の compile は、常に network 無し（`--network none`）で動く。option で有効にする手段は設けない。preview は host で動くので、どちらの backend でも遮断しない（§4）。
 
 ### 3.9 生成物に含まれる host の情報（#4 / #5 / #6）
 
@@ -452,6 +489,8 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 | プロセス数（UID 単位） | **使わない** | （`RLIMIT_NPROC`） | — |
 
 値は `texrun_texlive::Limits`（engine）と `texrun-preview` の定数で、CLI からは変えられない（`--timeout` を伸ばすと CPU 時間の上限も伸びる）。
+
+sandbox backend（§4）では、engine の同じ値を container runtime に渡す。CPU 時間・1 ファイルのサイズ・core は `--ulimit`、address space は container の中の `prlimit`（runtime の `--ulimit` が `as` を受け付けないため。latexmk の起動前に設定する）、memory・プロセス数・CPU は container の cgroup（`--memory` = `--memory-swap`、`--pids-limit`、`--cpus`）である。どれも latexmk の起動前に掛かり、`resource_limits` は `{"rlimits": true, "cgroup": true}` になる。memory の上限に達した場合は、runtime が記録する OOM kill（`State.OOMKilled`）で `resource_limit` にする。
 
 **既定値の根拠（実測）。** 開発用コンテナ（§6 と同じ image、arm64、14 CPU）で、次の文書と tool を cgroup の中で動かし、`memory.peak` / `pids.peak` / `cpu.stat` を読んだ。`RLIMIT_AS` は `ulimit -v` で値を変えて成否を見た。
 
@@ -525,46 +564,92 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 - `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、委譲の印のある cgroup では自分を leaf に移し、印の無い cgroup には、root で書き込める場合も、texrun のユーザーの所有の場合も、何もしない（controller も有効にしない）こと、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
 - unit test: 委譲の印の判定（書き込めることや所有者では判定しない）、`nsdelegate` の読み取り、`RLIMIT_AS` のメッセージの行全体での照合（行の一部や log にもある行では成立しない）、一時的なプロセス数の上限で成功した compile が warning になること、engine の gate の分岐（exec gate、Linux の stdin gate、macOS の必須の gate）。
 
-## 4. 将来の sandbox backend（#26）
+## 4. sandbox backend（#26）
 
-MVP の in-process 実行の次に、TeX engine を texrun 本体と別の isolation boundary で動かす backend を追加する。
+TeX engine を texrun 本体と別の isolation boundary で動かす backend として、container backend を実装した（`--backend container`、library では `texrun_texlive::ContainerEngine`）。in-process 実行（`--backend host`）は local 開発用に残し、CLI の既定のままにする。
 
-| 候補 | 得られるもの | 主な課題 |
+### 候補の比較と判断
+
+| 候補 | 得られるもの | 主な課題 | 判断 |
+| --- | --- | --- | --- |
+| Docker | filesystem・network・PID・IPC の namespace、cgroup による CPU / memory / pids 制限、read-only の root filesystem と image の texmf | daemon が必要。macOS では VM を経由する | **最初の backend にする。** CI（GitHub Actions の runner）と開発環境（OrbStack、Docker Desktop）にあり、毎回 test できる |
+| Podman（rootless） | Docker と同じ。daemon 無しで、container の root も host の非特権ユーザーになる | 環境による差（cgroup の委譲、`podman machine`）がある | **同じ CLI 互換の実装で受ける**（`--container-runtime podman`）。CI では test していない（follow-up） |
+| gVisor（`runsc`） | container の隔離に加え、syscall を user-space kernel で仲介し、kernel の攻撃面を縮小する | Linux のみ、I/O 性能 | library の `ContainerConfig::oci_runtime`（`--runtime runsc`）で指定できるようにしたが、test していない。CLI には出さない |
+| microVM（Firecracker 等） | VM 境界による強い隔離 | image と起動の管理が複雑で、KVM が必須 | 比較に留める |
+
+- **runtime は CLI で呼ぶ。** `docker` / `podman` の実行ファイルを PATH（絶対パスの entry だけ）から探し、shell を使わず argv の配列で起動する。runtime の CLI は、daemon に接続するための変数（`DOCKER_HOST`、`XDG_RUNTIME_DIR` など、`texrun_sandbox::RUNTIME_ENV`）だけを持つ allowlist の環境で動く。engine に渡す環境とは別である。
+- **runtime の検出と version の確認。** `--container-runtime auto`（既定）は Docker、次に Podman の順に、インストールされていて応答するものを使う。Docker は daemon の version（`Server.Version`）、Podman は client の version を読み、Docker 20.10 / Podman 4.0 未満と、Linux 以外の container を動かす daemon は使わない。runtime か image が無い場合は `EngineError::Unavailable`（CLI は exit 3、`error.stage = "probe"`）で、project をコピーする前に終わる。
+- **image は texrun が pull しない**（`--pull never`）。compile 中に network へ出ないこと、使う image を利用者が明示的に用意することのためである。
+
+### engine image
+
+`docker/engine/Dockerfile`。dev image（`docker/dev`）とは別の、最小の runtime image である。
+
+- base は `debian:trixie-slim` を multi-arch index の digest で固定し、Dependabot が digest を更新する。
+- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview を sandbox 内で動かすとき（follow-up）のために、MuPDF と Poppler も入れる。Rust toolchain やコンパイラは入れない。
+- 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
+- texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout`（coreutils）、`/usr/bin/prlimit`（util-linux）。
+- CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image 名は `texrun-engine:latest`（`--container-image` で変えられる）。registry への公開は follow-up とする。
+
+### container の設定
+
+latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::Container`）。
+
+| 設定 | 値 | 目的 |
 | --- | --- | --- |
-| Docker / Podman（rootless） | filesystem・network・PID の namespace、cgroup による CPU / memory / pids 制限、texmf の read-only 提供 | daemon / runtime の有無、起動のオーバーヘッド、macOS では VM を経由する |
-| gVisor（`runsc`） | container の隔離に加え、syscall を user-space kernel で仲介して kernel の攻撃面を縮小する | Linux 限定、I/O 性能 |
-| microVM（Firecracker 等） | VM 境界による強い隔離 | image と起動の管理が複雑、KVM が必須 |
+| network | `--network none` | network 無し（#24） |
+| root filesystem | `--read-only`、`/tmp` だけ `tmpfs`（`noexec,nosuid,nodev`、64 MiB） | image（texmf を含む）を書き換えさせない |
+| mount | workspace を `/workspace` に read-only、output dir と `HOME`（`.texrun/home`）をその位置に書き込み可、rc のディレクトリを `/texrun/rc` に read-only。ほかは何も mount しない | host の filesystem を workspace 以外見せない。入力を書き換えさせない |
+| user | texrun の euid / egid（texrun が root なら 65534。書き込み可の mount はその uid に渡す）。root では動かさない。rootless Podman では `--userns keep-id` も付ける | 非 root。書いたファイルは texrun のユーザーのものになる |
+| 権限 | `--cap-drop ALL`、`--security-opt no-new-privileges`、`--ipc none` | capability と権限の獲得を無くす |
+| 上限 | `--memory` = `--memory-swap`（4 GiB、swap 無し）、`--pids-limit 64`、`--cpus 2`、`--ulimit`（CPU 時間・ファイルサイズ・core）、container 内の `prlimit`（address space） | §3.10 の既定値と揃える |
+| 環境変数 | §3.4 の allowlist を `--env` で渡す（`PATH` は image の `/usr/bin:/bin`、`HOME` は container 内の path）。runtime が付ける `HOSTNAME`（`texrun`）以外は無い | host の環境変数を渡さない |
+| そのほか | `--init`（PID 1 が孤児を回収し、signal を中継する）、`--log-driver none`（出力は texrun に流すだけで、daemon に残さない）、`--pull never`、`--hostname texrun` | |
 
-移行方針:
+- **texmf** は image の中の TeX Live で、root filesystem ごと read-only である。host の texmf は mount しない。
+- **§3 の設定はそのまま使う。** texrun 管理 rc（§3.5）、latexmk の引数、env allowlist（§3.4）、kpathsea 設定（§3.7）、timeout と出力の上限（§3.1・3.2）、log と BibTeX の diagnostics は、in-process 実行と同じ code（`texrun-texlive` の内部）で作る。変わるのは、latexmk に渡す path（rc、`-outdir`、cwd、`HOME`）が container の中のものになることと、上限を掛ける主体が runtime になることだけである。rc は container 内では stdin gate を持たない（上限は latexmk の起動前に runtime が掛けるため）。
+- 出力サイズの監視（§3.2 の poll）は、host 側から mount 元のディレクトリに対して行う。
 
-1. sandbox backend は、`TypesetEngine` の別実装（例: container 内で latexmk を動かす engine）として追加する。
-   - §3 の設定（texrun 管理 rc・env allowlist・kpathsea 設定・各種上限）は、sandbox 内でもそのまま適用する。
-   - その上に、OS 側の制限を **追加で** 重ねる。
-     - network 無し（#24）
-     - read-only の root filesystem
-     - texmf の read-only mount
-     - cgroup の memory / pids 上限（#25）
-     - non-root user での実行
-   - §2 で「保証しない」とした font 関連の読み込みと、PDF object 埋め込み系の primitive は、sandbox の filesystem 隔離で担保する。
-2. workspace の作成・入力のコピー・artifact の収集（#4）は backend 共通のまま、workspace root を sandbox 内に mount する。
-3. 将来 xelatex / lualatex / dvipdfmx を追加するときは、それぞれが起動する外部プログラムも §3.5 と同じ基準で扱う。
-   - xelatex は出力 driver（`xdvipdfmx`）を子プロセスとして起動する。
-   - dvipdfmx は画像変換に外部プログラム（Ghostscript 等）を使う設定を持つ。
-   - LuaTeX は Lua からのプロセス起動・ファイルアクセスを持つ。
+### container のライフサイクル
 
-   それぞれについて、次のことを確認する。
-   - shell を経由せず起動されるか
-   - 変換コマンドの設定を固定できるか
-   - restricted / safer 系の option（例: LuaTeX の `--safer` 相当）が使えるか
+- texrun は container を `create`（名前 `texrun-<pid>-<n>-<nanos>` と label `org.texrun.sandbox=1`、`org.texrun.sandbox.pid=<pid>`）で作り、`start --attach` を supervisor（§3.6）の子プロセスとして起動する。stdout / stderr と終了コードは container のもので、latexmk の終了（`128 + signal` を含む、§3.10）はそのまま判定に使える。
+- runtime の CLI を kill しても container は止まらない。そのため supervisor の kill のたび（timeout、cancel、出力上限、正常終了の後の念のための kill）に、container の状態（OOM kill、終了コード）を読んでから `rm --force` で消す（中で動いているものも kill される）。消せなかった場合は、reap の後と texrun 側の値の drop で再試行する。`create` した container は、`start` しなかった場合も含めて、texrun の全ての経路で消える。
+- texrun 自身が `SIGKILL` などで終了した場合は、container が残りうる。その場合も、container の中の `timeout --signal=KILL` が compile の timeout + 45 秒（CPU 時間の余裕 15 秒 + 30 秒）で engine を止め、container は終了する。残った container は label で見つけて消せる（`docker ps -a --filter label=org.texrun.sandbox`）。次回の起動時に自動で回収することは follow-up とする。
+- 実測（OrbStack、macOS、arm64）: 1 ページの文書で CLI 全体が約 1.4 秒（probe の `latexmk -v` の container、compile の container の作成・削除を含む）、そのうち container の中の latexmk の実行は約 0.2 秒だった。
 
-   必要なら rc と env allowlist を拡張する。
+### path mapping と diagnostics
 
-core API（`CompileContext`）が backend の差し替えに耐える理由:
+- `CompileRequest` と `CompileResult` は `WorkspacePath`（workspace root 相対）だけでファイルを参照するので、backend によらず同じである。
+- container の中で workspace が見える場所は、`CompileContext::path_mapping`（`texrun_core::PathMapping`）で表す。`ContainerEngine` は、context に mapping が無ければ `/workspace` を使い、あればその path に mount する（`/texrun` と重なる path は `InvalidRequest`）。host で latexmk を動かす `LatexmkEngine` は、mapping のある context を `Unsupported` で拒否する。
+- engine は、latexmk に渡す path だけを mapping で container の path にし、workspace の読み書き（出力の収集、log と source の読み込み）は host の path で行う。log の parser には、TeX が見ていた working directory（container の path）を root として渡すので、log の中の絶対パスも workspace 相対の `Diagnostic::file` になる。mount 先を変えても diagnostics が同じになることを test で確認している。
 
-- `CompileRequest` と `Artifact.path` は、`WorkspacePath`（workspace root 相対のパス）だけでファイルを参照し、host の絶対パスを含まない。sandbox 内の mount 先（例: `/work`）が host と違っても、request と result は変わらない。
-- host 側の実行時情報は `CompileContext` にまとめてあり、`TypesetEngine::compile(&self, ctx, req)` の引数を増やさない設計になっている。`CompileContext` は `#[non_exhaustive]` で、`with_*` builder から作る。そのため、sandbox 固有の情報（path mapping、resource limit、runtime の指定など）を field として追加しても、既存の engine と呼び出し側は壊れない。
-- timeout は `CompileOptions`（backend 非依存）で、cancel は `CancelToken`（poll 型）で表している。どちらも、subprocess でも container でも同じ意味で実装できる。
-- `CompileOutcome` と `EngineError` は `#[non_exhaustive]` である。backend 固有の失敗（例: runtime が無い場合の `EngineError::Unavailable`）も、既存の分類で表せる。
+### preview
+
+- preview（#8）は、どちらの backend でも **host で** 動かす（exec gate、rlimit、`--cgroup`、§3.2・3.10）。
+- 理由: preview tool の起動は 1 回の preview で最大数百回あり（ページごとの描画）、container の起動のオーバーヘッドがそのまま掛かる。また、preview の出力先と tool の path の対応を、engine と同じ path mapping で扱う設計（`texrun-preview` への launcher の導入）が別に要る。MVP では compile の隔離を優先した。
+- そのため、sandbox backend でも preview tool（poppler / MuPDF）の脆弱性と network は、in-process 実行と同じ扱いである（§2 の「保証しない」）。engine image には preview tool を入れてあり、sandbox 内での preview は follow-up で扱う。
+
+### CLI
+
+- `--backend host|container`。既定は `host` のままにする。container backend には container runtime と engine image が必要で、既定にすると、それが無いほとんどの環境で texrun が動かなくなるためである。信頼できない文書には `--backend container` を使う（README に記載）。
+- `--container-runtime auto|docker|podman`、`--container-image <IMAGE>`。`--backend host` と一緒に指定すると usage error（exit 2）にする。
+- `--cgroup` は host で動くプロセス（`--backend host` の engine と preview tool）に効く。container backend の engine には、container の cgroup が常に掛かる。
+
+### 今後（xelatex / lualatex など）
+
+将来 xelatex / lualatex / dvipdfmx を追加するときは、それぞれが起動する外部プログラムも §3.5 と同じ基準で扱う。
+
+- xelatex は出力 driver（`xdvipdfmx`）を子プロセスとして起動する。
+- dvipdfmx は画像変換に外部プログラム（Ghostscript 等）を使う設定を持つ。
+- LuaTeX は Lua からのプロセス起動・ファイルアクセスを持つ。
+
+それぞれについて、次のことを確認する。
+
+- shell を経由せず起動されるか
+- 変換コマンドの設定を固定できるか
+- restricted / safer 系の option（例: LuaTeX の `--safer` 相当）が使えるか
+
+必要なら rc と env allowlist を拡張する。sandbox backend では、これらのプログラムも image に入れ、同じ container の制限の中で動かす。
 
 ## 5. 脆弱性の報告
 

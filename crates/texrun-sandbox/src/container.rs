@@ -357,6 +357,9 @@ impl<'r> Container<'r> {
             "--log-driver",
             "none",
         ]);
+        if self.runtime.is_rootless_podman() {
+            args.extend(["--userns".into(), "keep-id".into()]);
+        }
         if let Some(runtime) = &c.oci_runtime {
             if runtime.is_empty()
                 || !runtime

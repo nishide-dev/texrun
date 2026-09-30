@@ -101,6 +101,9 @@ previews to the output directory. See `texrun compile --help` for details.
 | `--pages <RANGE>` | first 20 pages | Pages to preview: `N`, `N-M`, `N-`, `-M` (at most 200) |
 | `--preview-dpi <DPI>` | `144` | Preview resolution (long edge at most 4096 px) |
 | `--preview-backend <BACKEND>` | `auto` | `auto` (MuPDF, else Poppler), `mupdf` or `poppler` |
+| `--backend <BACKEND>` | `host` | Where TeX runs: `host` (the host's latexmk, as your user) or `container` (in a hardened container of the engine image; see [Engine backends](#engine-backends)) |
+| `--container-runtime <RUNTIME>` | `auto` | With `--backend container`: `auto` (Docker if installed and running, otherwise Podman), `docker` or `podman` |
+| `--container-image <IMAGE>` | `texrun-engine:latest` | With `--backend container`: the engine image; must exist locally, texrun never pulls |
 | `--cgroup <MODE>` | `auto` | Linux: run latexmk and the preview tools in cgroups of their own (memory, processes, CPU). `auto` uses a delegated cgroup if there is one (e.g. `systemd-run --user --scope -p Delegate=yes texrun ...`), otherwise only the per-process limits apply (see `resource_limits`); `required` fails with exit 3 instead; `off` never uses one |
 
 The workspace never contains VCS metadata, `texrun-out/`, `.texrun/`,
@@ -190,8 +193,11 @@ or in total), the CPU time of a process, the memory, or the number of
 processes (docs/security.md §3.2, §3.10). The limits are not options; a
 limit reached before a timeout is reported next to `timed_out` too.
 `resource_limits` says which layers were in place: `rlimits` (per-process
-limits set before latexmk starts) and `cgroup` (Linux, see `--cgroup`), with
-`notes` on a missing layer.
+limits set before latexmk starts) and `cgroup` (Linux, see `--cgroup`; with
+`--backend container` the container's own cgroup), with `notes` on a
+missing layer. With `--backend container`, `engine.name` is
+`texlive-container` and `engine.version` also names the runtime and the
+image.
 
 Check `error` first, then `outcome` (or just `texrun_exit_code`). `exit` is
 the latexmk process status and is informational only. `error` can appear
@@ -230,7 +236,7 @@ are copied into it).
 | 0 | The document compiled and a PDF was produced |
 | 1 | The document failed to compile (see the diagnostics), also when a resource limit stopped it (`resource_limit`) |
 | 2 | Usage or input error: invalid arguments, entrypoint not found or outside `--root`, project rejected (symlink leaving the root, input limits, unsafe root) |
-| 3 | Runtime error: latexmk missing or unusable, I/O errors, artifacts could not be copied, `--cgroup required` without a usable cgroup |
+| 3 | Runtime error: latexmk missing or unusable (with `--backend container`: no usable container runtime or engine image), I/O errors, artifacts could not be copied, `--cgroup required` without a usable cgroup |
 | 4 | The compile timed out |
 | 130 | Interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP |
 
@@ -240,14 +246,44 @@ while previews are rendered; the JSON then still shows `outcome` and a
 code; problems with them are reported as preview notices. On Ctrl-C, texrun stops latexmk (its whole process group),
 removes the workspace and then exits.
 
+### Engine backends
+
+| | `--backend host` (default) | `--backend container` |
+| --- | --- | --- |
+| TeX runs | on the host, as your user | in a container of the engine image (Docker or Podman), as a non-root user without capabilities |
+| Shell escape off, texrun rc, environment allowlist, kpathsea paranoid mode, timeout and limits | yes | yes (the same settings) |
+| Host files TeX can reach | whatever kpathsea's paranoid mode does not refuse by name (e.g. the TeX Live tree, font lookups, pdfTeX's file embedding primitives) | only the workspace (read-only, except the output directory) and the image's own read-only TeX Live tree |
+| Network | not blocked | none (`--network none`) |
+| Memory / processes / CPUs of the whole compile | only with a delegated cgroup (`--cgroup`) | always (the container's cgroup) |
+| Needs | TeX Live + latexmk on the host | Docker 20.10+ or Podman 4+, and the engine image |
+
+Use `--backend container` for documents you do not trust. The default stays
+`host` because the container backend needs a container runtime and the
+image. Build the image once from this repository:
+
+```bash
+docker build -t texrun-engine:latest docker/engine
+texrun compile --backend container main.tex
+```
+
+Page previews are rendered on the host with either backend (with the
+per-process limits of `--cgroup`); running them in the container too is a
+follow-up. See [docs/security.md](docs/security.md) §2 and §4 for exactly
+what each backend guarantees.
+
 ## System requirements
 
 - **OS:** Linux or macOS. Windows is not supported.
 - **Rust:** 1.98.1. `rust-toolchain.toml` pins the version, so `rustup` installs
   and selects it automatically.
-- **TeX Live + latexmk:** required to compile documents. For development, the
-  Docker-based environment (see below) is recommended instead of installing
-  TeX Live on the host.
+- **TeX Live + latexmk:** required to compile documents with `--backend host`.
+  For development, the Docker-based environment (see below) is recommended
+  instead of installing TeX Live on the host.
+- **Container runtime (optional):** Docker 20.10+ (including Docker Desktop
+  and OrbStack on macOS) or Podman 4+, and the engine image
+  (`docker/engine/Dockerfile`), for `--backend container`. Only Docker is
+  tested in CI. The engine image also contains MuPDF (AGPL) and Poppler
+  (GPL); the note below on distributing images applies to it too.
 - **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
   page previews. MuPDF is used when both are installed; without either,
   compiling still works and the result says that previews were skipped.
@@ -299,11 +335,12 @@ TeX can read files and, if enabled, run external commands, so texrun treats
 documents as untrusted input. texrun disables shell escape, runs latexmk with a
 texrun-managed configuration, restricts TeX file access to the workspace where
 kpathsea allows it, passes a minimal environment and enforces a timeout and
-output limits. In-process execution is **not** a complete sandbox, though (for
-example, parts of the host such as the TeX Live tree remain readable); a
-container-based backend is tracked in
-[#26](https://github.com/nishide-dev/texrun/issues/26). Network access is not
-blocked yet ([#24](https://github.com/nishide-dev/texrun/issues/24)).
+output limits. Running TeX on the host (`--backend host`) is **not** a
+complete sandbox, though: parts of the host such as the TeX Live tree remain
+readable, and network access is not blocked. `--backend container` adds an
+OS-level boundary: TeX then sees only the workspace, has no network and runs
+without privileges in a read-only container
+([Engine backends](#engine-backends)).
 
 See [docs/security.md](docs/security.md) for the trust boundary, guarantees,
 limitations and execution limits (Japanese), and [SECURITY.md](SECURITY.md) for
