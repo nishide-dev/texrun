@@ -215,4 +215,71 @@ proptest! {
             }
         }
     }
+
+    #[test]
+    fn blg_never_panics_on_bytes(blg in prop::collection::vec(any::<u8>(), 0..2048)) {
+        check_blg(&blg);
+    }
+
+    /// BibTeX logs assembled from real fragments.
+    #[test]
+    fn blg_never_panics_on_fragments(
+        parts in prop::collection::vec(
+            (0..BLG_FRAGMENTS.len(), prop::sample::select(&["\n", "\r\n", ""][..])),
+            0..64,
+        ),
+    ) {
+        let mut blg = String::new();
+        for (part, sep) in parts {
+            blg.push_str(BLG_FRAGMENTS[part]);
+            blg.push_str(sep);
+        }
+        check_blg(blg.as_bytes());
+    }
+}
+
+/// Fragments of BibTeX log syntax.
+const BLG_FRAGMENTS: &[&str] = &[
+    "",
+    " : ",
+    " : @book{x",
+    "Database file #1: refs.bib",
+    "The style file: plain.bst",
+    "Repeated entry---line 3 of file refs.bib",
+    "---line 4 of file main.aux",
+    "---line 0 of file refs.bib",
+    "--line 5 of file refs.bib",
+    "I couldn't open database file x.bib",
+    "I found no style file---while reading file main.aux",
+    "(Error may have been on previous line)",
+    "I'm skipping whatever remains of this entry",
+    "Warning--string name \"x\" is undefined",
+    "Warning--I didn't find a database entry for \"k\"",
+    "Sorry---you've exceeded BibTeX's hash size",
+    "(There were 3 error messages)",
+    "(There was 1 error message)",
+    "(That was a fatal error)",
+    "\u{1b}[31m",
+];
+
+fn check_blg(blg: &[u8]) {
+    let files = |name: &WorkspacePath| Some(name.clone());
+    for parser in [
+        texrun_latex_log::BlgParser::new(),
+        texrun_latex_log::BlgParser::new().with_max_diagnostics(2),
+    ] {
+        let parsed = parser.parse_with_files(blg, &files);
+        // The limit, the summary and the "omitted" notice.
+        assert!(parsed.diagnostics.len() <= texrun_latex_log::DEFAULT_MAX_DIAGNOSTICS + 2);
+        for d in &parsed.diagnostics {
+            // The summary has no excerpt without BibTeX's summary line.
+            if d.kind != texrun_latex_log::DiagnosticKind::BibtexFailed {
+                check_diagnostic(d);
+            }
+            assert!(d.message.len() <= 2048, "{d:?}");
+            assert!(!d.message.chars().any(char::is_control), "{d:?}");
+            assert_ne!(d.line, Some(0), "{d:?}");
+            assert!(d.line.is_none() || d.file.is_some(), "{d:?}");
+        }
+    }
 }

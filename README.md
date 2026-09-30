@@ -168,6 +168,15 @@ follows it is `info`, so the errors are the problems to fix; the human output
 does not show it. A missing package or class has the line of its
 `\usepackage` / `\documentclass` only when it can be told for certain.
 
+BibTeX problems are reported from its `.blg` logs and latexmk's output: a
+syntax error or repeated entry in a `.bib` file is `bibtex_error` with the
+`.bib` file and the line BibTeX reports; a database or style BibTeX cannot
+open is `missing_file`; a `.bib` named by `\bibliography` that does not exist
+(latexmk then does not run BibTeX) is a `missing_file` warning; an entry not
+in the databases is an `undefined_citation` warning from BibTeX next to
+LaTeX's. `bibtex_failed` says that BibTeX failed (`info` after its errors,
+`error` when there are none to show). The `.blg` itself is not an artifact.
+
 Check `error` first, then `outcome` (or just `texrun_exit_code`). `exit` is
 the latexmk process status and is informational only. `error` can appear
 together with an `outcome`, e.g. when the compile succeeded but its output

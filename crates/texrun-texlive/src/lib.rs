@@ -24,7 +24,12 @@
 //!   size (polled), and the captured stdout / stderr (4 MiB each).
 //!
 //! The main log is parsed with `texrun-latex-log`; its diagnostics carry
-//! workspace-relative file names.
+//! workspace-relative file names. BibTeX failures are reported from the
+//! `.blg` files latexmk's BibTeX runs wrote into the output directory and
+//! from latexmk's console output (e.g. a missing `.bib`, for which latexmk
+//! does not run BibTeX at all); see the `bibtex` module for the bounds on
+//! what is read. The `.blg` files are not artifacts: their content is in the
+//! diagnostics' excerpts.
 //!
 //! # Platform support
 //!
@@ -43,6 +48,7 @@
 #[cfg(not(unix))]
 compile_error!("texrun-texlive supports Unix hosts only");
 
+mod bibtex;
 mod command;
 mod engine;
 mod layout;

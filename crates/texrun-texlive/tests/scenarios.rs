@@ -129,8 +129,10 @@ fn references() {
 
     // kpsewhich is disabled; latexmk may mention that on stderr (the wording
     // depends on the latexmk version, so it is not checked) and carries on.
-    // Such console output never becomes a diagnostic: only the .log is
-    // parsed. The rc's own failure message must not appear.
+    // Such console output never becomes a diagnostic: diagnostics come from
+    // the .log and .blg files, and from a few fixed latexmk messages about
+    // BibTeX (see the `bibtex` module). The rc's own failure message must
+    // not appear.
     let stderr = String::from_utf8_lossy(&run.stderr.bytes);
     assert!(
         !stderr.contains("texrun: failed to run"),

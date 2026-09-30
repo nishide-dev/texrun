@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 use texrun_core::{
@@ -15,6 +15,7 @@ use texrun_core::{
 };
 use texrun_latex_log::LogParser;
 
+use crate::bibtex;
 use crate::command::{self, MAX_PRINT_LINE};
 use crate::layout::{self, HOME_DIR};
 use crate::names::{check_host_path, check_name};
@@ -311,6 +312,16 @@ impl LatexmkEngine {
             }
         };
         diagnostics.extend(plan.parse_log());
+        // When latexmk started, for telling this compile's BibTeX logs from
+        // stale ones.
+        let started = SystemTime::now()
+            .checked_sub(finished.elapsed)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        diagnostics.extend(plan.bibtex_diagnostics(
+            started,
+            &finished.stdout.bytes,
+            &finished.stderr.bytes,
+        ));
 
         let mut result = CompileResult::new(outcome, self.info(), finished.elapsed);
         result.exit = Some(ProcessExit::from(finished.status));
@@ -605,6 +616,24 @@ impl Plan {
             ));
         }
         diagnostics
+    }
+}
+
+impl Plan {
+    /// Diagnostics about BibTeX (see the `bibtex` module): its logs written
+    /// since `started` and what latexmk printed about it.
+    fn bibtex_diagnostics(
+        &self,
+        started: SystemTime,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Vec<Diagnostic> {
+        let inputs = bibtex::Inputs {
+            root: &self.root,
+            entry_dir: &self.cwd,
+            entry_dir_rel: self.entry_dir_rel.as_ref(),
+        };
+        bibtex::diagnostics(&self.output_dir, started, &inputs, stdout, stderr)
     }
 }
 

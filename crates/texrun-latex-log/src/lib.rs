@@ -1,5 +1,5 @@
-//! Turns TeX / LaTeX engine logs (`main.log`) into structured
-//! [`Diagnostic`]s.
+//! Turns TeX / LaTeX engine logs (`main.log`) and BibTeX logs (`.blg`, see
+//! [`BlgParser`]) into structured [`Diagnostic`]s.
 //!
 //! The parser is a pure function of the log bytes (and, optionally, of source
 //! files handed to it by the caller, see [`LogParser::parse_with_sources`]):
@@ -124,12 +124,14 @@
 //! assert_eq!(diagnostics[0].line, Some(5));
 //! ```
 
+mod blg;
 mod lines;
 mod parser;
 mod patterns;
 mod request;
 mod stack;
 
+pub use blg::{BibFiles, BlgParser, ParsedBlg, parse_blg};
 pub use parser::ParsedLog;
 pub use texrun_core::{Diagnostic, DiagnosticKind, Severity};
 use texrun_core::{WorkspacePath, WorkspaceRoot};
