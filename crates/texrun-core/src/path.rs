@@ -170,6 +170,14 @@ impl WorkspacePath {
     pub fn join(&self, other: &Self) -> Self {
         Self(format!("{}/{}", self.0, other.0))
     }
+
+    /// Whether `base` is this path or one of its ancestors, compared by whole
+    /// components (`a/bc` does not start with `a/b`). Purely lexical.
+    pub fn starts_with(&self, base: &Self) -> bool {
+        self.0
+            .strip_prefix(&base.0)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
 }
 
 /// `C:`, `c:foo` etc. — meaningful as a drive prefix on Windows.
@@ -340,6 +348,17 @@ mod tests {
         assert_eq!(wp(".latexmkrc").file_stem(), ".latexmkrc");
         assert_eq!(wp("archive.tar.gz").file_stem(), "archive.tar");
         assert_eq!(wp("out").join(&p).as_str(), "out/chapters/intro.tex");
+    }
+
+    #[test]
+    fn starts_with_compares_whole_components() {
+        let p = wp("a/b/c.tex");
+        assert!(p.starts_with(&wp("a")));
+        assert!(p.starts_with(&wp("a/b")));
+        assert!(p.starts_with(&wp("a/b/c.tex")));
+        assert!(!p.starts_with(&wp("a/b/c")));
+        assert!(!wp("a/bc").starts_with(&wp("a/b")));
+        assert!(!wp("a").starts_with(&wp("a/b")));
     }
 
     #[test]
