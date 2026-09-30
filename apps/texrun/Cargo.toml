@@ -1,0 +1,19 @@
+[package]
+name = "texrun"
+description = "A CLI for compiling LaTeX documents with structured diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "texrun"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+texrun-core.workspace = true
+
+[lints]
+workspace = true
