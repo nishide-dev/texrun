@@ -1,11 +1,13 @@
 # Security model
 
 texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実行制限の既定値をまとめる（#9）。
-ここに書いた決定事項は、各実装 Issue（#4 workspace、#5 TeX Live engine、#6 CLI、#8 preview）が従う仕様である。
+ここに書いた決定事項は、各実装 Issue（#4 workspace、#5 TeX Live engine、#6 CLI、#8 preview、#10 fixture）が従う仕様である。
 実装がこの文書と食い違う場合は、どちらかを修正して揃える。
 
 > **現状:** この文書は方針と検証結果であり、ここに書いた制限の多くはまだ実装されていない。
 > 実装の進み具合は各 Issue を参照する。
+> 公開リポジトリのため、攻撃の再現手順や具体的な入力は書かず、「どの保証をどの層で担保するか」だけを書く。
+> 境界を破る方法を見つけた場合は [SECURITY.md](../SECURITY.md) の手順で非公開で報告してほしい。
 
 ## 1. 脅威モデル
 
@@ -13,16 +15,19 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
 
 - texrun に渡される TeX ソースと付随ファイル（画像、`.bib`、`.sty` など）は **信頼できない入力** として扱う。
   AI エージェントが生成した文書や、外部から取得したテンプレートを想定する。
-- texrun の利用者（CLI を起動する人・エージェント）と texrun のバイナリ、host にインストールされた TeX Live は信頼する。
-- MVP の TeX engine は texrun と同じ host 上で、同じ OS ユーザー権限の子プロセスとして動く（以下「in-process 実行」と呼ぶ。texrun のプロセス内ではないが、OS レベルの隔離境界は無い）。
+- 次のものは信頼する。
+  - texrun の利用者（CLI を起動する人・エージェント）
+  - texrun のバイナリ
+  - host にインストールされた TeX Live
+- MVP の TeX engine は texrun と同じ host 上で、同じ OS ユーザー権限の子プロセスとして動く。これを以下「in-process 実行」と呼ぶ。texrun のプロセス内で動くわけではないが、OS レベルの隔離境界は無い。
 
 ### 守りたいもの
 
-| 資産 | 例 | 想定する攻撃 |
+| 資産 | 例 | 想定する攻撃経路 |
 | --- | --- | --- |
-| host の任意コマンド実行 | shell、任意バイナリ | `\write18`、`latexmkrc`（Perl）、ファイル名経由の shell injection |
-| host の秘密情報 | `~/.ssh`、`/etc/passwd`、環境変数中の token | `\input{/etc/passwd}`、`\openin`、root 外 symlink、環境変数の継承 |
-| host のファイルの改ざん | `~/.bashrc`、入力プロジェクト自体 | `\openout` による workspace 外への書き込み |
+| host の任意コマンド実行 | shell、任意バイナリ | TeX の shell escape、latexmk の rc（Perl）、latexmk が補助ツールを起動するときの shell |
+| host の秘密情報 | `~/.ssh`、環境変数中の token | TeX のファイル読み込み primitive、root 外 symlink、環境変数の継承 |
+| host のファイルの改ざん | `~/.bashrc`、入力プロジェクト自体 | TeX のファイル書き込み primitive |
 | host の資源 | CPU、ディスク、メモリ | 無限ループ、巨大ログ、大量ページ |
 
 ### 信頼境界
@@ -32,83 +37,121 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
 -----------------------------------+------------------------------------------
  texrun CLI / core                 |  入力プロジェクト（コピー元）
  host の TeX Live・latexmk          |    -> workspace（コピー先、texrun が管理）
- preview tool（mutool / pdftoppm）  |        -> TeX engine が読む・実行する内容
-                                   |        -> 生成された log / aux / PDF
+ texrun が生成する latexmk rc       |        -> TeX engine が読む・実行する内容
+ preview tool（mutool / pdftoppm）  |        -> 生成された log / aux / PDF
 ```
 
-TeX engine（latexmk / pdflatex / bibtex）は信頼するバイナリだが、**信頼できない入力を解釈している最中の engine プロセスは攻撃者の影響下にある** とみなす。
-engine が生成した log・PDF も信頼できない入力として扱う（diagnostics parser #7、preview #8 は壊れた・巨大な入力に耐える必要がある）。
+TeX engine（latexmk / pdflatex / bibtex / makeindex）のバイナリは信頼する。
+ただし、**信頼できない入力を解釈している最中の engine プロセスは、攻撃者の影響下にある** とみなす。
+engine が生成した log・PDF も信頼できない入力として扱う。diagnostics parser（#7）と preview（#8）は、壊れた入力や巨大な入力に耐える必要がある。
 
 ## 2. MVP で保証する境界 / 保証しない範囲
 
 ### 保証する（この文書の決定事項を実装した時点で）
 
-1. **任意コマンド実行をしない（TeX / latexmk の機能として）**
-   - `\write18` / `\immediate\write18` は実行されない（`-no-shell-escape`。restricted shell escape も無効）。
-   - `\input{"|cmd"}` / `\openout` の pipe は実行されない（shell escape 無効時は pipe も無効）。
-   - 入力に含まれる `latexmkrc` / `.latexmkrc`、user・system の rc ファイルは実行されない（`-norc`）。
-   - latexmk は内部で `sh -c` を使うため、entrypoint 名・output dir 名に shell メタ文字を含めない（§3.5）。
-2. **TeX から workspace 外のファイルを名前で指定して読み書きさせない**
-   - 絶対パス（`/etc/passwd`、`/proc/self/environ`）、`..` を含むパス、dot で始まる component を含むパスの `\input` / `\openin` / `\openout` は kpathsea の paranoid mode（`openin_any=p` / `openout_any=p`）で拒否される。
-   - workspace は入力を texrun 管理のディレクトリにコピーしたもので、root 外を指す symlink は持ち込まない（#4）。
-3. **host 由来の環境変数に依存しない・漏らさない**（env allowlist、§3.4）。
-4. **資源消費に上限がある**: wall-clock timeout、1 ファイルあたりの書き込みサイズ上限、output の合計サイズ上限、入力サイズ上限（§3.1〜3.3）。
+1. **TeX / latexmk の機能を経由して任意のコマンドを実行させない。** 次の層を重ねて担保する。
+   - **TeX の shell escape を無効にする。** `\write18` と pipe による open は実行されない。latexmk の `-no-shell-escape` に加え、texrun 管理 rc の pdflatex コマンドにも明示する（§3.5）。
+   - **入力やユーザー環境の rc を実行しない。** 入力に含まれる rc と、user・system の rc は読まない（`-norc`）。代わりに、texrun が workspace の外に生成した rc だけを `-r` で読ませる（§3.5）。
+   - **latexmk に shell を使わせない。** latexmk の既定の設定では、pdflatex・bibtex・makeindex などの補助ツールや kpsewhich を shell 経由で起動する。起動の引数には、文書の内容や log に由来する名前が入りうる。texrun 管理 rc では、次のように上書きする。
+     - 補助ツールは shell を経由しない（argv を配列のまま渡す）起動に置き換える
+     - kpsewhich の呼び出しは無効にする
+     - texrun が使わないツールは未実装扱い（`NONE`）にする
+   - **多層防御の一段として、entrypoint と output dir の名前を検査する**（§3.5）。この検査だけでは、上の保証は成り立たない。
+   - 検証は #10 の security fixture で行う。
+2. **workspace の外にあるファイルを、次の経路で読み書きさせない。**
+   - `\input` / `\include` / `\openin` / `\openout` による読み書き
+   - 画像の読み込み（`\includegraphics` / `\pdfximage`）
+   - bibtex の database / style の指定
+   - pdfTeX のファイル情報系 primitive（`\pdffilesize` など）
+
+   これらの経路では、次の指定がすべて kpathsea の paranoid mode（`openin_any=p` / `openout_any=p`、§3.7）で拒否されることを確認した。
+   - 絶対パス
+   - `..` を含むパス
+   - dot で始まる component を含むパス
+
+   workspace は入力を texrun 管理のディレクトリにコピーしたもので、root 外を指す symlink は持ち込まない（#4）。
+3. **host 由来の環境変数に依存しない。漏らさない**（env allowlist、§3.4）。
+4. **資源消費に上限を設ける。** 対象は wall-clock timeout、1 ファイルあたりの書き込みサイズ、output の合計サイズ、入力サイズ（§3.1〜3.3）。
 5. **timeout / cancel 時に子孫プロセスを残さない**（process group 単位の kill、§3.6）。
 
 ### 保証しない（MVP の in-process 実行の限界）
 
-- **TeX Live の texmf ツリー等、host の一部は読める。**
-  paranoid mode の判定は「TeX に渡された名前」に対して行われ、kpathsea の検索で見つかるファイル（`\input{article}` → `/usr/share/texlive/texmf-dist/...`）は読める。
-  つまり TEXMFDIST・TEXMFLOCAL・TEXMFSYSVAR・TEXMFSYSCONFIG（Debian では `/usr/share/texlive`、`/usr/share/texmf`、`/var/lib/texmf`、`/etc/texmf`）配下のファイルは文書から読み出して PDF に埋め込める。
-  これらは通常公開情報だが、host 固有の設定やローカルにインストールしたパッケージが含まれうる。
-- **OS レベルの隔離は無い。** engine は texrun を起動したユーザーの権限で動く。pdfTeX・libpng・libjpeg・poppler / MuPDF など、画像や PDF を解析するコードにメモリ安全性の脆弱性があれば、細工した画像・PDF で任意コード実行されうる。その場合、そのユーザーが読み書きできるものはすべて危険にさらされる。
-- **network は遮断していない。** TeX Live + latexmk の compile は network を必要としないが、network namespace 等で禁止はしていない。
-- **CPU・メモリは OS レベルで制限していない。** pdfTeX のメモリは `texmf.cnf` の固定容量（`main_memory` 等）で頭打ちになる（`\def\x{x\x}\x` は数秒で `TeX capacity exceeded` で止まった）が、LuaTeX など他 engine はこの限りではない。CPU 時間は timeout でのみ制限する。
-- **workspace 内での書き込みは止めない。** TeX は workspace 内（output dir 配下）に任意の名前・数のファイルを作れる。サイズは §3.2 の上限で抑えるが、ファイル数・inode は制限しない。
-- **timeout までの資源消費は起こりうる。** ログを吐き続ける文書は約 32 MB/s でログと stdout を生成した（§6）。上限に達するまでの消費は許容する。
-- **process group から抜けるプロセスは追えない。** `setsid` 等で新しい session を作った孫プロセスは killpg の対象外になる。shell escape 無効の TeX / latexmk はそのようなプロセスを起動しないが、OS として保証するものではない（cgroup 等は post-MVP）。
-- **TeX / latexmk / kpathsea 自体のバグ** による境界の破れ。
-- **表示上の偽装。** `WorkspacePath` は bidi 制御文字（U+202A〜U+202E、U+2066〜U+2069）やゼロ幅文字（U+200B〜U+200F、U+FEFF）を許容している。人間向け出力でこれらを含む path を表示するときは escape する（#6）。JSON 出力はそのまま出す（JSON 文字列として正しく、消費側の責任で扱う）。
+完全な対策は、将来の sandbox backend（§4、#26）で扱う。
+
+- **font 関連の読み込みは保証しない。** font・font map・encoding などの読み込みには、paranoid mode の検査が及ばない経路がある。
+- **PDF object にファイルを直接埋め込む pdfTeX の primitive は保証しない。** この経路は paranoid mode の検査対象外で、workspace 外のファイルを読めることを確認した。
+- **TeX Live の texmf ツリー等、host の一部は名前で指定すれば読める。** paranoid mode の判定は「TeX に渡された名前」に対して行う。そのため、各ファイル種別の検索パスで見つかるファイルは読める。検索パスはファイル種別ごとに次のとおり。
+  - TeX 入力（`\input` / `\openin`）: `TEXINPUTS`（texmf ツリーの `tex/` 以下と cwd）
+  - 画像: `TEXINPUTS`
+  - bibtex: `BIBINPUTS` / `BSTINPUTS`（`bibtex/` 以下）
+  - font 関連: font 用の各パス（`fonts/` 以下と、OS の font ディレクトリ）
+
+  たとえば `\openin` では、`tex/` 以下の `.sty` / `.cls` は読めた。一方、`web2c/` にある `texmf.cnf`、`ls-R`、font map、`.bst` は見つからなかった。これらのファイルは通常公開情報だが、host 固有の設定やローカルにインストールしたパッケージが含まれうる。
+- **OS レベルの隔離は無い。** engine は texrun を起動したユーザーの権限で動く。画像や PDF を解析するコード（pdfTeX・libpng・libjpeg・poppler / MuPDF など）にメモリ安全性の脆弱性があれば、細工した入力で任意コード実行されうる。その場合、そのユーザーが読み書きできるものはすべて危険にさらされる。
+- **network は遮断していない**（§3.8、#24）。
+- **CPU・メモリは OS レベルで制限していない**（#25）。
+  - pdfTeX のメモリは `texmf.cnf` の固定容量（`main_memory` 等）で頭打ちになる。LuaTeX など他の engine はこの限りではない。
+  - CPU 時間は timeout でのみ制限する。
+- **workspace 内での書き込みは止めない。** TeX は output dir 配下に、任意の名前・任意の数のファイルを作れる。サイズは §3.2 の上限で抑えるが、ファイル数・inode は制限しない。
+- **上限に達するまでの資源消費は起こりうる。** ログを出し続ける文書では、ログと stdout がそれぞれ約 32 MB/s の速さで増えた（§6）。
+- **process group から抜けるプロセスは追えない。**
+  - 新しい session を作った子孫は `killpg` の対象外になる。
+  - shell escape を無効にした TeX と、texrun 管理 rc の latexmk は、そのようなプロセスを起動しない。ただし OS として保証するものではない（cgroup 等、#25）。
+- **生成物から host の情報が漏れる。** 詳細は §3.9。
+- **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。
+- **表示上の偽装。** `WorkspacePath` は bidi 制御文字（U+202A〜U+202E、U+2066〜U+2069）とゼロ幅文字（U+200B〜U+200F、U+FEFF）を許容している。
+  - 人間向けの出力でこれらを含む path を表示するときは、escape する（#6）。
+  - JSON 出力はそのまま出す。JSON 文字列としては正しく、扱いは消費側の責任とする。
+  - output dir と entrypoint の名前では、これらの文字を §3.5 の検査で拒否する。
 
 ## 3. 決定事項
 
-各項目の末尾に実装担当 Issue を記す。値は MVP の定数であり、CLI で上書きできるようにするか（timeout 以外）は #6 で決める。
+各項目の末尾に実装担当 Issue を記す。値は MVP の定数である。timeout 以外を CLI で上書きできるようにするかは #6 で決める。
 
 ### 3.1 timeout（#5、CLI 露出は #6）
 
 | 項目 | 既定値 |
 | --- | --- |
-| compile 全体の wall-clock timeout | **60 秒**（latexmk の全 pass・bibtex を含む。`CompileOptions.timeout` が `None` のとき CLI がこの値を入れる） |
-| preview 生成の timeout | **30 秒**（全ページ合計。compile の timeout とは別枠、#8） |
+| compile 全体の wall-clock timeout | **60 秒**（latexmk の全 pass と bibtex / makeindex を含む。`CompileOptions.timeout` が `None` のとき CLI がこの値を入れる） |
+| preview 生成の timeout | **30 秒**（全ページの合計。compile の timeout とは別枠、#8） |
 
-- 60 秒は通常の論文・学会テンプレート（数 pass + bibtex）に十分で、暴走時の待ち時間として許容できる値として選んだ。空白 20,000 ページの文書でも約 9 秒で compile が終わった（§6）。
-- timeout の上限値は設けない（利用者が明示的に長くするのは自由）。`0` は `CompileRequest::validate()` が拒否する（実装済み）。
-- 超過時は `CompileOutcome::TimedOut`、cancel 時は `CompileOutcome::Cancelled`。
+- 60 秒は、通常の論文や学会テンプレート（数 pass + bibtex）の compile には十分である。暴走したときの待ち時間としても許容できるので、この値にした。空白 20,000 ページの文書でも、compile は約 9 秒で終わった（§6）。
+- timeout の上限値は設けない。利用者が明示的に長くするのは自由とする。`0` は `CompileRequest::validate()` が拒否する（実装済み）。
+- timeout を超えたら `CompileOutcome::TimedOut`、cancel されたら `CompileOutcome::Cancelled` を返す。
 
 ### 3.2 出力・artifact の上限（#5、preview は #8）
 
 | 項目 | 既定値 | 強制方法 |
 | --- | --- | --- |
-| 子プロセスが書く 1 ファイルの最大サイズ | **256 MiB** | `RLIMIT_FSIZE`（spawn 前に `pre_exec` で `setrlimit`。latexmk と全子孫に継承される） |
-| output dir の合計サイズ | **1 GiB** | timeout の poll ループ内で定期的（目安 500 ms ごと）に集計し、超えたら process group を kill |
-| stdout / stderr の保持量 | **各 4 MiB**（先頭を保持し、超過分は読み捨てる） | reader thread が pipe を最後まで読み続け、保持量だけを制限する（pipe を止めると engine が block する） |
-| PDF artifact | 256 MiB（`RLIMIT_FSIZE` と同じ値で自動的に頭打ち） | — |
-| preview のページ数 | 既定 **先頭 20 ページ**、指定範囲（`--pages`）でも **最大 200 ページ** | #8 |
-| preview 画像の合計サイズ | **128 MiB** を超えた時点で以降のページを生成せず warning | #8 |
+| 子プロセスが書く 1 ファイルの最大サイズ | **256 MiB** | `RLIMIT_FSIZE`。spawn 前に `pre_exec` で `setrlimit` し、latexmk と全子孫に継承させる |
+| output dir の合計サイズ | **1 GiB** | timeout の poll ループ内で定期的に（目安 500 ms ごと）集計し、超えたら process group を kill する |
+| stdout / stderr の保持量 | **各 4 MiB**（先頭を保持し、超過分は読み捨てる） | reader thread が pipe を最後まで読み続け、保持する量だけを制限する。pipe を読まずに止めると engine が block する |
+| PDF artifact | 256 MiB（`RLIMIT_FSIZE` と同じ値で自動的に頭打ちになる） | — |
+| preview のページ数 | 既定は **先頭 20 ページ**。範囲を指定した場合（`--pages`）も **最大 200 ページ** | #8 |
+| preview 画像の合計サイズ | **128 MiB**。超えた時点で以降のページを生成せず、warning を出す | #8 |
 
-- `RLIMIT_FSIZE` を超えた書き込みでは engine が `SIGXFSZ` で終了する（20 MiB に制限してログを吐き続けさせると、ログはちょうど 20 MiB で止まり latexmk は失敗終了した）。
-- 上限による停止は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。専用の outcome を追加するかは #5 で判断してよい（`CompileOutcome` は `#[non_exhaustive]`）。
+- `RLIMIT_FSIZE` を超えて書き込もうとすると、engine は `SIGXFSZ` で終了する。20 MiB に制限してログを出し続けさせたところ、ログはちょうど 20 MiB で止まり、latexmk は失敗終了した。
+- 上限によって停止した場合は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。`CompileOutcome` は `#[non_exhaustive]` なので、専用の outcome を追加するかは #5 で判断してよい。
 
-### 3.3 入力の上限（#4）
+### 3.3 入力の上限と除外（#4、#21 の実装値と揃える）
 
 | 項目 | 既定値 |
 | --- | --- |
-| workspace にコピーする合計サイズ | **512 MiB** |
-| ファイル数 | **10,000** |
+| workspace にコピーする regular file の合計サイズ | **256 MiB** |
+| entry 数（file + directory + symlink） | **10,000** |
+| 深さ（root からの path component 数） | **32** |
 
-- 上限を超えたら compile を始めずに `EngineError::InvalidRequest` 相当のエラーにする（黙って一部だけコピーしない）。
-- コピー時の除外: `.git/`、`.texrun/`（output root と衝突させない）、`latexmkrc` / `.latexmkrc`（`-norc` で実行はされないが持ち込まない。除外した旨を warning にする）。
-- root 外を指す symlink は拒否（#4 の方針どおり）。
+- 値は `WorkspaceConfig` で上書きできる。
+- 上限を超えたら、compile を始めずにエラーにする（`WorkspaceError::LimitExceeded`）。黙って一部だけコピーすることはしない。
+- コピー時に除外するもの（除外した理由は report に記録する）:
+  - VCS のディレクトリ: `.git`、`.hg`、`.svn`
+  - `.texrun/`（output root と衝突させないため）
+  - root 直下の `target`
+  - special file（FIFO / socket 等）
+  - `*.fmt`: workspace 内の format を読み込ませないため。§3.5 の `-no-parse-first-line` と合わせた二重の対策
+  - `biber.conf`: 将来 biber を使う場合に、入力から設定を持ち込ませないため
+  - `latexmkrc` / `.latexmkrc`: `-norc` で実行はされないが、持ち込まない。report に記録し、CLI が warning として表示する（#6）
+- root 外を指す symlink は拒否する（#4 の方針どおり）。
 
 ### 3.4 子プロセスの環境変数（#5、preview tool は #8）
 
@@ -116,77 +159,200 @@ engine が生成した log・PDF も信頼できない入力として扱う（di
 
 | 変数 | 値 | 理由 |
 | --- | --- | --- |
-| `PATH` | host の `PATH` をそのまま | latexmk が `pdflatex` / `bibtex` を PATH から探す。空だと `kpathsea: Can't get directory of program name: ./pdflatex` で失敗した。TeX Live のインストール先は host ごとに異なるので固定値にしない |
-| `HOME` | `<workspace>/.texrun/home`（texrun が作る空ディレクトリ） | user の `~/texmf`（TEXMFHOME）や `~/.latexmkrc` を使わない。**未設定にしてはいけない**: `HOME` が無いと TEXMFHOME が `./texmf`、TEXMFVAR が `./.texlive2025/texmf-var`（cwd = workspace 相対）になる |
-| `openin_any` | `p` | §3.7 |
-| `openout_any` | `p` | §3.7 |
-| `max_print_line` | `10000` | ログの 79 文字折り返しを抑える（#7 の parse 精度）。`error_line` / `half_error_line` も変える場合は #7 で決める |
-| `MKTEXTFM` / `MKTEXPK` / `MKTEXMF` | `0` | 存在しないフォント名で kpathsea が `mktextfm` 等の shell script を起動し、TEXMFVAR に書き込むのを止める（`-no-shell-escape` とは独立に動く） |
-| `LC_ALL` | `C` | メッセージ・bibtex の挙動を locale に依存させない。`LC_ALL=C` でも UTF-8 のファイル名（`日本語.tex`）は compile できた |
+| `PATH` | host の `PATH` をそのまま | latexmk は `pdflatex` / `bibtex` を PATH から探す。PATH が空だと起動できなかった。TeX Live のインストール先は host ごとに異なるので、固定値にはしない |
+| `HOME` | `<workspace>/.texrun/home`（texrun が作る空ディレクトリ） | user の `~/texmf`（TEXMFHOME）や `~/.latexmkrc` を使わないため。**未設定にしてはいけない**。`HOME` が無いと、TEXMFHOME と TEXMFVAR が cwd（= workspace）相対のパスになる |
+| `openin_any` / `openout_any` | `p` | §3.7 |
+| `max_print_line` | `10000` | ログの 79 文字折り返しを抑える（#7 の parse 精度のため）。`error_line` / `half_error_line` も変えるかは #7 で決める |
+| `MKTEXTFM` / `MKTEXPK` / `MKTEXMF` / `MKTEXTEX` / `MKTEXFMT` | `0` | ファイルが見つからないときに、kpathsea が生成 script を起動しないようにする。この起動は `-no-shell-escape` とは独立に行われ、生成物を TEXMFVAR に書き込む |
+| `LC_ALL` | `C` | メッセージと bibtex の挙動を locale に依存させない。`LC_ALL=C` でも、UTF-8 のファイル名は compile できた |
 
-- 渡さないもの（例）: `TEXINPUTS`・`BIBINPUTS`・`BSTINPUTS`・`TEXMFCNF`・`TEXMF*`（host の設定で入力の解決先が変わる。`TEXINPUTS` を継承すると host 側の `article.cls` に差し替えられることを確認した）、`shell_escape`（**環境変数 `shell_escape=t` を継承すると、`-no-shell-escape` 無しでは `\write18` が実行された**）、token・秘密情報を含みうる任意の変数。
-- `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE`（再現可能な PDF）は必要になった時点で allowlist に追加を検討する。
-- trade-off: `HOME` を差し替えるため、user が `~/texmf` に入れたパッケージは使えない。必要になったら明示的な option（例: 追加の読み取り専用 texmf ツリー）として設計する。
+- 渡さない変数（例）:
+  - 検索パス・設定の変数: `TEXINPUTS`・`BIBINPUTS`・`BSTINPUTS`・`TEXMFCNF`・`TEXMF*`。継承すると、入力ファイルの解決先が host 側に変わる
+  - shell escape の設定を上書きできる変数: `shell_escape`・`shell_escape_commands`
+  - latexmk の system rc を指定する `LATEXMKRCSYS`
+  - token などの秘密情報を含みうる、その他の任意の変数
+- 再現可能なビルド用の変数（`SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE`）は §3.9 で扱う。
+- trade-off: `HOME` を差し替えるので、user が `~/texmf` に入れたパッケージは使えない。必要になったら、明示的な option（例: 追加の読み取り専用 texmf ツリー）として設計する。
 
 ### 3.5 latexmk の起動（#5）
 
+texrun 自身は shell を介さず、argv 配列で latexmk を起動する。
+
 ```text
-latexmk -pdf -norc -no-shell-escape
-        -interaction=nonstopmode -halt-on-error -file-line-error
-        -outdir=<output_dir（workspace 相対）>
-        <entrypoint（WorkspacePath::to_cli_arg()）>
+cwd: <entrypoint のあるディレクトリ（workspace 内）>
+latexmk -norc -r <texrun 管理 rc（workspace 外）>
+        -pdf -interaction=nonstopmode -halt-on-error -file-line-error
+        -no-shell-escape
+        -outdir=<output dir の絶対パス>
+        <entrypoint のファイル名（先頭が - なら ./ を付ける）>
 ```
 
-- 必須: `-norc`、`-no-shell-escape`、`-interaction=nonstopmode`。`-shell-escape` / `-shell-restricted` を有効にする option は提供しない。
-- texrun 自身は shell を介さず argv 配列で起動し、working directory は workspace root にする。
-- `-outdir` は **workspace 相対** で渡す（相対・絶対のどちらでも動作は同じだった。相対にすると host の temp dir のパスが latexmk の内部 shell command に入らない）。
-- **latexmk は pdflatex / bibtex を `sh -c` 経由で起動する**（`Running 'pdflatex ... "main.tex"'`。ファイル名は二重引用符で囲まれるだけ）。entrypoint にバッククォートを含む `` g`id>pwn_g`.tex `` を渡すと **`id` が実行された**。`-outdir` にバッククォートを含めても同様に実行された。latexmk 自身は `$` や空白を含む名前を拒否するが、バッククォートは通してしまう。
-  - そのため engine は entrypoint と output dir の各文字を allowlist で検査し、外れたら `EngineError::InvalidRequest` にする: ASCII 英数字、`.` `_` `-` `+` `,` `=` `@` `/`、および非 ASCII の英数字（`char::is_alphanumeric`）。空白、`` ` `` `$` `"` `'` `\` `;` `|` `&` `<` `>` `(` `)` `{` `}` `[` `]` `*` `?` `~` `#` `%` `^` `!` などは拒否する（TeX 側でも問題を起こす文字が多い）。
-  - 先頭 `-` は `WorkspacePath::to_cli_arg()` で `./-x.tex` になり、正しく扱われることを確認した。latexmk は `--` をサポートしない（`--` を渡すと失敗する）。
-- **`-file-line-error` と `\include{chapters/intro}` の組み合わせで subdirectory の `.aux` が書けない問題**: pdflatex の `-output-directory` は subdirectory を作らない。latexmk は `! I can't write on file ...` というログ行を見て subdirectory を作って再実行する機能を持つが、`-file-line-error` を付けるとこの行が `./main.tex:6: I can't write on file ...` になって検出されず、compile が失敗する（paranoid mode とは無関係に起きる）。
-  - 対策（#5）: **latexmk 起動前に、workspace 内の入力ディレクトリ構造を output dir 配下に作っておく**（`chapters/` があれば `<output_dir>/chapters/` を作る）。これで `-file-line-error` を維持したまま相対・絶対 `-outdir` の両方で成功した。`-file-line-error` を外す案は #7 の parse を難しくするので採らない。
-  - `-e '$allow_subdir_creation=2'` は検出条件が同じなので効かなかった（`-e` は Perl を実行する option でもあり、使わない）。
+**texrun 管理 rc**
+
+rc は compile ごとに（または texrun の起動ごとに）、workspace の **外**、texrun が所有する一時ディレクトリに生成する。
+TeX からは書き込めない（§3.7）。
+`-norc` で自動の rc 読み込みを止め、この rc だけを `-r` で読ませる。
+rc の骨子（設定項目名レベル）は次のとおり。
+
+| 設定項目 | 内容 |
+| --- | --- |
+| 起動用の Perl sub（例 `texrun_run`） | 受け取った引数を、`system { $prog } @args` の形（list 形式、shell を経由しない）で実行する |
+| `$pdflatex` | `internal texrun_run pdflatex -no-parse-first-line -no-shell-escape %O %S` |
+| `$bibtex` | `internal texrun_run bibtex %O %S` |
+| `$makeindex` | `internal texrun_run makeindex %O -o %D %S` |
+| `$biber` | `internal texrun_run biber %O %S`（将来用。MVP の image には biber が無い） |
+| `$kpsewhich` | `NONE`（呼び出しを無効化する） |
+| `$latex` / `$xelatex` / `$lualatex` / `$dvilualatex` / `$dvipdf` / `$dvips` / `$ps2pdf` / 各 previewer / `$lpr*` | `NONE`（MVP では使わない） |
+| `$pdf_mode` / `$dvi_mode` / `$postscript_mode` | `1` / `0` / `0` |
+| `$success_cmd` / `$warning_cmd` / `$failure_cmd` 等のフック | 設定しない（空のまま） |
+
+- 検証結果（§6）: この rc を使うと、プロセスツリーは `latexmk → pdflatex` になり、間に `sh` が入らなかった。次の機能がすべて正常に動いた。
+  - 目次
+  - 相互参照
+  - bibtex
+  - サブディレクトリへの `\include`
+  - makeindex
+- `$kpsewhich = 'NONE'` の副作用が 2 つある。
+  - latexmk の stdout に `Kpsewhich command needed but not set up` が出る。#7 の parser ではこれを無視する。
+  - latexmk は、texmf 内のファイルの依存関係を追跡しなくなる。texrun は毎回まっさらな workspace で compile するので、影響は無い。
+- latexmk 4.86 のソースで、shell を使う箇所は次の 3 つだった。
+  - コマンドの実行
+  - kpsewhich の呼び出し
+  - `-pvc` 用のプロセス一覧取得
+
+  前の 2 つは、この rc で塞いだ。texrun は `-pv` / `-pvc` を使わない。latexmk を更新するときは、この確認をやり直す。
+- **必須オプション**（`-shell-escape` / `-shell-restricted` を有効にする option は提供しない）:
+  - `-norc` と `-r <rc>`
+  - `-no-shell-escape`
+  - `-interaction=nonstopmode`
+  - pdflatex の `-no-parse-first-line`（rc で指定する）。TeX Live の既定では pdflatex の `parse_first_line` が `t` で、ソースの先頭行で format を指定できる。このオプションで、先頭行の format 指定が無視されることを確認した。
+  - `-e`（Perl を実行する option）は使わない。
+
+**サブディレクトリの entrypoint（例 `src/main.tex`）**
+
+cwd を workspace root にしたままだと、`src/` からの相対 `\input` / `\include` と `.bib` が解決しない。次の 3 方式を比べた。
+
+| 方式 | 結果 |
+| --- | --- |
+| texrun が cwd を `src/` にし、`-outdir` を絶対パスで渡す | 成功（相互参照・bibtex・makeindex・`\include` を含む） |
+| cwd は root のまま、latexmk の `-cd` を使う | 成功。ただし相対 `-outdir` は `src/` 基準で解釈され、output が `src/.texrun/out` にできた。絶対パスなら期待どおりだった |
+| cwd は root のまま、`-cd` を使わない | 相対 `\include` と `.bib` が見つからない |
+
+- **決定:** texrun が `Command::current_dir` で cwd を entrypoint のディレクトリにし、`-outdir` は `WorkspaceRoot::output_dir()` の絶対パスで渡す。`-cd` は使わない（latexmk 側の path 解釈に依存しないため）。
+- 補足:
+  - 相対 `-outdir` で `..` を含む値を渡しても、latexmk は内部で絶対パスに変換していた。
+  - rc によって shell を経由しないので、絶対パスに host の temp dir 名が入っても問題にならない。
+- 制約: paranoid mode では `..` を含むパスを読めない。そのため、entrypoint のディレクトリより上にあるファイル（例 `\input{../common/macros}`）は読めない。そうした構成では、project root に置いた entrypoint から読み込むよう案内する（#6 の CLI ヘルプ・エラーメッセージ）。
+
+**output dir のサブディレクトリの事前作成**
+
+pdflatex の `-output-directory` は、サブディレクトリを作らない。
+latexmk はログの特定の行を見てサブディレクトリを作る機能を持つが、`-file-line-error` を付けるとその行の形式が変わって検出されず、`\include{chapters/intro}` の compile が失敗した（paranoid mode とは無関係）。
+
+- 対策（#5）: latexmk を起動する前に、entrypoint のディレクトリ配下のディレクトリ構造を output dir 配下に作っておく。
+- この対策で、`-file-line-error` を維持したまま成功した。`-file-line-error` を外す案は #7 の parse を難しくするので採らない。
+
+**entrypoint と output dir の名前の検査（多層防御）**
+
+上の rc によって、名前が shell に渡ることは無くなる。
+それでも、rc の設定漏れや latexmk の将来の変更に備えて、engine は entrypoint と output dir（workspace 相対）の各文字を検査する。
+外れたら `EngineError::InvalidRequest` にする。
+
+- ASCII: 英数字、空白、`.` `_` `-` `+` `,` `=` `@` `/` だけを許可する。shell や TeX で特別な意味を持つ記号（引用符、`` ` ``、`$`、`\`、`;`、`|`、`&`、`<`、`>`、括弧類、`*`、`?`、`~`、`#`、`%`、`^`、`!` など）は拒否する。
+- 非 ASCII: Unicode の general category が **Cf（format。bidi 制御文字・ゼロ幅文字を含む）** の文字だけを拒否し、それ以外は許可する。制御文字（Cc）は `WorkspacePath` が既に拒否している。日本語の全角記号・全角空白・結合文字（NFD）は許可する。
+- **Unicode 正規化はしない。** 判定は与えられた文字列のまま行い、path もそのまま使う。
+  - Linux のファイル名はバイト列で、正規化して別の名前にすると、実在するファイルを指せなくなる。
+  - macOS（APFS）は正規化の違いを区別しない。
+  - 結合文字は許可しているので、NFC / NFD のどちらの形でも同じ判定になる。
+- 先頭の `-` は `WorkspacePath::to_cli_arg()` で `./-x.tex` になり、正しく扱われることを確認した。latexmk は `--` をサポートしない（`--` を渡すと失敗する）。
+- latexmk 自身も `$` を含む名前は拒否するが、空白を含む名前は通す。latexmk 側の検査には依存しない。
 
 ### 3.6 プロセスの停止（#5、preview tool は #8）
 
 - spawn 時に新しい process group を作る（`CommandExt::process_group(0)`）。
-- timeout / cancel（`CancelToken`）/ 出力上限超過時は **process group に `SIGKILL`**（`killpg`）。latexmk に `SIGTERM` を送るだけでは、子の `sh -c` と `pdflatex` が親 PID 1 のまま走り続けることを確認した。TeX に graceful shutdown は不要で、途中までの log はファイルに残るので、`SIGTERM` による猶予は設けない。
-- latexmk が正常終了した後も `killpg(SIGKILL)` を 1 回送り、残った子孫を掃除する（`ESRCH` は無視）。group に生存メンバーがいる間は同じ ID の process group は作られないので、leader を reap した後の `killpg` でも無関係なプロセスには届かない。
-- `ctx.cancel.is_cancelled()` と timeout・出力サイズは同じ poll ループで確認する（#20 からの申し送りどおり）。
+- timeout / cancel（`CancelToken`）/ 出力上限の超過時は、**process group に `SIGKILL` を送る**（`killpg`）。
+  - latexmk だけに `SIGTERM` を送ると、その子プロセスが親 PID 1 のまま走り続けることを確認した。
+  - TeX に graceful shutdown は不要で、途中までの log はファイルに残る。そのため `SIGTERM` による猶予は設けない。
+- latexmk が正常終了した後も `killpg(SIGKILL)` を 1 回送り、残った子孫を掃除する（`ESRCH` は無視する）。
+  - group に生存メンバーがいる間は、同じ ID の process group は作られない。
+  - そのため、leader を reap した後に `killpg` しても、無関係なプロセスには届かない。
+- `ctx.cancel.is_cancelled()`、timeout、出力サイズは、同じ poll ループで確認する（#20 からの申し送りどおり）。
 
 ### 3.7 kpathsea 設定（#5）
 
-- `openin_any=p` / `openout_any=p` を環境変数で渡す（TeX Live / Debian の既定は `openin_any=a`、`openout_any=p`）。
-- `TEXMFOUTPUT` は設定しない（設定するとそのディレクトリ配下の絶対パスへの書き込みが許可される）。
-- **output dir `.texrun/out`（dot ディレクトリ配下）は paranoid mode と両立する。** 判定対象は TeX に渡された名前（`main.aux`、`chapters/intro.aux`）で、`-output-directory` の prefix は判定の後に付くため。相対・絶対の `-outdir` の両方で `.aux`・`.log`・`.toc`・`\include` 子ファイルの `.aux`・bibtex（`.bbl` / `.blg`）が正常に書け、相互参照と引用が解決された。**既定 output dir の変更は不要**。
-- 副作用: 文書から dot で始まる path（`\input{.hidden/x}`）や `..` を含む path は読めなくなる（互換性の制約として受け入れる）。
+- `openin_any=p` / `openout_any=p` を環境変数で渡す。TeX Live / Debian の既定は `openin_any=a`、`openout_any=p`。
+- `TEXMFOUTPUT` は設定しない。設定すると、そのディレクトリ配下の絶対パスへの書き込みが許可される。
+- **output dir `.texrun/out`（dot ディレクトリ配下）は paranoid mode と両立する。**
+  - 判定の対象は TeX に渡された名前（`main.aux`、`chapters/intro.aux`）で、`-output-directory` の prefix は判定の後に付く。
+  - `-outdir` を相対で渡しても絶対で渡しても、次のものが正常に書け、相互参照と引用も解決された。
+    - `.aux`・`.log`・`.toc`
+    - `\include` した子ファイルの `.aux`
+    - bibtex の出力（`.bbl` / `.blg`）
+    - makeindex の出力（`.ind` / `.ilg`）
+  - **既定の output dir を変える必要はない。**
+- 副作用: 文書から、dot で始まる path（`\input{.hidden/x}`）や `..` を含む path は読めなくなる。互換性の制約として受け入れる。
 
-### 3.8 network（post-MVP で強制）
+### 3.8 network（#24）
 
-- compile・preview は network を必要としない前提で設計する。package の自動インストール（`tlmgr`、MiKTeX の on-the-fly install 相当）は行わない。
-- MVP では network を遮断しない（§2）。sandbox backend では network 無しを既定にする。
+- compile と preview は、network を必要としない前提で設計する。package の自動インストール（`tlmgr`、MiKTeX の on-the-fly install 相当）は行わない。
+- MVP では network を遮断しない（§2）。どう強制するかは #24 で扱い、sandbox backend（#26）では network 無しを既定にする。
 
-## 4. 将来の sandbox backend
+### 3.9 生成物に含まれる host の情報（#4 / #5 / #6）
+
+生成物には、次の host の情報が含まれる。
+
+| 生成物 | 含まれる情報 |
+| --- | --- |
+| `.fls` / `.fdb_latexmk` | workspace の絶対パス（`PWD` 行。host の temp dir 名。macOS では user ごとのパスを含む） |
+| `.log` | workspace と texmf ツリーの絶対パス |
+| PDF | 作成日時（`CreationDate` / `ModDate`）、それに依存する `/ID`、pdfTeX と TeX Live の版を表す banner（`PTEX.Fullbanner`、`Producer`） |
+
+これらの扱いは次のとおりとする。
+
+- 収集する artifact は engine が報告したもの（PDF、log、preview）だけにする。`.fls` / `.fdb_latexmk` / `.aux` は収集しない（#4 / #5）。
+- 既定では `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` を設定しないので、PDF の日時は compile した時刻になる。再現可能なビルドを求められた場合に限り、CLI の option（#6）で `SOURCE_DATE_EPOCH=<値>` と `FORCE_SOURCE_DATE=1` を env allowlist に加える。これで、PDF の日時が固定されることを確認した。
+- banner と log 内のパスは、MVP では抑制しない。生成物を第三者と共有する場合は、利用者の判断に委ねる。
+
+## 4. 将来の sandbox backend（#26）
 
 MVP の in-process 実行の次に、TeX engine を texrun 本体と別の isolation boundary で動かす backend を追加する。
 
 | 候補 | 得られるもの | 主な課題 |
 | --- | --- | --- |
-| Docker / Podman（rootless） | filesystem・network・PID namespace、cgroup による CPU / memory / pids 制限、texmf を read-only で提供 | daemon / runtime の有無、起動オーバーヘッド、macOS では VM 経由 |
-| gVisor（`runsc`） | container に加え syscall を user-space kernel で仲介し、kernel 攻撃面を縮小 | Linux 限定、I/O 性能 |
-| microVM（Firecracker 等） | VM 境界による強い隔離 | image・起動管理の複雑さ、KVM 必須 |
+| Docker / Podman（rootless） | filesystem・network・PID の namespace、cgroup による CPU / memory / pids 制限、texmf の read-only 提供 | daemon / runtime の有無、起動のオーバーヘッド、macOS では VM を経由する |
+| gVisor（`runsc`） | container の隔離に加え、syscall を user-space kernel で仲介して kernel の攻撃面を縮小する | Linux 限定、I/O 性能 |
+| microVM（Firecracker 等） | VM 境界による強い隔離 | image と起動の管理が複雑、KVM が必須 |
 
 移行方針:
 
-1. sandbox backend は `TypesetEngine` の別実装（例: container 内で latexmk を動かす engine）として追加する。§3 の latexmk 引数・env allowlist・kpathsea 設定・上限は sandbox 内でもそのまま適用し、OS 側の制限（`--network none`、read-only root、texmf の read-only mount、cgroup の memory / pids 上限、non-root user）を **追加で** 重ねる。
+1. sandbox backend は、`TypesetEngine` の別実装（例: container 内で latexmk を動かす engine）として追加する。
+   - §3 の設定（texrun 管理 rc・env allowlist・kpathsea 設定・各種上限）は、sandbox 内でもそのまま適用する。
+   - その上に、OS 側の制限を **追加で** 重ねる。
+     - network 無し（#24）
+     - read-only の root filesystem
+     - texmf の read-only mount
+     - cgroup の memory / pids 上限（#25）
+     - non-root user での実行
+   - §2 で「保証しない」とした font 関連の読み込みと、PDF object 埋め込み系の primitive は、sandbox の filesystem 隔離で担保する。
 2. workspace の作成・入力のコピー・artifact の収集（#4）は backend 共通のまま、workspace root を sandbox 内に mount する。
+3. 将来 xelatex / lualatex / dvipdfmx を追加するときは、それぞれが起動する外部プログラムも §3.5 と同じ基準で扱う。
+   - xelatex は出力 driver（`xdvipdfmx`）を子プロセスとして起動する。
+   - dvipdfmx は画像変換に外部プログラム（Ghostscript 等）を使う設定を持つ。
+   - LuaTeX は Lua からのプロセス起動・ファイルアクセスを持つ。
 
-core API（`CompileContext`）が差し替えに耐える理由:
+   それぞれについて、次のことを確認する。
+   - shell を経由せず起動されるか
+   - 変換コマンドの設定を固定できるか
+   - restricted / safer 系の option（例: LuaTeX の `--safer` 相当）が使えるか
 
-- `CompileRequest` と `Artifact.path` は `WorkspacePath`（workspace root 相対のパス）だけで file を参照し、host の絶対パスを含まない。sandbox 内での mount 先（例: `/work`）が host と違っても、request と result は変わらない。
-- host 側の実行時情報は `CompileContext` にまとめ、`TypesetEngine::compile(&self, ctx, req)` の引数を増やさない設計になっている。`CompileContext` は `#[non_exhaustive]` で `with_*` builder から作るので、sandbox 固有の情報（path mapping、resource limit、runtime の指定など）を field として追加しても既存の engine・呼び出し側は壊れない。
-- timeout は `CompileOptions`（backend 非依存）、cancel は `CancelToken`（poll 型）で表しており、subprocess でも container でも同じ意味で実装できる。
-- `CompileOutcome` / `EngineError` は `#[non_exhaustive]` で、backend 固有の失敗（runtime が無い = `EngineError::Unavailable` 等）を既存の分類で表せる。
+   必要なら rc と env allowlist を拡張する。
+
+core API（`CompileContext`）が backend の差し替えに耐える理由:
+
+- `CompileRequest` と `Artifact.path` は、`WorkspacePath`（workspace root 相対のパス）だけでファイルを参照し、host の絶対パスを含まない。sandbox 内の mount 先（例: `/work`）が host と違っても、request と result は変わらない。
+- host 側の実行時情報は `CompileContext` にまとめてあり、`TypesetEngine::compile(&self, ctx, req)` の引数を増やさない設計になっている。`CompileContext` は `#[non_exhaustive]` で、`with_*` builder から作る。そのため、sandbox 固有の情報（path mapping、resource limit、runtime の指定など）を field として追加しても、既存の engine と呼び出し側は壊れない。
+- timeout は `CompileOptions`（backend 非依存）で、cancel は `CancelToken`（poll 型）で表している。どちらも、subprocess でも container でも同じ意味で実装できる。
+- `CompileOutcome` と `EngineError` は `#[non_exhaustive]` である。backend 固有の失敗（例: runtime が無い場合の `EngineError::Unavailable`）も、既存の分類で表せる。
 
 ## 5. 脆弱性の報告
 
@@ -194,41 +360,42 @@ core API（`CompileContext`）が差し替えに耐える理由:
 
 ## 6. 実験結果の要約
 
-**環境:** 開発用 Docker image（`docs/development.md`）。Debian 13.7 trixie（arm64）の TeX Live パッケージ: `texlive-binaries` 2024.20240313（pdfTeX 1.40.26、banner 表記は `TeX Live 2025/dev/Debian`、kpathsea 6.4.0）、`texlive-latex-base` / `-recommended` 2024.20250309、latexmk 4.86。コンテナ内 root で実行した（kpathsea の判定は名前ベースで、root でも結果は変わらない）。TeX Live の版・OS が違う場合は再確認すること。
+**環境:** 開発用 Docker image（`docs/development.md`）で確認した。
+
+- OS: Debian 13.7 trixie（arm64）
+- TeX Live パッケージ:
+  - `texlive-binaries` 2024.20240313（pdfTeX 1.40.26。banner の表記は `TeX Live 2025/dev/Debian`、kpathsea 6.4.0）
+  - `texlive-latex-base` / `-recommended` 2024.20250309
+- latexmk 4.86
+
+コンテナ内では root で実行した。kpathsea の判定は名前ベースなので、root でも結果は変わらない。
+TeX Live の版や OS が違う場合は、確認をやり直すこと。
+公開リポジトリのため、境界を破る入力の具体例は載せず、「どの層で止まったか」だけを書く。
+実験用のファイルは repo に置かず、コンテナ内の `/tmp` で作業した。
 
 | 確認項目 | 結果 |
 | --- | --- |
-| workspace の `latexmkrc` / `.latexmkrc`、`$HOME/.latexmkrc` | `-norc` なし: Perl の `system()` が実行された。`-norc` あり: どれも実行されなかった（`-norc` は system rc も読まない。Debian の system rc は `/etc/LatexMk`） |
-| `\write18` / `\immediate\write18`（`-no-shell-escape`） | どちらも `runsystem(...)...disabled.` で実行されない |
-| 同上（オプションなし = TeX Live 既定） | `shell_escape=p`（restricted）。`echo` は `disabled (restricted)`、許可リスト（`shell_escape_commands` = bibtex, bibtex8, extractbb, gregorio, kpsewhich, l3sys-query, latexminted, makeindex, memoize-extract.pl, memoize-extract.py, repstopdf, r-mpost, texosquery-jre8）の `kpsewhich` は `executed safely` で実行された |
-| 環境変数 `shell_escape=t` | `-no-shell-escape` なしでは `\write18` が実行された。`-no-shell-escape` があれば実行されない |
-| `\input{/etc/passwd}` | 既定（`openin_any=a`）では読めて PDF に中身が出た。`openin_any=p` では ``File `/etc/passwd.tex' not found`` |
-| `\openin` | `openin_any=p` で `/etc/hostname`、`/proc/self/environ`、`../`、`sub/../x`、`.hidden`、`.texrun/out/x.log`、texmf 内の絶対パスは拒否。`article.cls`（名前指定）は読めた。`"\|id"` の pipe は実行されない |
-| `\openout`（`openout_any=p`） | `/tmp/...`、`../...`、`.dotfile.txt`、`sub/.hid.txt`、workspace 内の絶対パスは ``I can't write on file`` で拒否。`normal.txt`、`sub/n.txt` は output dir 配下に書かれた |
-| output dir `.texrun/out` + paranoid | `-outdir` 相対・絶対とも aux / log / toc / bibtex / `\include` 子の `.aux` が成功（subdirectory を事前作成した場合。§3.5）。fonts（Type1 `.pfb`）、`pdftex.map`（`/var/lib/texmf`）、texmf の `.sty` / `.cls` も問題なく読めた |
-| `\include{chapters/intro}` + `-file-line-error` | subdirectory が無いと paranoid の有無に関係なく失敗。`-file-line-error` を外すと latexmk が自動で作る |
-| `env -i`（空の環境） | `kpathsea: Can't get directory of program name: ./pdflatex` で失敗 |
-| `env -i PATH=/usr/bin:/bin` | 成功（bibtex・相互参照含む）。`HOME` 無しだと TEXMFHOME / TEXMFVAR が cwd 相対になる |
-| `TEXINPUTS` の継承 | host 側に置いた `article.cls` が読み込まれた。`env -i` では読まれない |
-| `max_print_line=10000` | 既定では 79 文字で折り返された長い `\typeout` が 1 行で出た |
-| 存在しないフォント | kpathsea が `mktextfm` を起動した。`MKTEXTFM=0` 等で起動しない |
-| entrypoint / `-outdir` のバッククォート | latexmk の `sh -c` で実行された（§3.5）。`$`・空白を含む名前は latexmk 自身が拒否 |
-| `\def\x{\x}\x` | CPU を使い続けて終わらない。プロセスツリーは `latexmk`（perl）→ `sh -c pdflatex ...` → `pdflatex` で、全員が latexmk の process group に属する。latexmk だけに `SIGTERM` を送ると `sh` と `pdflatex` が残り、`kill -KILL -<pgid>` で全て消えた |
-| `\def\x{x\x}\x` | 数秒で `TeX capacity exceeded, sorry [main memory size=5000000]` で停止 |
-| `\typeout` の無限ループ | 5 秒でログ約 160 MB、latexmk の stdout も約 160 MB |
-| `ulimit -f`（`RLIMIT_FSIZE`）20 MiB で同上 | ログが 20 MiB で止まり、latexmk は失敗終了 |
-| 空白 20,000 ページ | 約 9 秒で成功。PDF 3.5 MB、ログ 170 KB |
-
-再現手順（コンテナ内、作業は `/tmp` 配下で行い repo には置かない）:
-
-```bash
-docker-compose run --rm dev    # docs/development.md 参照（環境によっては docker compose）
-mkdir -p /tmp/w && cd /tmp/w
-printf '%s\n' '\documentclass{article}\begin{document}' '\input{/etc/passwd}' '\end{document}' > rd.tex
-openin_any=p openout_any=p latexmk -pdf -norc -no-shell-escape \
-  -interaction=nonstopmode -file-line-error -outdir=.texrun/out rd.tex
-grep -m1 'not found' .texrun/out/rd.log      # File `/etc/passwd.tex' not found.
-```
-
-他の項目も同様に、上の表の入力を 1 ファイルずつ作り、`env -i PATH=... openin_any=p openout_any=p latexmk <§3.5 の引数>` で実行してログ（`<outdir>/*.log`）と生成ファイルの有無を確認する。
-プロセスツリーは `setsid latexmk ... loop.tex &` の後に `ps -o pid,ppid,pgid,args --forest -g <sid>` で確認できる。
+| rc の読み込み | `-norc` が無いと、workspace の `latexmkrc` / `.latexmkrc` と `$HOME/.latexmkrc` の Perl が実行された。`-norc -r <texrun 管理 rc>` では、workspace・user・system（Debian では `/etc/LatexMk`）のどの rc も実行されず、指定した rc だけが読まれた |
+| TeX の shell escape（`-no-shell-escape`） | `runsystem(...)...disabled.` となり、実行されなかった。pipe による open も実行されなかった |
+| TeX Live 既定の restricted shell escape | `shell_escape=p` で、`shell_escape_commands` に列挙されたコマンド（bibtex, bibtex8, extractbb, gregorio, kpsewhich, l3sys-query, latexminted, makeindex, memoize-extract.pl, memoize-extract.py, repstopdf, r-mpost, texosquery-jre8）は実行される。texrun は `-no-shell-escape` でこれも無効にする |
+| 環境変数による shell escape 設定の上書き | 継承すると設定を変えられた。`-no-shell-escape` と env allowlist の両方で防ぐ |
+| latexmk 既定設定での補助ツールの起動 | pdflatex・bibtex・makeindex が `sh -c` 経由で起動され、名前に含まれる shell メタ文字が解釈された |
+| texrun 管理 rc での補助ツールの起動 | 同じ入力でも shell を経由せず、メタ文字は解釈されなかった。プロセスツリーは `latexmk → pdflatex` |
+| texrun 管理 rc での通常文書 | 目次・相互参照・bibtex・`\include`（サブディレクトリ）・makeindex がすべて成功した。サブディレクトリの entrypoint も、cwd を entrypoint のディレクトリにする方式で成功した |
+| 先頭行の format 指定 | `-no-parse-first-line` が無いと先頭行の指定に従って別の format が読まれ、あると無視された |
+| paranoid mode: TeX の読み書き primitive、画像、bibtex、pdfTeX のファイル情報系 primitive | 絶対パス、`..`、dot で始まる component を含む指定は、すべて拒否された（既定の `openin_any=a` では読めた） |
+| paranoid mode: 名前での検索 | `\openin` では、texmf の `tex/` 以下のファイルは読めた。`texmf.cnf`・`ls-R`・font map・`.bst` は見つからなかった。texmf の sty / cls / font（`.pfb`）/ `pdftex.map` の通常の読み込みは壊れなかった |
+| paranoid mode の検査が及ばない経路 | font 関連と、PDF object にファイルを埋め込む primitive（§2「保証しない」） |
+| output dir `.texrun/out` + paranoid | `-outdir` が相対でも絶対でも、aux / log / toc / bibtex / makeindex / `\include` した子ファイルの `.aux` が成功した（サブディレクトリを事前に作った場合。§3.5） |
+| `\include{chapters/intro}` + `-file-line-error` | サブディレクトリが無いと、paranoid mode の有無に関係なく失敗した。`-file-line-error` を外すと、latexmk がサブディレクトリを自動で作った |
+| 空の環境（`env -i`） | pdflatex を起動できずに失敗した |
+| `PATH` だけの環境 | 成功した（bibtex と相互参照を含む）。`HOME` が無いと、TEXMFHOME / TEXMFVAR が cwd 相対になった |
+| 検索パスの変数（`TEXINPUTS`）の継承 | host 側に置いたファイルが、標準のクラスファイルの代わりに読まれた。`env -i` では読まれなかった |
+| `max_print_line=10000` | 既定では 79 文字で折り返されるメッセージが、1 行で出た |
+| 存在しないフォント | kpathsea が生成 script を起動した。`MKTEX*=0` にすると起動しなかった |
+| 無限ループ（`\def\x{\x}\x`） | CPU を使い続けて終わらない。latexmk だけに `SIGTERM` を送ると子プロセスが残り、process group に `SIGKILL` を送ると全て止まった |
+| memory を使い続ける展開 | 数秒で `TeX capacity exceeded, sorry [main memory size=5000000]` になって止まった |
+| ログを出し続けるループ | 5 秒でログが約 160 MB、latexmk の stdout も約 160 MB になった |
+| `RLIMIT_FSIZE` 20 MiB で同上 | ログが 20 MiB で止まり、latexmk は失敗終了した |
+| 空白 20,000 ページ | 約 9 秒で成功した。PDF は 3.5 MB、ログは 170 KB |
+| 生成物の host 情報 | `.fls` に workspace の絶対パスが入った。PDF には作成日時と pdfTeX / TeX Live の banner が入った。`SOURCE_DATE_EPOCH=0` と `FORCE_SOURCE_DATE=1` で、日時が固定された |

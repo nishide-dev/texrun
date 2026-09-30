@@ -31,11 +31,16 @@ texrun treats TeX documents as untrusted input, but the MVP runs TeX Live as a
 local subprocess and is **not** a complete sandbox. What texrun does and does
 not guarantee is described in [docs/security.md](docs/security.md) (Japanese).
 
-- In scope: bypassing a boundary that docs/security.md says texrun enforces
-  (e.g. running commands via `\write18`, `latexmkrc` or file names, reading or
-  writing files outside the workspace by name, escaping the timeout or process
-  cleanup).
-- Out of scope: behaviour docs/security.md lists as not guaranteed (e.g. the
-  TeX Live tree being readable, no network or OS-level isolation), and
-  vulnerabilities in TeX Live, latexmk, MuPDF or Poppler themselves — please
-  report those upstream.
+- In scope: bypassing a boundary that docs/security.md §2 says texrun
+  enforces, for example running commands through TeX or latexmk, reading or
+  writing files outside the workspace through the routes listed there,
+  inheriting host environment variables, or escaping the timeout, size limits
+  or process cleanup.
+- Out of scope: behaviour that docs/security.md §2 lists as not guaranteed in
+  the MVP (for example font-related lookups, the PDF-object embedding
+  primitives it mentions, the TeX Live tree being readable by name, and the
+  lack of network or OS-level isolation), and vulnerabilities in TeX Live,
+  latexmk, MuPDF or Poppler themselves; please report those upstream.
+
+Please do not include working exploit inputs in public issues or pull
+requests; send them through the private report instead.
