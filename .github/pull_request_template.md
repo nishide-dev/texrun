@@ -1,6 +1,6 @@
 <!--
 PR タイトルは英語の Conventional Commits 形式にしてください（例: `feat(cli): add compile command`）。
-Squash merge 時にそのまま最終コミットメッセージとして使われます。
+Squash merge 時は PR タイトルが最終コミットのタイトル、PR 本文がコミット本文として使われます。
 本文は日本語で記述してください。詳細は CONTRIBUTING.md を参照してください。
 -->
 
@@ -18,13 +18,14 @@ Squash merge 時にそのまま最終コミットメッセージとして使わ�
 
 <!-- 実行したコマンドや手動確認の手順。ローカル品質ゲートの結果など -->
 
+- [ ] `cargo check --workspace --all-targets --all-features`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace`
 
 ## 関連 Issue
 
-<!-- 例: Closes #123 / Refs #456 -->
+<!-- 例: Closes #123 / Refs #456。該当する Issue が無ければこのセクションごと削除してください -->
 
 Closes #
 

@@ -24,9 +24,13 @@ git switch -c feat/compile-command
 ### Merge 方針
 
 - **Squash merge を基本** とします。1 PR = `main` 上の 1 コミットになります。
-- squash 後のコミットメッセージには **PR タイトル** がそのまま使われるため、PR タイトルは Conventional Commits 形式で書いてください（後述）。
-- そのため feature branch 内の個々のコミットは多少粒度が荒くても構いませんが、可能な範囲で Conventional Commits 形式に揃えてください。
-- merge 後の feature branch は削除します。
+- リポジトリは以下のように設定されています。
+  - squash コミットのタイトル: **PR タイトル**（`squash_merge_commit_title=PR_TITLE`）
+  - squash コミットの本文: **PR 本文**（`squash_merge_commit_message=PR_BODY`）
+  - merge 後の head branch の自動削除: 有効（`delete_branch_on_merge=true`）
+- この設定により、PR 内のコミット数にかかわらず PR タイトルが `main` の最終コミットメッセージになります。そのため PR タイトルは必ず Conventional Commits 形式で書いてください（後述）。
+- feature branch 内の個々のコミットは多少粒度が荒くても構いませんが、可能な範囲で Conventional Commits 形式に揃えてください。
+- merge 後の feature branch は自動で削除されます。
 
 ## Commit message
 
@@ -59,7 +63,7 @@ scope なし:
 
 ```text
 docs: document local development setup
-chore: update dependencies
+chore(deps): update dependencies
 build: pin rust toolchain version
 ```
 
@@ -74,7 +78,12 @@ build: pin rust toolchain version
 | `refactor` | 外部仕様を変えないリファクタリング                 |
 | `perf`     | 性能改善                                           |
 | `chore`    | CI、依存更新、開発環境など                         |
-| `build`    | ビルドシステムやパッケージ関連（Cargo 設定など）   |
+| `build`    | ビルド設定・パッケージング関連（Cargo 設定など）   |
+
+`chore` と `build` の使い分け:
+
+- 依存 crate のバージョン更新は `chore(deps)` とします（例: `chore(deps): bump clap to 4.5`）。
+- ビルド設定・パッケージングの変更（`Cargo.toml` の profile や feature、toolchain 指定、配布形態など）は `build` とします。
 
 ### scope 候補
 
@@ -90,6 +99,7 @@ scope は変更対象の crate・モジュール・領域を表します。迷�
 | `preview`     | PDF のページ preview・メタデータ取得                   |
 | `ci`          | GitHub Actions などの CI 設定                          |
 | `docker`      | Docker ベースの開発環境                                |
+| `deps`        | 依存 crate の更新（`chore(deps)` として使用）          |
 
 - 複数領域にまたがる場合は、主な変更対象の scope を 1 つ選ぶか、scope を省略してください。
 - crate・モジュール構成の変更に伴い scope 候補を追加・変更する場合は、このドキュメントも更新してください。
@@ -105,7 +115,22 @@ scope は変更対象の crate・モジュール・領域を表します。迷�
 
 ### Breaking change
 
-外部仕様（CLI の引数・`--json` 出力・exit code など）に互換性のない変更を含む場合は、type/scope の直後に `!` を付け、body 末尾に `BREAKING CHANGE:` を記載します。
+外部仕様（CLI の引数・`--json` 出力・exit code など）に互換性のない変更を含む場合は、仕様どおり以下の **どちらか** で表します。
+
+- type/scope の直後に `!` を付ける
+- footer（本文末尾の trailer）に `BREAKING CHANGE: <説明>` を記載する
+
+どちらか一方で breaking change として扱われます。変更内容や移行方法を説明したい場合は、`!` と footer を併用して構いません。
+
+```text
+feat(cli)!: remove --quiet flag
+```
+
+```text
+feat(cli): rename --json flag to --format json
+
+BREAKING CHANGE: `--json` は削除され、`--format json` に置き換えられた。
+```
 
 ```text
 feat(cli)!: rename --json flag to --format json
@@ -113,11 +138,13 @@ feat(cli)!: rename --json flag to --format json
 BREAKING CHANGE: `--json` は削除され、`--format json` に置き換えられた。
 ```
 
+squash merge では PR 本文がコミット本文になるため、`BREAKING CHANGE:` footer を使う場合は PR 本文の末尾に記載してください。
+
 ## Pull Request
 
 ### PR title
 
-PR タイトルもコミットメッセージと同じ **Conventional Commits 形式の英語** にします。squash merge 時にそのまま最終コミットメッセージとして利用されることを意図しています。
+PR タイトルもコミットメッセージと同じ **Conventional Commits 形式の英語** にします。リポジトリ設定により、squash merge 時は PR タイトルがそのまま `main` 上の最終コミットのタイトルになります。
 
 ```text
 feat(cli): add compile command
@@ -143,20 +170,15 @@ PR を作成・更新する前に、ローカルで品質ゲートを通して�
 CI と同じ基準をローカルで確認するため、PR 前に以下を実行してください。
 
 ```bash
+cargo check --workspace --all-targets --all-features
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-必要に応じて以下も利用できます。
+フォーマット違反は `cargo fmt --all` で自動修正できます。
 
-```bash
-# フォーマットの自動修正
-cargo fmt --all
-
-# 型チェックのみを素早く行う
-cargo check --workspace --all-targets --all-features
-```
+- 上記は #2 / #11 で定義する品質ゲートと同一です。CI 側のチェックが変わった場合は、このドキュメントも合わせて更新してください。
 
 - CI を source of truth とし、開発者固有の git hook の導入は必須にしません。
 - TeX Live が必要な integration test の実行方法は、開発環境の整備（Docker ベースの TeX Live 環境など）に合わせて README 等に記載します。
