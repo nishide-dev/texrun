@@ -421,6 +421,69 @@ fn document_failure_exits_1_with_diagnostics() {
     assert_eq!(doc["artifacts"][0]["kind"], "log");
 }
 
+/// `--cgroup`: `auto` records why no cgroup was used, `required` refuses to
+/// run without one (exit 3, before anything is copied), `off` does not
+/// look for one. The rlimits are always in place (exec gate).
+#[test]
+fn cgroup_modes_are_reported() {
+    let env = Env::new(FAKE_SUCCEED);
+    env.file("proj/main.tex", MINIMAL);
+    let unavailable = texrun_process::Cgroups::detect().check().err();
+
+    let out = env.run(&["compile", "--json", "--no-preview", "main.tex"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let limits = &json(&out)["resource_limits"];
+    assert_eq!(limits["rlimits"], true, "{limits}");
+    assert_eq!(limits["cgroup"], unavailable.is_none(), "{limits}");
+    if let Some(reason) = &unavailable {
+        assert_eq!(
+            limits["notes"],
+            serde_json::json!([format!("cgroup: {reason}")])
+        );
+    }
+
+    let out = env.run(&[
+        "compile",
+        "--json",
+        "--no-preview",
+        "--cgroup",
+        "off",
+        "main.tex",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        json(&out)["resource_limits"],
+        serde_json::json!({ "rlimits": true, "cgroup": false })
+    );
+
+    let out = env.run(&["compile", "--json", "--cgroup", "required", "main.tex"]);
+    if unavailable.is_some() {
+        assert_eq!(code(&out), 3);
+        let doc = json(&out);
+        assert_eq!(doc["error"]["stage"], "setup", "{doc:#}");
+        assert_eq!(doc["error"]["kind"], "unsupported", "{doc:#}");
+        assert_eq!(doc["error"]["category"], "runtime", "{doc:#}");
+        let hint = doc["error"]["hint"].as_str().unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(hint.contains("Delegate=yes"), "{hint}");
+        } else {
+            assert!(hint.contains("Linux only"), "{hint}");
+        }
+        assert!(doc.get("outcome").is_none());
+        let plain = env.run(&["compile", "--cgroup", "required", "main.tex"]);
+        assert_eq!(code(&plain), 3);
+        assert!(
+            stderr(&plain).contains("--cgroup required"),
+            "{}",
+            stderr(&plain)
+        );
+    } else {
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(json(&out)["resource_limits"]["cgroup"], true);
+    }
+    assert!(env.leftovers().is_empty(), "{:?}", env.leftovers());
+}
+
 #[test]
 fn missing_latexmk_is_a_runtime_error() {
     let env = Env::new(FAKE_SUCCEED);

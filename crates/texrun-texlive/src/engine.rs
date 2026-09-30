@@ -9,17 +9,18 @@ use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 use texrun_core::{
-    Artifact, ArtifactKind, CompileContext, CompileOutcome, CompileRequest, CompileResult,
-    Diagnostic, DiagnosticKind, EngineError, EngineInfo, ProcessExit, Severity, TypesetEngine,
-    WorkspacePath, WorkspaceRoot,
+    Artifact, ArtifactKind, CancelToken, CompileContext, CompileOutcome, CompileRequest,
+    CompileResult, Diagnostic, DiagnosticKind, EngineError, EngineInfo, ProcessExit,
+    ResourceLimits, Severity, TypesetEngine, WorkspacePath, WorkspaceRoot,
 };
 use texrun_latex_log::LogParser;
+use texrun_process::{CgroupOutcome, Cgroups, ExecGate, RunError};
 
 use crate::bibtex;
 use crate::command::{self, MAX_PRINT_LINE};
 use crate::layout::{self, HOME_DIR};
 use crate::names::{check_host_path, check_name};
-use crate::process::{self, CapturedOutput, Job, Limits, StopReason};
+use crate::process::{self, CapturedOutput, Job, LimitReached, Limits, Start, StopReason};
 use crate::rc::{self, RcOptions};
 
 /// Engine identifier reported in [`EngineInfo::name`].
@@ -71,6 +72,24 @@ pub struct LatexmkConfig {
     /// Sets `SOURCE_DATE_EPOCH` (and `FORCE_SOURCE_DATE=1`) for reproducible
     /// PDF dates (docs/security.md §3.9). Off by default.
     pub source_date_epoch: Option<i64>,
+    /// Start latexmk through this exec gate, so that its resource limits are
+    /// in place before it starts, on Linux and macOS (docs/security.md
+    /// §3.10). The rc then has no start gate.
+    ///
+    /// Without a usable gate, latexmk waits at the start gate of the texrun
+    /// rc while the limits are set with `prlimit(2)` (Linux: the same
+    /// guarantee), or, where that does not exist (macOS), runs without
+    /// rlimits; with [`ExecGate::with_required`] that is
+    /// [`EngineError::Unsupported`] instead. `None` by default (the texrun
+    /// CLI sets its own executable).
+    pub exec_gate: Option<ExecGate>,
+    /// Run latexmk and all its descendants in a cgroup of their own, with
+    /// the memory, process and CPU limits of [`Limits`] (Linux; see
+    /// [`Cgroups`]). A cgroup that cannot be used is recorded in
+    /// [`CompileResult::resource_limits`], or, if
+    /// [required](Cgroups::with_required), is [`EngineError::Unsupported`].
+    /// `None` by default.
+    pub cgroups: Option<Cgroups>,
 }
 
 impl Default for LatexmkConfig {
@@ -82,6 +101,8 @@ impl Default for LatexmkConfig {
             default_timeout: DEFAULT_TIMEOUT,
             limits: Limits::default(),
             source_date_epoch: None,
+            exec_gate: None,
+            cgroups: None,
         }
     }
 }
@@ -126,6 +147,20 @@ impl LatexmkConfig {
     #[must_use]
     pub fn with_source_date_epoch(mut self, epoch: Option<i64>) -> Self {
         self.source_date_epoch = epoch;
+        self
+    }
+
+    /// Sets [`LatexmkConfig::exec_gate`].
+    #[must_use]
+    pub fn with_exec_gate(mut self, gate: ExecGate) -> Self {
+        self.exec_gate = Some(gate);
+        self
+    }
+
+    /// Sets [`LatexmkConfig::cgroups`].
+    #[must_use]
+    pub fn with_cgroups(mut self, cgroups: Cgroups) -> Self {
+        self.cgroups = Some(cgroups);
         self
     }
 }
@@ -251,66 +286,39 @@ impl LatexmkEngine {
         }
 
         plan.prepare_dirs()?;
-        let (rc_dir, rc_path) = self.write_rc(&plan.root)?;
 
         let limits = self.config.limits;
-        let job = Job {
-            program: &latexmk,
-            args: command::latexmk_args(&rc_path, &plan.output_dir, &plan.entry_arg),
-            cwd: &plan.cwd,
-            env: command::child_env(
-                &self.child_path(),
-                &plan.home,
-                self.config.source_date_epoch,
-            ),
-            timeout: Some(
-                request
-                    .options
-                    .timeout
-                    .unwrap_or(self.config.default_timeout),
-            ),
-            cancel: Some(&ctx.cancel),
-            size_dirs: vec![plan.output_dir.as_path(), plan.home.as_path()],
-            limits,
-            file_size_gate: process::FILE_SIZE_GATE_SUPPORTED,
-        };
-        let finished = process::run(&job);
-        // The rc is not needed any more, whatever happened.
-        let _ = rc_dir.close();
-        let finished = finished?;
+        let timeout = request
+            .options
+            .timeout
+            .unwrap_or(self.config.default_timeout);
+        let (finished, start, notes) = self.supervise(&plan, &latexmk, timeout, &ctx.cancel)?;
 
         // A file that hit RLIMIT_FSIZE stops the writer without the poll loop
         // noticing; check the sizes once more.
-        let stop = finished.stop.clone().or_else(|| {
-            process::check_output_size(&[plan.output_dir.as_path(), plan.home.as_path()], &limits)
-        });
+        let reached = process::limit_reached(&finished, &plan.main_log(), &limits, timeout);
+        let stop = finished
+            .stop
+            .clone()
+            .or_else(|| {
+                process::check_output_size(
+                    &[plan.output_dir.as_path(), plan.home.as_path()],
+                    &limits,
+                )
+            })
+            .or_else(|| match &reached {
+                Some(LimitReached::Output(stop)) => Some(stop.clone()),
+                _ => None,
+            });
 
         let artifacts = plan.collect_artifacts();
         let pdf_ok = artifacts.iter().any(|a| a.kind == ArtifactKind::Pdf);
-        let mut diagnostics = Vec::new();
-        let outcome = match &stop {
-            Some(StopReason::TimedOut) => CompileOutcome::TimedOut,
-            Some(StopReason::Cancelled) => CompileOutcome::Cancelled,
-            Some(StopReason::OutputLimit(message)) => {
-                diagnostics.push(Diagnostic::new(
-                    Severity::Error,
-                    DiagnosticKind::Other,
-                    message.clone(),
-                ));
-                CompileOutcome::Failed
-            }
-            None if finished.status.success() && pdf_ok => CompileOutcome::Succeeded,
-            None => {
-                if finished.status.success() {
-                    diagnostics.push(Diagnostic::new(
-                        Severity::Error,
-                        DiagnosticKind::Other,
-                        "latexmk finished without producing a PDF",
-                    ));
-                }
-                CompileOutcome::Failed
-            }
-        };
+        let (outcome, mut diagnostics) = decide(
+            stop.as_ref(),
+            reached.as_ref(),
+            finished.status.success(),
+            pdf_ok,
+        );
         diagnostics.extend(plan.parse_log());
         // When latexmk started, for telling this compile's BibTeX logs from
         // stale ones.
@@ -327,6 +335,7 @@ impl LatexmkEngine {
         result.exit = Some(ProcessExit::from(finished.status));
         result.diagnostics = diagnostics;
         result.artifacts = artifacts;
+        result.resource_limits = Some(resource_limits(&start, &finished, notes));
         Ok(LatexmkRun {
             result,
             stdout: finished.stdout,
@@ -335,10 +344,111 @@ impl LatexmkEngine {
         })
     }
 
+    /// Writes the rc and runs latexmk for `plan` with its limits in place.
+    /// Returns how it ended, how it was started and notes on limits that
+    /// were not used.
+    fn supervise(
+        &self,
+        plan: &Plan,
+        latexmk: &Path,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<(process::Finished, Start<'_>, Vec<String>), EngineError> {
+        // A required cgroup that cannot be used is its own error, not one
+        // of the exec gate (both are `RunError::Unsupported`).
+        if let Some(cgroups) = &self.config.cgroups
+            && cgroups.is_required()
+            && let Err(reason) = cgroups.check()
+        {
+            return Err(EngineError::Unsupported(format!(
+                "latexmk must run in a cgroup of its own, but none can be used ({reason})"
+            )));
+        }
+        let mut notes = Vec::new();
+        let mut start = self.start(&mut notes)?;
+        loop {
+            let (rc_dir, rc_path) = self.write_rc(&plan.root, matches!(start, Start::StdinGate))?;
+            let job = Job {
+                program: latexmk,
+                args: command::latexmk_args(&rc_path, &plan.output_dir, &plan.entry_arg),
+                cwd: &plan.cwd,
+                env: command::child_env(
+                    &self.child_path(),
+                    &plan.home,
+                    self.config.source_date_epoch,
+                ),
+                timeout: Some(timeout),
+                cancel: Some(cancel),
+                size_dirs: vec![plan.output_dir.as_path(), plan.home.as_path()],
+                limits: self.config.limits,
+                start: start.clone(),
+                cgroups: self.config.cgroups.as_ref(),
+            };
+            let finished = process::run(&job);
+            // The rc is not needed any more, whatever happened.
+            let _ = rc_dir.close();
+            match finished {
+                // The exec gate became unusable after it was checked;
+                // nothing was started.
+                Err(RunError::Unsupported(reason)) if matches!(&start, Start::ExecGate(gate) if gate.check().is_err()) =>
+                {
+                    start = self.without_gate(&reason, &mut notes)?;
+                }
+                other => return Ok((other.map_err(process::engine_error)?, start, notes)),
+            }
+        }
+    }
+
+    /// How latexmk is started with its limits in place: through the exec
+    /// gate if it can be used, otherwise as [`Self::without_gate`].
+    fn start(&self, notes: &mut Vec<String>) -> Result<Start<'_>, EngineError> {
+        match &self.config.exec_gate {
+            Some(gate) => match gate.check() {
+                Ok(()) => Ok(Start::ExecGate(gate)),
+                Err(reason) => self.without_gate(&reason, notes),
+            },
+            None => self.without_gate("", notes),
+        }
+    }
+
+    /// The start without the exec gate (unusable because of `reason`, or
+    /// none configured if empty): the rc's start gate with `prlimit(2)`
+    /// where it exists (Linux, same guarantee), otherwise no rlimits, or
+    /// [`EngineError::Unsupported`] if the gate is required.
+    fn without_gate(
+        &self,
+        reason: &str,
+        notes: &mut Vec<String>,
+    ) -> Result<Start<'_>, EngineError> {
+        let gate = self.config.exec_gate.as_ref();
+        if texrun_process::PRLIMIT_SUPPORTED {
+            return Ok(Start::StdinGate);
+        }
+        if gate.is_some_and(ExecGate::is_required) {
+            return Err(EngineError::Unsupported(format!(
+                "latexmk must start with its resource limits in place, but the exec gate \
+                 cannot be used ({reason})"
+            )));
+        }
+        notes.push(if gate.is_some() {
+            format!("rlimits: the exec gate cannot be used ({reason})")
+        } else {
+            "rlimits: no exec gate, and this platform cannot set the limits of a running \
+             process"
+                .to_owned()
+        });
+        Ok(Start::Unlimited)
+    }
+
     /// Writes the texrun rc into a new temporary directory, which must be
     /// outside the workspace (`workspace_root`, canonical). Returns the
-    /// directory, removed when dropped, and the rc path.
-    fn write_rc(&self, workspace_root: &Path) -> Result<(TempDir, PathBuf), EngineError> {
+    /// directory, removed when dropped, and the rc path. `stdin_gate`: see
+    /// [`RcOptions::stdin_gate`].
+    fn write_rc(
+        &self,
+        workspace_root: &Path,
+        stdin_gate: bool,
+    ) -> Result<(TempDir, PathBuf), EngineError> {
         let parent = self
             .config
             .rc_parent
@@ -361,9 +471,7 @@ impl LatexmkEngine {
         }
         let path = real.join(RC_FILE_NAME);
         check_host_path("latexmk rc path", &path)?;
-        let rc = rc::render(RcOptions {
-            stdin_gate: process::FILE_SIZE_GATE_SUPPORTED,
-        });
+        let rc = rc::render(RcOptions { stdin_gate });
         fs::write(&path, rc).map_err(io_error(format!("writing {}", path.display())))?;
         Ok((dir, path))
     }
@@ -393,9 +501,10 @@ impl TypesetEngine for LatexmkEngine {
             cancel: None,
             size_dirs: Vec::new(),
             limits: self.config.limits,
-            file_size_gate: false,
+            start: Start::Plain,
+            cgroups: None,
         };
-        let finished = process::run(&job)?;
+        let finished = process::run(&job).map_err(process::engine_error)?;
         let stdout = String::from_utf8_lossy(&finished.stdout.bytes);
         let version = match (finished.stop, parse_version(&stdout)) {
             (None, Some(v)) if finished.status.success() => v,
@@ -428,6 +537,83 @@ pub(crate) fn parse_version(output: &str) -> Option<String> {
         let version = version.trim();
         (!version.is_empty()).then(|| version.to_owned())
     })
+}
+
+/// The outcome of a finished latexmk run, and the diagnostics texrun adds:
+/// `stop` (why texrun stopped it, if it did), `reached` (a resource limit
+/// it reached), whether latexmk exited successfully and whether a PDF
+/// exists (docs/security.md §3.2, §3.10).
+fn decide(
+    stop: Option<&StopReason>,
+    reached: Option<&LimitReached>,
+    success: bool,
+    pdf_ok: bool,
+) -> (CompileOutcome, Vec<Diagnostic>) {
+    let limit =
+        |severity, message: &str| Diagnostic::new(severity, DiagnosticKind::ResourceLimit, message);
+    let mut diagnostics = Vec::new();
+    let succeeded = success && pdf_ok;
+    // A limit reached before a timeout or cancellation is reported too: it
+    // may be why the compile did not finish (e.g. perl retries a `fork`
+    // refused by `pids.max` until the timeout). One that did not keep the
+    // compile from succeeding (a retried `fork`) is only a warning.
+    let reached_fatally = match reached {
+        Some(LimitReached::Resource { message, transient }) => {
+            let passed = *transient && stop.is_none() && succeeded;
+            let severity = if passed {
+                Severity::Warning
+            } else {
+                Severity::Error
+            };
+            diagnostics.push(limit(severity, message));
+            !passed
+        }
+        _ => false,
+    };
+    let outcome = match stop {
+        Some(StopReason::TimedOut) => CompileOutcome::TimedOut,
+        Some(StopReason::Cancelled) => CompileOutcome::Cancelled,
+        Some(StopReason::OutputLimit(message)) => {
+            diagnostics.push(limit(Severity::Error, message));
+            CompileOutcome::Failed
+        }
+        None if reached_fatally => CompileOutcome::Failed,
+        None if succeeded => CompileOutcome::Succeeded,
+        None => {
+            if success {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticKind::Other,
+                    "latexmk finished without producing a PDF",
+                ));
+            }
+            CompileOutcome::Failed
+        }
+    };
+    (outcome, diagnostics)
+}
+
+/// Which resource limits were in place for latexmk (docs/security.md §3.10).
+fn resource_limits(
+    start: &Start<'_>,
+    finished: &process::Finished,
+    mut notes: Vec<String>,
+) -> ResourceLimits {
+    let cgroup = match &finished.cgroup {
+        CgroupOutcome::Applied(_) => true,
+        CgroupOutcome::Unavailable(reason) => {
+            notes.push(format!("cgroup: {reason}"));
+            false
+        }
+        _ => false,
+    };
+    let rlimits = !matches!(start, Start::Unlimited) && finished.rlimits_applied;
+    if !rlimits && finished.stop.is_none() && notes.iter().all(|n| !n.starts_with("rlimits:")) {
+        notes.push("rlimits: not all could be set on this platform".to_owned());
+    }
+    let mut limits = ResourceLimits::new(rlimits, cgroup);
+    limits.notes = notes;
+    limits
 }
 
 fn unavailable(reason: String) -> EngineError {
@@ -576,6 +762,16 @@ impl Plan {
                     .then(|| Artifact::new(kind, name).with_size_bytes(meta.len()))
             })
             .collect()
+    }
+
+    /// The main log (its end if it is long), or nothing if there is none.
+    fn main_log(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let path = self.output_dir.join(format!("{}.log", self.stem));
+        if read_log(&path, &mut buf).is_err() {
+            buf.clear();
+        }
+        buf
     }
 
     /// Parses the main log into diagnostics with workspace-relative files.
@@ -1014,7 +1210,7 @@ mod tests {
     fn rc_is_written_outside_the_workspace_and_removed() {
         let (_dir, root) = workspace_with(&["main.tex"]);
         let engine = LatexmkEngine::default();
-        let (rc_dir, rc_path) = engine.write_rc(root.path()).unwrap();
+        let (rc_dir, rc_path) = engine.write_rc(root.path(), true).unwrap();
         assert!(!rc_path.starts_with(root.path()));
         let text = fs::read_to_string(&rc_path).unwrap();
         assert!(text.contains("sub texrun_run"));
@@ -1025,9 +1221,86 @@ mod tests {
         // An rc parent inside the workspace is refused.
         let engine = LatexmkEngine::new(LatexmkConfig::default().with_rc_parent(root.path()));
         assert!(matches!(
-            engine.write_rc(root.path()),
+            engine.write_rc(root.path(), true),
             Err(EngineError::Unavailable { .. })
         ));
+    }
+
+    /// How latexmk is started with and without a usable exec gate (the
+    /// rc's stdin gate is the Linux fallback, docs/security.md §3.2).
+    #[test]
+    fn latexmk_starts_through_the_gate_or_a_fallback() {
+        let start = |config: LatexmkConfig| {
+            let engine = LatexmkEngine::new(config);
+            let mut notes = Vec::new();
+            let start = engine.start(&mut notes).map(|s| format!("{s:?}"));
+            (start.map_err(|e| e.to_string()), notes)
+        };
+        let usable = ExecGate::new("/bin/sh");
+        let (usable_start, notes) = start(LatexmkConfig::default().with_exec_gate(usable));
+        assert!(usable_start.unwrap().starts_with("ExecGate"));
+        assert!(notes.is_empty());
+
+        let missing = ExecGate::new("/nonexistent/texrun");
+        for config in [
+            LatexmkConfig::default(),
+            LatexmkConfig::default().with_exec_gate(missing.clone()),
+        ] {
+            let (fallback, notes) = start(config);
+            if texrun_process::PRLIMIT_SUPPORTED {
+                assert_eq!(fallback.unwrap(), "StdinGate");
+                assert!(notes.is_empty(), "{notes:?}");
+            } else {
+                assert_eq!(fallback.unwrap(), "Unlimited");
+                assert!(notes[0].starts_with("rlimits:"), "{notes:?}");
+            }
+        }
+
+        let (required, _) =
+            start(LatexmkConfig::default().with_exec_gate(missing.with_required(true)));
+        if texrun_process::PRLIMIT_SUPPORTED {
+            assert_eq!(required.unwrap(), "StdinGate", "same guarantee on Linux");
+        } else {
+            let err = required.unwrap_err();
+            assert!(err.contains("/nonexistent/texrun"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_limit_that_did_not_stop_the_compile_is_a_warning() {
+        let transient = LimitReached::Resource {
+            message: "processes".to_owned(),
+            transient: true,
+        };
+        let fatal = LimitReached::Resource {
+            message: "cpu".to_owned(),
+            transient: false,
+        };
+        let severity = |d: &[Diagnostic]| d.iter().map(|d| d.severity).collect::<Vec<_>>();
+
+        // A retried `fork` and a successful compile: still a success.
+        let (outcome, d) = decide(None, Some(&transient), true, true);
+        assert_eq!(outcome, CompileOutcome::Succeeded);
+        assert_eq!(severity(&d), [Severity::Warning]);
+        assert_eq!(d[0].kind, DiagnosticKind::ResourceLimit);
+        // ... but not if the compile failed.
+        let (outcome, d) = decide(None, Some(&transient), false, false);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // A limit that stopped a process fails the compile.
+        let (outcome, d) = decide(None, Some(&fatal), true, true);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // A timeout stays a timeout, with the limit as the likely reason.
+        let (outcome, d) = decide(Some(&StopReason::TimedOut), Some(&transient), false, false);
+        assert_eq!(outcome, CompileOutcome::TimedOut);
+        assert_eq!(severity(&d), [Severity::Error]);
+        // Output limits as before.
+        let output = StopReason::OutputLimit("output limit exceeded: x".to_owned());
+        let (outcome, d) = decide(Some(&output), None, false, true);
+        assert_eq!(outcome, CompileOutcome::Failed);
+        assert_eq!(d[0].kind, DiagnosticKind::ResourceLimit);
+        assert_eq!(decide(None, None, true, true).0, CompileOutcome::Succeeded);
     }
 
     #[test]

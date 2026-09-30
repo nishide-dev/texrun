@@ -20,8 +20,14 @@
 //! - latexmk runs in its own process group, which is killed with `SIGKILL`
 //!   on timeout, cancellation or when an output limit is exceeded, and once
 //!   more after latexmk exits (the shared supervisor of `texrun-process`);
-//! - output limits: `RLIMIT_FSIZE` per file (Linux), total output directory
-//!   size (polled), and the captured stdout / stderr (4 MiB each).
+//! - output limits: `RLIMIT_FSIZE` per file, total output directory size
+//!   (polled), and the captured stdout / stderr (4 MiB each);
+//! - resource limits ([`Limits`], docs/security.md §3.10): `RLIMIT_CPU` per
+//!   process (the timeout plus 10 s), `RLIMIT_AS` (4 GiB, Linux) and, where
+//!   a delegated cgroup can be used ([`LatexmkConfig::cgroups`]), a cgroup
+//!   for latexmk and all its descendants (memory 4 GiB, 64 processes and
+//!   threads, 2 CPUs). A reached limit fails the compile with a
+//!   `resource_limit` diagnostic, like the output limits.
 //!
 //! The main log is parsed with `texrun-latex-log`; its diagnostics carry
 //! workspace-relative file names. BibTeX failures are reported from the
@@ -33,12 +39,19 @@
 //!
 //! # Platform support
 //!
-//! Unix only. `RLIMIT_FSIZE` is applied to latexmk with `prlimit(2)` from the
-//! parent, because setting it in the child before `exec` needs `unsafe`
-//! (`pre_exec`), which this workspace forbids. That call only exists on
-//! Linux; on other Unix systems (macOS) the per-file limit is enforced by the
-//! periodic output size check only, i.e. with a delay of up to
-//! [`Limits::size_check_interval`].
+//! Unix only. Setting the rlimits in the child before `exec` needs `unsafe`
+//! (`pre_exec`), which this workspace forbids, so latexmk is started with
+//! them in place in one of two ways:
+//!
+//! - through an exec gate ([`LatexmkConfig::exec_gate`]; the texrun CLI
+//!   hosts one), on Linux and macOS: the rc then has no start gate;
+//! - otherwise, on Linux, latexmk waits at the start gate of the rc until
+//!   they are set with `prlimit(2)` from the parent.
+//!
+//! Without a gate on macOS (no `prlimit(2)`) latexmk runs without rlimits,
+//! and the per-file limit is enforced by the periodic output size check
+//! only, i.e. with a delay of up to [`Limits::size_check_interval`]; the
+//! result says so ([`CompileResult::resource_limits`](texrun_core::CompileResult::resource_limits)).
 //!
 //! # rc
 //!
@@ -61,3 +74,6 @@ pub use engine::{
     MAX_PARSED_LOG_BYTES,
 };
 pub use process::{CapturedOutput, Limits};
+/// For [`LatexmkConfig::with_exec_gate`] and [`LatexmkConfig::with_cgroups`]
+/// (from `texrun-process`).
+pub use texrun_process::{Cgroups, ExecGate};

@@ -101,6 +101,7 @@ previews to the output directory. See `texrun compile --help` for details.
 | `--pages <RANGE>` | first 20 pages | Pages to preview: `N`, `N-M`, `N-`, `-M` (at most 200) |
 | `--preview-dpi <DPI>` | `144` | Preview resolution (long edge at most 4096 px) |
 | `--preview-backend <BACKEND>` | `auto` | `auto` (MuPDF, else Poppler), `mupdf` or `poppler` |
+| `--cgroup <MODE>` | `auto` | Linux: run latexmk and the preview tools in cgroups of their own (memory, processes, CPU). `auto` uses a delegated cgroup if there is one (e.g. `systemd-run --user --scope -p Delegate=yes texrun ...`), otherwise only the per-process limits apply (see `resource_limits`); `required` fails with exit 3 instead; `off` never uses one |
 
 The workspace never contains VCS metadata, `texrun-out/`, `.texrun/`,
 precompiled formats or tool configuration such as `latexmkrc` (texrun never
@@ -145,6 +146,9 @@ project root.
     { "kind": "log", "path": "main.log", "size_bytes": 2800 },
     { "kind": "preview", "path": "preview/page-001.png", "page": 1, "size_bytes": 50212 }
   ],
+  // Which OS-level limits were in place for latexmk (docs/security.md §3.10):
+  "resource_limits": { "rlimits": true, "cgroup": false,
+                       "notes": [ "cgroup: no delegated cgroup: ..." ] },
   // After a successful compile, unless --no-preview (texrun_preview::PreviewReport):
   "preview": { "status": "rendered", "backend": "mupdf", "format": "png",
                "pdf": { "page_count": 1, "pages": [ ... ] }, "pages": [ ... ], "notices": [] },
@@ -180,6 +184,15 @@ LaTeX's. Like latexmk, a document without `\cite` yet (`I found no
 \citation commands`) gives only a warning. `bibtex_failed` says that BibTeX failed (`info` after its errors,
 `error` when there are none to show). The `.blg` itself is not an artifact.
 
+A compile that texrun stopped at a resource limit fails (exit 1) with a
+`resource_limit` error diagnostic that says which: the output size (per file
+or in total), the CPU time of a process, the memory, or the number of
+processes (docs/security.md §3.2, §3.10). The limits are not options; a
+limit reached before a timeout is reported next to `timed_out` too.
+`resource_limits` says which layers were in place: `rlimits` (per-process
+limits set before latexmk starts) and `cgroup` (Linux, see `--cgroup`), with
+`notes` on a missing layer.
+
 Check `error` first, then `outcome` (or just `texrun_exit_code`). `exit` is
 the latexmk process status and is informational only. `error` can appear
 together with an `outcome`, e.g. when the compile succeeded but its output
@@ -192,7 +205,8 @@ without changing `schema_version`.
 
 - from the CLI: `usage`, `invalid_preview_options`, `non_utf8_path`,
   `unsafe_root`, `unsafe_output_path` (stage `output`), `io` (stage
-  `output`), `signal_setup`;
+  `output`), `signal_setup`, `unsupported` (stage `setup`: `--cgroup
+  required` without a usable cgroup);
 - from the engine (stages `probe`, `compile`): `unavailable`, `spawn`, `io`,
   `invalid_request`, `unsupported`;
 - from the workspace (stages `project`, `workspace`, `collect`):
@@ -214,9 +228,9 @@ are copied into it).
 | Code | Meaning |
 | --- | --- |
 | 0 | The document compiled and a PDF was produced |
-| 1 | The document failed to compile (see the diagnostics) |
+| 1 | The document failed to compile (see the diagnostics), also when a resource limit stopped it (`resource_limit`) |
 | 2 | Usage or input error: invalid arguments, entrypoint not found or outside `--root`, project rejected (symlink leaving the root, input limits, unsafe root) |
-| 3 | Runtime error: latexmk missing or unusable, I/O errors, artifacts could not be copied |
+| 3 | Runtime error: latexmk missing or unusable, I/O errors, artifacts could not be copied, `--cgroup required` without a usable cgroup |
 | 4 | The compile timed out |
 | 130 | Interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP |
 

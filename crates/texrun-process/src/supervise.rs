@@ -11,6 +11,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use texrun_core::CancelToken;
 
 use crate::capture::{CapturedOutput, Reader};
+use crate::cgroup::{self, CgroupLimits, CgroupOutcome};
 use crate::error::RunError;
 use crate::gate::{self, ExecGate};
 use crate::rlimit;
@@ -95,6 +96,19 @@ impl<'a, S> Watch<'a, S> {
         self
     }
 
+    /// When the child is stopped ([`Stop::TimedOut`]), for a child spawned
+    /// at `start`: the timeout or the deadline, whichever comes first. A
+    /// timeout too large to represent never expires.
+    fn deadline_from(&self, start: Instant) -> Option<Instant> {
+        match (
+            self.timeout.and_then(|t| start.checked_add(t)),
+            self.deadline,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Runs `check` every `interval` (at most every [`POLL_INTERVAL`]; the
     /// first time one `interval` after the spawn) and stops the child
     /// ([`Stop::Check`]) when it returns a value.
@@ -152,6 +166,9 @@ pub struct Finished<S = ()> {
     /// so that the program was started as with [`StartMode::Immediate`].
     /// `None` for every other start mode.
     pub gate_fallback: Option<String>,
+    /// Whether the run had its own cgroup ([`Spec::cgroup`]), and what it
+    /// recorded (e.g. OOM kills).
+    pub cgroup: CgroupOutcome,
 }
 
 /// Runs `spec` on the host ([`HostLauncher`]) and supervises it until it
@@ -166,8 +183,9 @@ pub fn run_with<S>(
     spec: &Spec<'_>,
     mut watch: Watch<'_, S>,
 ) -> Result<Finished<S>, RunError> {
-    let plan = check_spec(launcher, spec)?;
+    let mut plan = check_spec(launcher, spec)?;
     let program = spec.program_name();
+    let run_cgroup = create_cgroup(&mut plan, &program)?;
     let (mut cmd, mut channel) = command(launcher, spec, &plan)?;
     cmd.stdout(stdio(spec.stdout))
         .stderr(stdio(spec.stderr))
@@ -181,13 +199,19 @@ pub fn run_with<S>(
     let child = spawned.map_err(|source| spawn_error(plan.start, &program, source))?;
     let leader_pid = child.id();
     let pgid = Pid::from_child(&child);
+
     let mut group = Group {
         child,
         pid: leader_pid,
         pgid,
         launcher,
+        cgroup: None,
         reaped: false,
     };
+    // Into the cgroup first, while a gated child still waits: then every
+    // descendant is inside, and the group kill reaches all of them. On an
+    // error the guard kills and reaps the child.
+    group.cgroup = enter_cgroup(run_cgroup, leader_pid, &mut plan, &program)?;
 
     let stdout = reader(group.child.stdout.take(), spec.stdout);
     let stderr = reader(group.child.stderr.take(), spec.stderr);
@@ -215,14 +239,7 @@ pub fn run_with<S>(
         channel.release();
     }
 
-    // A timeout too large to represent never expires.
-    let deadline = match (
-        watch.timeout.and_then(|t| start.checked_add(t)),
-        watch.deadline,
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
+    let deadline = watch.deadline_from(start);
     let mut last_check = start;
     let stop = loop {
         if let Some(channel) = channel.as_mut() {
@@ -259,6 +276,10 @@ pub fn run_with<S>(
         .map_err(RunError::io(format!("waiting for {program}")))?;
     group.reaped = true;
     launcher.on_reaped(leader_pid);
+    let cgroup = match group.cgroup.take() {
+        Some(run) => CgroupOutcome::Applied(run.finish()),
+        None => plan.cgroup_outcome.clone(),
+    };
 
     let rlimits_applied = match channel.as_mut() {
         None => prlimit_applied,
@@ -275,7 +296,49 @@ pub fn run_with<S>(
         stderr: stderr.finish(readers_deadline),
         rlimits_applied,
         gate_fallback: plan.gate_fallback,
+        cgroup,
     })
+}
+
+/// Creates the run's cgroup, if the plan has one. A failure fails the run
+/// if the cgroup is required, and is recorded otherwise.
+fn create_cgroup(plan: &mut Plan<'_>, program: &str) -> Result<Option<cgroup::imp::Run>, RunError> {
+    let Some((parent, limits)) = &plan.cgroup else {
+        return Ok(None);
+    };
+    match parent.create(limits) {
+        Ok(run) => Ok(Some(run)),
+        Err(e) if plan.cgroup_required => {
+            Err(RunError::io(format!("creating a cgroup for {program}"))(e))
+        }
+        Err(e) => {
+            plan.cgroup_outcome =
+                CgroupOutcome::Unavailable(format!("cannot create a cgroup: {e}"));
+            Ok(None)
+        }
+    }
+}
+
+/// Moves the child `pid` into `run` (its cgroup), like [`create_cgroup`]
+/// for failures.
+fn enter_cgroup(
+    run: Option<cgroup::imp::Run>,
+    pid: u32,
+    plan: &mut Plan<'_>,
+    program: &str,
+) -> Result<Option<cgroup::imp::Run>, RunError> {
+    let Some(run) = run else { return Ok(None) };
+    match run.attach(pid) {
+        Ok(()) => Ok(Some(run)),
+        Err(e) if plan.cgroup_required => {
+            Err(RunError::io(format!("moving {program} into its cgroup"))(e))
+        }
+        Err(e) => {
+            plan.cgroup_outcome =
+                CgroupOutcome::Unavailable(format!("cannot enter the cgroup: {e}"));
+            Ok(None)
+        }
+    }
 }
 
 /// How the child is started, after [`check_spec`].
@@ -297,12 +360,39 @@ struct Plan<'s> {
     gate_applies_all: bool,
     /// Why [`StartMode::ExecGate`] fell back to [`StartMode::Immediate`].
     gate_fallback: Option<String>,
+    /// The parent cgroup and the limits of the run's cgroup, if used.
+    cgroup: Option<(&'s cgroup::imp::Parent, CgroupLimits)>,
+    /// Whether a cgroup that cannot be used fails the run.
+    cgroup_required: bool,
+    /// [`Finished::cgroup`] unless the run gets its cgroup.
+    cgroup_outcome: CgroupOutcome,
 }
 
 /// Checks `spec` before anything is started.
 fn check_spec<'s>(launcher: &dyn Launcher, spec: &'s Spec<'_>) -> Result<Plan<'s>, RunError> {
+    if let Some(problem) = spec.rlimits.problem() {
+        return Err(RunError::InvalidSpec(problem));
+    }
     let apply_rlimits = launcher.apply_rlimits() && !spec.rlimits.is_empty();
     let required = apply_rlimits && spec.require_rlimits;
+    let (cgroup_plan, cgroup_required, cgroup_outcome) = match spec.cgroup {
+        Some((cgroups, limits)) if launcher.apply_rlimits() => {
+            if let Some(parent) = cgroups.available() {
+                (
+                    Some((parent, limits)),
+                    cgroups.is_required(),
+                    CgroupOutcome::NotRequested,
+                )
+            } else {
+                let reason = cgroups.check().err().unwrap_or_default();
+                if cgroups.is_required() {
+                    return Err(RunError::Unsupported(reason));
+                }
+                (None, false, CgroupOutcome::Unavailable(reason))
+            }
+        }
+        _ => (None, false, CgroupOutcome::NotRequested),
+    };
     let mut gate_fallback = None;
     let start = match &spec.start {
         StartMode::Immediate => Start::Immediate,
@@ -361,6 +451,9 @@ fn check_spec<'s>(launcher: &dyn Launcher, spec: &'s Spec<'_>) -> Result<Plan<'s
         apply_rlimits,
         gate_applies_all: apply_rlimits && unsettable.is_none(),
         gate_fallback,
+        cgroup: cgroup_plan,
+        cgroup_required,
+        cgroup_outcome,
     })
 }
 
@@ -370,7 +463,7 @@ fn check_spec<'s>(launcher: &dyn Launcher, spec: &'s Spec<'_>) -> Result<Plan<'s
 fn gate_spec<'a>(gate: &ExecGate, spec: &Spec<'a>, plan: &Plan<'_>) -> Spec<'a> {
     let limits = spec
         .rlimits
-        .iter()
+        .pairs()
         .filter(|&(r, _)| plan.apply_rlimits && rlimit::settable(r));
     let mut gated = spec.clone();
     gated.args = gate.command_args(limits, &spec.program, spec.args.iter());
@@ -480,6 +573,8 @@ struct Group<'l> {
     pid: u32,
     pgid: Pid,
     launcher: &'l dyn Launcher,
+    /// The run's cgroup, killed with the group; removed when dropped.
+    cgroup: Option<cgroup::imp::Run>,
     reaped: bool,
 }
 
@@ -493,6 +588,10 @@ impl Group<'_> {
     fn kill(&self) {
         debug_assert!(!self.reaped);
         let _ = kill_process_group(self.pgid, Signal::KILL);
+        // Also processes that left the group (a new session).
+        if let Some(run) = &self.cgroup {
+            run.kill();
+        }
         self.launcher.on_kill(self.pid);
     }
 }
@@ -504,6 +603,11 @@ impl Drop for Group<'_> {
             if self.child.wait().is_ok() {
                 self.launcher.on_reaped(self.pid);
             }
+        }
+        // Waits (bounded) until the killed processes are gone, so that the
+        // cgroup can be removed.
+        if let Some(run) = self.cgroup.take() {
+            let _ = run.finish();
         }
     }
 }

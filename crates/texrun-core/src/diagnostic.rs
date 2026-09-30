@@ -65,6 +65,12 @@ pub enum DiagnosticKind {
     /// missing. Follows the individual BibTeX errors (then as
     /// [`Severity::Info`]), or stands alone when there are none to report.
     BibtexFailed,
+    /// texrun stopped the compile, or a process of the engine was stopped,
+    /// because a resource limit was reached: the output size, the CPU
+    /// time, the memory or the number of processes (docs/security.md
+    /// §3.2, §3.10). The message says which. Produced by texrun, not
+    /// parsed from a log.
+    ResourceLimit,
     /// Recognized as a diagnostic but not classified further. Unknown values
     /// are deserialized as this variant.
     #[serde(other)]
@@ -174,10 +180,11 @@ mod tests {
     }
 
     #[test]
-    fn bibtex_kinds_are_snake_case() {
+    fn texrun_kinds_are_snake_case() {
         for (kind, name) in [
             (DiagnosticKind::BibtexError, "bibtex_error"),
             (DiagnosticKind::BibtexFailed, "bibtex_failed"),
+            (DiagnosticKind::ResourceLimit, "resource_limit"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
             assert_eq!(

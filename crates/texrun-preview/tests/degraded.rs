@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use texrun_core::{CancelToken, Severity};
 use texrun_preview::{
-    BackendChoice, ExecGate, NoticeKind, PreviewError, PreviewOptions, PreviewReport,
+    BackendChoice, Cgroups, ExecGate, NoticeKind, PreviewError, PreviewOptions, PreviewReport,
     PreviewStatus, Previewer, Toolset,
 };
 
@@ -494,4 +494,37 @@ fn an_optional_exec_gate_that_cannot_be_used_is_reported_once() {
         vec![NoticeKind::ResourceLimits, NoticeKind::RenderFailed]
     );
     assert!(report.notices[0].message.contains("/nonexistent/texrun"));
+}
+
+#[test]
+fn a_required_cgroup_that_cannot_be_used_skips_the_previews() {
+    let script = PDFINFO.replace("#!/bin/sh\n", "#!/bin/sh\ntouch \"$HOME/../../ran\"\n");
+    let f = fake(&script, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    let report = Previewer::new(f.tools)
+        .with_cgroups(Cgroups::unavailable("no delegated cgroup").with_required(true))
+        .render(&fixture("sizes.pdf"), out.path(), &opts())
+        .unwrap();
+    assert_eq!(report.status, PreviewStatus::Skipped);
+    assert_eq!(kinds(&report), vec![NoticeKind::ResourceLimits]);
+    assert!(report.notices[0].message.contains("no delegated cgroup"));
+    assert!(!out.path().join("ran").exists(), "a tool ran");
+}
+
+#[test]
+fn an_optional_cgroup_that_cannot_be_used_is_reported_once() {
+    let f = fake(PDFINFO, PDFTOPPM);
+    let out = tempfile::tempdir().unwrap();
+    let report = Previewer::new(f.tools)
+        .with_cgroups(Cgroups::unavailable("no delegated cgroup"))
+        .render(&fixture("sizes.pdf"), out.path(), &opts())
+        .unwrap();
+    // Rendered as without cgroups (page 2 fails in the fake), with one
+    // warning about the limits.
+    assert_eq!(report.status, PreviewStatus::Partial);
+    assert_eq!(
+        kinds(&report),
+        vec![NoticeKind::ResourceLimits, NoticeKind::RenderFailed]
+    );
+    assert!(report.notices[0].message.contains("no delegated cgroup"));
 }

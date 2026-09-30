@@ -78,6 +78,9 @@ fn texlive_compiles_a_document_with_includes() {
     let pdf = Path::new(doc["output_dir"].as_str().unwrap()).join("main.pdf");
     assert!(fs::read(&pdf).unwrap().starts_with(b"%PDF-"));
     assert!(dir.path().join("texrun-out/main.pdf").is_file());
+    // latexmk started through the exec gate (texrun itself), so the
+    // rlimits were in place on every platform.
+    assert_eq!(doc["resource_limits"]["rlimits"], true, "{doc:#}");
 
     // Human-readable mode.
     let out = texrun(dir.path(), &["compile", "main.tex"])
@@ -281,4 +284,194 @@ fn texlive_sigint_stops_pdflatex() {
     // Workspace, rc and probe directories are gone: cleanup ran.
     let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// A cgroup this test may create cgroups in (docs/development.md, "cgroup
+/// test"), or `None` (skipped) unless `TEXRUN_REQUIRE_CGROUP=1`.
+#[cfg(target_os = "linux")]
+fn cgroup_parent() -> Option<std::path::PathBuf> {
+    let cgroups = texrun_process::Cgroups::detect();
+    match cgroups.check() {
+        Ok(()) => Some(cgroups.parent().unwrap().to_owned()),
+        Err(reason) if std::env::var_os("TEXRUN_REQUIRE_CGROUP").is_some_and(|v| v == "1") => {
+            panic!("TEXRUN_REQUIRE_CGROUP=1, but no cgroup can be used: {reason}")
+        }
+        Err(reason) => {
+            eprintln!("skipped: no delegated cgroup ({reason})");
+            None
+        }
+    }
+}
+
+/// What a compile run alone in a fresh cgroup did to that cgroup.
+#[cfg(target_os = "linux")]
+struct OwnCgroupRun {
+    code: Option<i32>,
+    doc: Value,
+    stderr: String,
+    /// `cgroup.subtree_control` of the cgroup after the run.
+    subtree_control: String,
+    /// Child cgroups texrun left in it (its `.main` leaf).
+    children: Vec<String>,
+}
+
+/// How [`compile_in_own_cgroup`] prepares the cgroup.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupSetup {
+    /// Marked as delegated (`trusted.delegate=1`, as systemd does for
+    /// `Delegate=yes`).
+    Delegated,
+    /// Neither marked nor chowned.
+    Plain,
+    /// Chowned to this user, who runs texrun, but not marked (like a
+    /// cgroup below `user@<uid>.service` that `systemd --user` manages).
+    ChownedTo(u32),
+}
+
+/// Runs `texrun compile --json <args> main.tex` as the only process of a
+/// new cgroup below `parent`, prepared as `setup` says, and removes the
+/// cgroup.
+#[cfg(target_os = "linux")]
+fn compile_in_own_cgroup(parent: &Path, setup: CgroupSetup, args: &[&str]) -> OwnCgroupRun {
+    let own = parent.join(format!(
+        "texrun-cli-test-{}-{}",
+        std::process::id(),
+        match setup {
+            CgroupSetup::Delegated => "delegated".to_owned(),
+            CgroupSetup::Plain => "plain".to_owned(),
+            CgroupSetup::ChownedTo(uid) => format!("uid{uid}"),
+        }
+    ));
+    fs::create_dir(&own).unwrap();
+    if let CgroupSetup::ChownedTo(uid) = setup {
+        for name in [
+            "",
+            "cgroup.procs",
+            "cgroup.subtree_control",
+            "cgroup.threads",
+        ] {
+            std::os::unix::fs::chown(own.join(name), Some(uid), Some(uid)).unwrap();
+        }
+    }
+    if setup == CgroupSetup::Delegated {
+        rustix::fs::setxattr(
+            &own,
+            "trusted.delegate",
+            b"1",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+    }
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n",
+    )]);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "echo $$ > \"$0/cgroup.procs\" && exec \"$@\""])
+        .arg(&own);
+    if let CgroupSetup::ChownedTo(uid) = setup {
+        // texrun runs as that user, in a project it can write to.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        command
+            .args(["/usr/bin/setpriv", "--clear-groups"])
+            .args([format!("--reuid={uid}"), format!("--regid={uid}")]);
+    }
+    let out = command
+        .args([env!("CARGO_BIN_EXE_texrun"), "compile", "--json"])
+        .args(args)
+        .arg("main.tex")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let subtree_control = fs::read_to_string(own.join("cgroup.subtree_control")).unwrap();
+    let mut children = Vec::new();
+    for entry in fs::read_dir(&own).unwrap().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            children.push(entry.file_name().to_string_lossy().into_owned());
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    let _ = fs::remove_dir(&own);
+    assert!(!own.exists(), "the test cgroup was removed");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let doc =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
+    OwnCgroupRun {
+        code: out.status.code(),
+        doc,
+        stderr,
+        subtree_control,
+        children,
+    }
+}
+
+/// texrun started alone in a delegated cgroup (as with `systemd-run --user
+/// --scope -p Delegate=yes`) moves itself into a leaf of it and runs the
+/// engine and the preview tools in cgroups of their own.
+#[cfg(target_os = "linux")]
+#[test]
+fn texlive_uses_a_delegated_cgroup_of_its_own() {
+    common::require_texlive!();
+    let Some(parent) = cgroup_parent() else {
+        return;
+    };
+    let run = compile_in_own_cgroup(&parent, CgroupSetup::Delegated, &["--cgroup", "required"]);
+    let doc = &run.doc;
+    assert_eq!(run.code, Some(0), "{doc:#}\n{}", run.stderr);
+    assert_eq!(
+        doc["resource_limits"],
+        serde_json::json!({ "rlimits": true, "cgroup": true }),
+        "{doc:#}"
+    );
+    assert!(
+        doc["preview"]["notices"]
+            .as_array()
+            .is_none_or(|n| n.iter().all(|n| n["kind"] != "resource_limits")),
+        "{doc:#}"
+    );
+    assert!(
+        run.subtree_control.contains("memory"),
+        "{}",
+        run.subtree_control
+    );
+    assert_eq!(run.children.len(), 1, "{:?}", run.children);
+    assert_eq!(
+        run.children[0].rsplit_once('.').map(|(_, kind)| kind),
+        Some("main"),
+        "{:?}",
+        run.children
+    );
+}
+
+/// A cgroup without the delegation marker is left alone, whether it is
+/// merely writable (texrun runs as root) or owned by the user texrun runs
+/// as: texrun neither moves itself into a leaf nor enables controllers
+/// there. (As root it may still use the container's cgroup namespace
+/// root.)
+#[cfg(target_os = "linux")]
+#[test]
+fn texlive_leaves_a_cgroup_that_was_not_delegated_alone() {
+    common::require_texlive!();
+    let Some(parent) = cgroup_parent() else {
+        return;
+    };
+    for setup in [CgroupSetup::Plain, CgroupSetup::ChownedTo(65534)] {
+        let run = compile_in_own_cgroup(&parent, setup, &["--cgroup", "auto"]);
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{setup:?}: {:#}\n{}",
+            run.doc,
+            run.stderr
+        );
+        assert_eq!(
+            run.subtree_control.trim(),
+            "",
+            "{setup:?}: controllers were enabled"
+        );
+        assert!(run.children.is_empty(), "{setup:?}: {:?}", run.children);
+    }
 }

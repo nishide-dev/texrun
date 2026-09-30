@@ -25,6 +25,8 @@ texrun-texlive.workspace = true
 texrun-workspace.workspace = true
 
 [dev-dependencies]
+# Marking a test cgroup as delegated (`trusted.delegate` xattr).
+rustix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 

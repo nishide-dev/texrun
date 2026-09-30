@@ -412,7 +412,11 @@ mod without_prlimit {
     fn required_rlimits_are_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         let spec = sh(dir.path(), "touch ran")
-            .with_rlimits(Rlimits::new().with(Resource::FileSize, 1000))
+            .with_rlimits(
+                Rlimits::new()
+                    .with(Resource::FileSize, 1000)
+                    .with(Resource::Core, 0),
+            )
             .with_require_rlimits(true);
         let err = run(&spec, Watch::<()>::new()).unwrap_err();
         assert!(matches!(err, RunError::Unsupported(_)), "{err:?}");
@@ -507,7 +511,8 @@ mod linux {
         setrlimit(
             R::Core,
             Rlimit {
-                current: Some(own.current.map_or(hard, |c| c.min(hard))),
+                // Soft = hard: the cap applies to both (see the unit tests).
+                current: Some(hard),
                 maximum: Some(hard),
             },
         )
@@ -529,8 +534,11 @@ mod linux {
     #[test]
     fn a_launcher_can_take_over_the_rlimits() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = gated(sh(dir.path(), "read t && cat /proc/$$/limits"))
-            .with_rlimits(Rlimits::new().with(Resource::FileSize, 123_456));
+        let spec = gated(sh(dir.path(), "read t && cat /proc/$$/limits")).with_rlimits(
+            Rlimits::new()
+                .with(Resource::FileSize, 123_456)
+                .with(Resource::Core, 0),
+        );
         let launcher = Recording::default(); // `apply_rlimits() == false`
         let done = run_with(&launcher, &spec, Watch::<()>::new()).unwrap();
         let limits = String::from_utf8(done.stdout.bytes).unwrap();

@@ -15,7 +15,7 @@ thiserror.workspace = true
 # Supervised tool processes (Unix only).
 texrun-process.workspace = true
 # Unix only: descriptor-based file operations.
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 serde_json.workspace = true

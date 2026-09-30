@@ -25,12 +25,12 @@ use texrun_core::{
     TypesetEngine, WorkspacePath,
 };
 use texrun_preview::{PreviewOptions, PreviewReport, Previewer};
-use texrun_texlive::{LatexmkConfig, LatexmkEngine};
+use texrun_texlive::{Cgroups, LatexmkConfig, LatexmkEngine};
 use texrun_workspace::{
     OverwritePolicy, ProjectInput, Workspace, WorkspaceConfig, WorkspaceError, WorkspaceErrorKind,
 };
 
-use crate::cli::{CompileArgs, DEFAULT_OUTPUT_DIR_NAME};
+use crate::cli::{CgroupMode, CompileArgs, DEFAULT_OUTPUT_DIR_NAME};
 use crate::human::{self, Paths};
 use crate::output::{self, OutputDirError};
 use crate::report::{
@@ -138,8 +138,17 @@ fn execute(
     let (config, note) = workspace_config(args, &input, existing_output.as_deref());
     report.notes.extend(note);
 
-    let engine =
-        LatexmkEngine::new(LatexmkConfig::default().with_source_date_epoch(args.source_date_epoch));
+    // Before anything is copied: a required cgroup that cannot be used ends
+    // the run here. May move texrun itself into a leaf of its cgroup
+    // (`Cgroups::detect`).
+    let cgroups = select_cgroups(args.cgroup)?;
+    let mut engine_config = LatexmkConfig::default()
+        .with_source_date_epoch(args.source_date_epoch)
+        .with_exec_gate(crate::gate::exec_gate());
+    if let Some(cgroups) = &cgroups {
+        engine_config = engine_config.with_cgroups(cgroups.clone());
+    }
+    let engine = LatexmkEngine::new(engine_config);
     // Reports a missing latexmk before anything is copied, and makes the
     // result carry the latexmk version.
     engine
@@ -195,7 +204,7 @@ fn execute(
 
     // Previews are rendered into the workspace output directory and
     // attached to the result, so that the copy below includes them.
-    let mut preview = render_previews(&ws, &result, preview_options, cancel);
+    let mut preview = render_previews(&ws, &result, preview_options, cgroups, cancel);
     if let Some(preview) = &preview {
         preview.attach_to(&mut result);
     }
@@ -335,6 +344,7 @@ fn render_previews(
     ws: &Workspace,
     result: &CompileResult,
     options: Option<PreviewOptions>,
+    cgroups: Option<Cgroups>,
     cancel: &CancelToken,
 ) -> Option<PreviewReport> {
     let options = options?;
@@ -345,10 +355,43 @@ fn render_previews(
     let output_root = ws.output_dir();
     let pdf = output_root.join(pdf.path.as_path());
     // Options were validated up front; `render` cannot fail otherwise.
-    Previewer::detect()
-        .with_exec_gate(crate::gate::exec_gate())
-        .render(&pdf, &output_root, &options)
-        .ok()
+    let mut previewer = Previewer::detect().with_exec_gate(crate::gate::exec_gate());
+    // Only a usable one: that none can be used is already in the result
+    // (`resource_limits`), or ended the run (`--cgroup required`).
+    if let Some(cgroups) = cgroups.filter(|c| c.check().is_ok()) {
+        previewer = previewer.with_cgroups(cgroups);
+    }
+    previewer.render(&pdf, &output_root, &options).ok()
+}
+
+/// The hint for `--cgroup required` without a usable cgroup.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CGROUP_HINT: &str = "run texrun in a delegated cgroup of its own (e.g. systemd-run --user \
+                           --scope -p Delegate=yes texrun ...), or use --cgroup auto";
+/// The hint for `--cgroup required` without a usable cgroup.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const CGROUP_HINT: &str = "cgroups exist on Linux only; use --cgroup auto or --cgroup off here";
+
+/// The cgroups for `--cgroup`: none for `off`; otherwise the delegated
+/// cgroup found, which may be unavailable (with the reason) for `auto`,
+/// but not for `required`.
+fn select_cgroups(mode: CgroupMode) -> Result<Option<Cgroups>, ErrorInfo> {
+    let required = match mode {
+        CgroupMode::Off => return Ok(None),
+        CgroupMode::Auto => false,
+        CgroupMode::Required => true,
+    };
+    let cgroups = Cgroups::detect().with_required(required);
+    if required && let Err(reason) = cgroups.check() {
+        return Err(ErrorInfo::new(
+            Stage::Setup,
+            kind::UNSUPPORTED,
+            Category::Runtime,
+            format!("--cgroup required, but no cgroup can be used: {reason}"),
+        )
+        .with_hint(CGROUP_HINT));
+    }
+    Ok(Some(cgroups))
 }
 
 /// Checks that are not expressed in the clap definition.

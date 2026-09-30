@@ -6,7 +6,7 @@ texrun の信頼境界、MVP で保証する範囲と保証しない範囲、実
 
 > **現状:** この文書は方針と検証結果である。
 > #5 の担当分（§3.1 の timeout、§3.2 の出力上限、§3.4〜3.7）は `crates/texrun-texlive` で実装した。§3.3 は `crates/texrun-workspace`（#21）で実装した。
-> 外部プロセスの制限付き実行（§3.2 の rlimit、§3.4 の env allowlist、§3.6 の停止）は、latexmk と preview tool で共通の `crates/texrun-process`（#32）にまとめてある。
+> 外部プロセスの制限付き実行（§3.2 の rlimit、§3.4 の env allowlist、§3.6 の停止、§3.10 の CPU・memory・プロセス数の上限）は、latexmk と preview tool で共通の `crates/texrun-process`（#32、#25）にまとめてある。
 > それ以外の実装の進み具合は各 Issue を参照する。
 > 公開リポジトリのため、攻撃の再現手順や具体的な入力は書かず、「どの保証をどの層で担保するか」だけを書く。
 > 境界を破る方法を見つけた場合は [SECURITY.md](../SECURITY.md) の手順で非公開で報告してほしい。
@@ -73,8 +73,13 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
 
    workspace は入力を texrun 管理のディレクトリにコピーしたもので、root 外を指す symlink は持ち込まない（#4）。
 3. **host 由来の環境変数に依存しない。漏らさない**（env allowlist、§3.4）。
-4. **資源消費に上限を設ける。** 対象は wall-clock timeout、1 ファイルあたりの書き込みサイズ、output の合計サイズ、入力サイズ（§3.1〜3.3）。
-5. **timeout / cancel 時に子孫プロセスを残さない**（process group 単位の kill、§3.6）。
+4. **資源消費に上限を設ける。** 対象は次のとおり。
+   - wall-clock timeout、1 ファイルあたりの書き込みサイズ、output の合計サイズ、入力サイズ（§3.1〜3.3）
+   - 各プロセスの CPU 時間（Linux・macOS）と address space（Linux）（§3.10）
+   - Linux で委譲された cgroup が使える場合は、engine とその子孫全体の memory・プロセス数・CPU の同時使用（§3.10）
+
+   上限に達した compile は `CompileOutcome::Failed` になり、`resource_limit` の diagnostic が付く（§3.10）。
+5. **timeout / cancel 時に子孫プロセスを残さない**（process group 単位の kill。cgroup が使える場合は `cgroup.kill` も、§3.6）。
 
 ### 保証の検証（#10）
 
@@ -94,6 +99,9 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 | timeout / cancel で子孫プロセスを残さない | `scenarios.rs`: `timeout`、`latexmk.rs`: `cancel_stops_the_whole_process_tree` |
 | process group の kill・timeout・cancel・rlimit・leader の reap（TeX を使わない fake script） | `crates/texrun-process/tests/supervise.rs` |
 | 出力の上限 | `latexmk.rs`: `output_directory_limit_stops_the_compile` / `per_file_limit_stops_the_compile` |
+| CPU 時間・address space・cgroup の memory / プロセス数の上限で engine が止まり、結果が返る | `limits.rs`（TeX Live）、`crates/texrun-process/tests/limits.rs`（fake script） |
+| 長い文書（200 ページ超、目次・相互参照・bibtex・makeindex）が既定の上限に当たらない | `limits.rs`: `a_long_document_stays_within_the_default_limits` |
+| process group を抜けたプロセスも、cgroup があれば停止する | `crates/texrun-process/tests/limits.rs`: `cgroup_kill_reaches_a_process_outside_the_group` |
 
 画像・bibtex の database・pdfTeX のファイル情報系 primitive の経路は、§6 の実験で確認したもので、fixture にはまだ含めていない。
 
@@ -112,14 +120,15 @@ CI の `integration` job で毎回実行する（[development.md](development.md
   たとえば `\openin` では、`tex/` 以下の `.sty` / `.cls` は読めた。一方、`web2c/` にある `texmf.cnf`、`ls-R`、font map、`.bst` は見つからなかった。これらのファイルは通常公開情報だが、host 固有の設定やローカルにインストールしたパッケージが含まれうる。
 - **OS レベルの隔離は無い。** engine は texrun を起動したユーザーの権限で動く。画像や PDF を解析するコード（pdfTeX・libpng・libjpeg・poppler / MuPDF など）にメモリ安全性の脆弱性があれば、細工した入力で任意コード実行されうる。その場合、そのユーザーが読み書きできるものはすべて危険にさらされる。
 - **network は遮断していない**（§3.8、#24）。
-- **CPU・メモリは OS レベルで制限していない**（#25）。
+- **委譲された cgroup が使えない環境では、process tree 全体の memory とプロセス数を OS レベルで制限しない**（§3.10）。macOS、通常の Docker コンテナ、多くの Linux の端末 session がこれに当たる。
+  - その場合に効くのは、プロセスごとの `RLIMIT_CPU`（Linux・macOS）と `RLIMIT_AS`（Linux のみ）である。macOS では memory を OS レベルで制限しない。
   - pdfTeX のメモリは `texmf.cnf` の固定容量（`main_memory` 等）で頭打ちになる。LuaTeX など他の engine はこの限りではない。
-  - CPU 時間は timeout でのみ制限する。
+  - プロセス数は、TeX が shell escape 無しではプロセスを起動できないことと、texrun 管理 rc の latexmk が決まったツールだけを順に起動することに頼る。
 - **workspace 内での書き込みは止めない。** TeX は output dir 配下に、任意の名前・任意の数のファイルを作れる。サイズは §3.2 の上限で抑えるが、ファイル数・inode は制限しない。
 - **上限に達するまでの資源消費は起こりうる。** ログを出し続ける文書では、ログと stdout がそれぞれ約 32 MB/s の速さで増えた（§6）。
-- **process group から抜けるプロセスは追えない。**
-  - 新しい session を作った子孫は `killpg` の対象外になる。
-  - shell escape を無効にした TeX と、texrun 管理 rc の latexmk は、そのようなプロセスを起動しない。ただし OS として保証するものではない（cgroup 等、#25）。
+- **cgroup が使えない環境では、process group から抜けるプロセスは追えない。**
+  - 新しい session を作った子孫は `killpg` の対象外になる。cgroup が使える場合は `cgroup.kill` で止まる（§3.10）。
+  - shell escape を無効にした TeX と、texrun 管理 rc の latexmk は、そのようなプロセスを起動しない。ただし OS として保証するものではない。そのようなプロセスが CPU を使い続けられる時間は `RLIMIT_CPU` で抑える（§3.10）。
 - **生成物から host の情報が漏れる。** 詳細は §3.9。
 - **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。
 - **表示上の偽装。** `WorkspacePath` は bidi 制御文字（U+202A〜U+202E、U+2066〜U+2069）とゼロ幅文字（U+200B〜U+200F、U+FEFF）を許容している。
@@ -129,7 +138,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 
 ## 3. 決定事項
 
-各項目の末尾に実装担当 Issue を記す。値は MVP の定数である。CLI（#6）で変えられるのは compile の timeout（`--timeout`）と preview のページ範囲・DPI（`--pages` / `--preview-dpi`、上限は下表のまま）だけで、それ以外の上限は CLI からは変更できない。
+各項目の末尾に実装担当 Issue を記す。値は MVP の定数である。CLI（#6）で変えられるのは compile の timeout（`--timeout`）と preview のページ範囲・DPI（`--pages` / `--preview-dpi`、上限は下表のまま）、cgroup を使うかどうか（`--cgroup`、§3.10）だけで、それ以外の上限は CLI からは変更できない。
 
 ### 3.1 timeout（#5、CLI 露出は #6）
 
@@ -146,7 +155,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 
 | 項目 | 既定値 | 強制方法 |
 | --- | --- | --- |
-| 子プロセスが書く 1 ファイルの最大サイズ | **256 MiB** | Linux: `RLIMIT_FSIZE`（下記）。latexmk と全子孫に継承させる。全 OS: output dir の合計サイズと同じ poll で、最大のファイルが上限に達したら process group を kill する |
+| 子プロセスが書く 1 ファイルの最大サイズ | **256 MiB** | `RLIMIT_FSIZE`（下記。exec gate では Linux・macOS、rc の stdin gate では Linux）。latexmk と全子孫に継承させる。全 OS: output dir の合計サイズと同じ poll で、最大のファイルが上限に達したら process group を kill する |
 | output dir の合計サイズ | **1 GiB** | timeout の poll ループ内で定期的に（目安 500 ms ごと）集計し、超えたら process group を kill する |
 | stdout / stderr の保持量 | **各 4 MiB**（先頭を保持し、超過分は読み捨てる） | reader thread が pipe を最後まで読み続け、保持する量だけを制限する。pipe を読まずに止めると engine が block する |
 | PDF artifact | 256 MiB（`RLIMIT_FSIZE` と同じ値で自動的に頭打ちになる） | — |
@@ -155,15 +164,17 @@ CI の `integration` job で毎回実行する（[development.md](development.md
 | preview 画像 1 枚の長辺 | **4096 px**。超えるページは DPI を下げて描画し、info を出す | #8。PDF が宣言するページサイズ（信頼できない値）の parse に依存しないよう、3 段で強制する（下記）。1 ページあたりの出力と、Linux 以外でのメモリを抑える唯一の手段 |
 
 - `RLIMIT_FSIZE` を超えて書き込もうとすると、engine は `SIGXFSZ` で終了する。20 MiB に制限してログを出し続けさせたところ、ログはちょうど 20 MiB で止まり、latexmk は失敗終了した。
-- `RLIMIT_FSIZE` の設定方法:
+- latexmk の rlimit（`RLIMIT_FSIZE` と §3.10 の `RLIMIT_CPU` / `RLIMIT_AS`）の設定方法:
   - 子プロセスの `exec` 前に `setrlimit` する `pre_exec` は `unsafe` で、この workspace は `unsafe_code = "forbid"` なので使わない。
-  - 代わりに Linux では、spawn 直後に親から `prlimit(2)` で latexmk に設定する。latexmk が設定前にファイルを書いたり子プロセスを起動したりしないよう、texrun 管理 rc（§3.5）の先頭で stdin から開始の合図を待たせる。親は `prlimit` の後に合図を送る。合図が来ずに stdin が閉じた場合、rc は何もせずに終了する（終了コード 125）。
+  - **exec gate が使える場合は、latexmk も exec gate（下記、preview tool と同じもの）経由で起動する**（#25。`LatexmkConfig::with_exec_gate`。CLI は常に指定する）。gate は latexmk（perl）の最初の命令より前に limit を設定するので、Linux でも macOS でも、latexmk とその全子孫が最初から制限される。gate は stdin を `/dev/null` にするので、このとき rc には開始の合図の待機を入れない。
+  - exec gate が使えない場合（library として gate を指定しない、`/proc` の無い Linux で CLI の gate が見つからない、など）、Linux では従来の方法にする。spawn 直後に親から `prlimit(2)` で latexmk に設定し、latexmk が設定前にファイルを書いたり子プロセスを起動したりしないよう、texrun 管理 rc（§3.5）の先頭で stdin から開始の合図を待たせる。親は `prlimit` の後に合図を送る。合図が来ずに stdin が閉じた場合、rc は何もせずに終了する（終了コード 125）。rc の待機は perl が rc を読むまで始まらないが、その前に perl が書くファイルや起動する子プロセスは無いので、latexmk がファイルを書く前・子を起動する前に limit が掛かる点で exec gate と同じ保証である。
   - `prlimit` の適用と開始の合図の送信は `texrun-process` が行う（`Rlimits` と `StartMode::StdinGate`）。合図の内容と、合図を待つ rc は engine（`texrun-texlive`）側に置く。
-  - macOS には `prlimit` が無い。1 ファイルの上限は poll（目安 500 ms ごと）でのみ強制するので、検出までの間は上限を超えて書かれうる（ログを出し続ける文書で約 16 MB）。
-- `RLIMIT_FSIZE` で書き込みが止まった場合も、終了後の集計で上限に達したファイルを検出し、同じ diagnostic を付ける。
-- 設定する値は、texrun 自身の hard limit（子プロセスが継承する値）と上限値の小さい方とする。上限を強める方向にだけ働くので、権限は要らない。
-- **core dump は無効にする**（`RLIMIT_CORE=0`、soft・hard とも。Linux で `RLIMIT_FSIZE` と同時に設定する）。`SIGXFSZ` の既定の動作は core dump で、core ファイルは TeX の cwd（workspace 内）に作られ、output dir の集計の対象外になるためである。macOS では `RLIMIT_FSIZE` を設定せず、停止は `SIGKILL` で行うので、core は作られない。
-- 上限によって停止した場合は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。`CompileOutcome` は `#[non_exhaustive]` なので、専用の outcome を追加するかは #5 で判断してよい。
+  - 事前の確認の後で exec gate が使えなくなった場合（確認と spawn の間に binary が消えた、など）、engine は何も起動しない（gate を必須として渡すので、supervisor は `RunError::Unsupported` を返す）。Linux では rc の stdin gate でやり直す。macOS では、gate が必須なら `EngineError::Unsupported`（CLI では exit 3）、そうでなければ次の場合と同じになる。
+  - exec gate が無く `prlimit` も無い場合（macOS で library として gate を指定しない）は、rlimit を設定しない。1 ファイルの上限は poll（目安 500 ms ごと）でのみ強制するので、検出までの間は上限を超えて書かれうる（ログを出し続ける文書で約 16 MB）。結果の `resource_limits.rlimits` が `false` になり、`notes` に理由が入る。
+- `RLIMIT_FSIZE` で書き込みが止まった場合も、終了後の集計で上限に達したファイルを検出し、同じ diagnostic を付ける。texrun 管理 rc は、起動したツールが `SIGXFSZ`（または `SIGXCPU`）で終わったら、latexmk をすぐに終了コード 128 + signal で終わらせる（§3.10）。
+- 設定する値は、texrun 自身の limit（子プロセスが継承する値）と上限値の小さい方とする。soft limit は texrun 自身の soft limit と要求値の小さい方、hard limit は texrun 自身の hard limit と要求値の小さい方にする（#25 で変更。以前は soft にも hard との min を設定していたので、利用者が `ulimit -S` で下げた soft limit より大きくなりえた。#44 の nit 5）。上限を強める方向にだけ働くので、権限は要らない。
+- **core dump は無効にする**（`RLIMIT_CORE=0`、soft・hard とも。`RLIMIT_FSIZE` / `RLIMIT_CPU` と同時に設定する）。`SIGXFSZ` と `SIGXCPU` の既定の動作は core dump で、core ファイルは TeX の cwd（workspace 内）に作られ、output dir の集計の対象外になるためである。`texrun-process` は、`Resource::FileSize` か `Resource::Cpu` を soft 0 の `Resource::Core` なしで指定した spec を、spawn の前に `RunError::InvalidSpec` で拒否する。rlimit を設定しない場合（上記）は、停止は `SIGKILL` で行うので、core は作られない。
+- 上限によって停止した場合は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。diagnostic の kind は `resource_limit`（#25 で追加。以前は `other`）で、§3.10 の CPU 時間・memory・プロセス数の上限と共通である。専用の outcome は追加しない（§3.10）。
 - preview（#8）の長辺の上限は、次の 3 段で強制する。
   1. ページサイズから DPI を下げる。`mutool` はページの拡大係数（`UserUnit`）を反映して描画するので、係数を掛けたサイズで計算する。
   2. `mutool draw` には、上限を bounding box（`-w` / `-h`）としても渡す。縮小だけに効き、小さいページは拡大しない。`pdftoppm` には拡大を伴わずに上限を渡す option が無いので、この段は無い。
@@ -172,7 +183,7 @@ CI の `integration` job で毎回実行する（[development.md](development.md
   - gate は texrun 自身の隠しサブコマンド（`texrun __exec-gate`。clap の解析より前に分岐し、`--help` にも出ない）である。supervisor は tool の代わりに gate を spawn する。gate は次の順に処理する。
     1. 引数を検査する。protocol の版、`--rlimit <名前>=<値>` の並び、`--` の後に tool の絶対パスと引数、の形以外は拒否し、何も実行しない。
     2. stdin（supervisor との Unix socket pair）で開始の合図を待つ。supervisor は `Launcher::on_spawn` の後に合図を送る。合図が来ずに閉じた場合は、何も実行せずに終了する（終了コード 125）。
-    3. `setrlimit(2)` で自分に limit を設定する（texrun 自身の hard limit を超えない）。失敗したら exec しない。
+    3. `setrlimit(2)` で自分に limit を設定する（texrun 自身の soft・hard limit を超えない）。失敗したら exec しない。
     4. stdin を `/dev/null` に差し替え、supervisor に `ok` を報告してから、tool を `exec` する。報告用の fd は close-on-exec なので、exec が成功すると閉じる。exec の失敗（tool が無いなど）も報告され、supervisor は gate を使わない場合と同じ spawn error にする。
   - rlimit は exec の後も引き継がれ、PID（= PGID）も変わらない。そのため tool は最初の命令から制限された状態で動き、tool が起動する子孫もすべて limit を継承する。process group の kill と reap の前提（§3.6）もそのまま成り立つ。
   - gate は tool の引数や PDF のパスを解釈しない。`--` の後はそのまま `exec` の argv に渡し、shell で解釈させることも、`PATH` を検索することもない（tool は絶対パスで指定する）。なお `exec` は C library の `execvp` を経由するので、実行形式として認識されない file（ENOEXEC）は `/bin/sh` で実行し直される。これは gate を使わない spawn（std）と同じ挙動で、tool は texrun が検出した実行ファイルである。環境変数と cwd は、supervisor が gate に与えたもの（§3.4 の allowlist、`work/` の fd）をそのまま引き継ぐ。
@@ -183,17 +194,19 @@ CI の `integration` job で毎回実行する（[development.md](development.md
     - `RLIMIT_AS`: 2 GiB（Linux のみ。macOS は既に確保済みの address space より小さい値を拒否し、強制もしないので設定しない）
     - `RLIMIT_FSIZE`: 残りの画像予算 + 1 byte。ただし 16 MiB 未満にはしない（`HOME` に fontconfig の cache などを書くため）
     - `RLIMIT_CORE`: 0
-  - `setrlimit` は macOS にもあるので、macOS でも `RLIMIT_FSIZE` と `RLIMIT_CORE` が exec 前から効く。
-  - #25 の cgroup への attach は、gate が合図を待っている間に `Launcher::on_spawn` で行うか、gate の手順（3 と 4 の間）に加える。どちらの場合も exec 前なので、全ての子孫が対象になる。
+    - `RLIMIT_CPU`: preview の timeout + 10 s（soft）、その 5 s 後（hard）（§3.10）
+  - `setrlimit` は macOS にもあるので、macOS でも `RLIMIT_FSIZE`・`RLIMIT_CORE`・`RLIMIT_CPU` が exec 前から効く。
+  - cgroup（§3.10）への移動は、gate が合図を待っている間（手順 2）に supervisor が行う。exec 前なので、全ての子孫が対象になる。
   - gate を使えない場合（`ExecGate` の path が実行可能な file でない、など）の動作は、次のとおりである。
     - `ExecGate::with_required(true)` か `Spec::require_rlimits` を指定した場合は、何も spawn せずに `RunError::Unsupported` にする。
     - それ以外の場合は `StartMode::Immediate`（spawn 直後に親から `prlimit(2)`、Linux のみ）に fallback し、`Finished::gate_fallback` に理由を記録する。`Immediate` の保証範囲（設定までの間隔は時間で抑えられない、その間の確保や書き込みは取り消されない、その間に起動された子孫は制限されない）は `StartMode::Immediate` の rustdoc に書いてある。
-    - preview は、gate が使えないことを最初に `ExecGate::check` で確かめ、warning の notice（`resource_limits`。CLI の JSON にも出る）で報告する。gate が必須なら、tool を 1 つも動かさずに preview を skip する（status は `skipped`）。必須でなければ、上記の fallback で描画する。実行中に gate が使えなくなった場合も、同じ notice を 1 回だけ出す。
+    - preview は、gate が使えないことを最初に `ExecGate::check` で確かめ、warning の notice（`resource_limits`。CLI の JSON にも出る）で報告する。gate が必須なら、tool を 1 つも動かさずに preview を skip する（status は `skipped`）。必須でなければ、上記の fallback で描画する。実行中に gate が使えなくなった場合も、同じ notice を 1 回だけ出す。事前の確認の後で必須の gate が使えなくなった場合（supervisor が spawn 前に `RunError::Unsupported` を返す）も、その tool を動かさずに `resource_limits` の notice にして、preview をそこで止める（#25。以前は tool の失敗の notice `tool_unavailable` だった）。
     - **CLI は gate を必須にする（fail-closed）**。preview が失敗しても compile の結果や exit code は変わらない（§3.2 の preview の方針）ので、制限を弱めて描画するより、描画しない方を選ぶ。
     - CLI の gate は、Linux では `/proc/self/exe` である。spawn された子（exec 前の texrun 自身）の中で解決されるので、実行中に binary が削除・置き換えされても（package の更新など）、いま動いている texrun と同じ image が gate になる。host で起動する子に限って成り立つ（将来の container launcher、#26 では使わない）。macOS では `current_exe()` を使い、その path が使えない場合は上記のとおり preview を skip して notice を出す。
+    - `/proc` が mount されていない Linux（一部の sandbox や chroot）では、`/proc/self/exe` の確認が常に失敗するので、**CLI の preview は常に skip になる**（`resource_limits` の notice）。fail-closed なので正しい挙動である。compile は rc の stdin gate（`prlimit`）で limit を掛けて続ける（上記）。
     - library として gate を指定せずに `Previewer` を使った場合は、`Immediate` になる。
   - library として使う場合、gate の実行ファイルは呼び出し側が明示する（`ExecGate::new`。自分の binary の隠しサブコマンドで `texrun_process::run_gate` を呼ぶか、`texrun-process` の `texrun-exec-gate` binary を使う）。環境変数や `PATH` からは探さない。
-  - latexmk は従来どおり rc の stdin gate（上記。Linux の `prlimit`）を使う。rc の gate は latexmk がファイルを書く前・子プロセスを起動する前に limit を設定する点で exec gate と同じ保証である。macOS で latexmk に `RLIMIT_FSIZE` を exec gate で設定することは、engine 側に gate の path を渡す API が要るので別途扱う。
+  - latexmk も同じ exec gate で起動する（#25、上記の「latexmk の rlimit の設定方法」）。engine には `LatexmkConfig::with_exec_gate` で gate を渡す。
 - preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。
   - scratch dir（`.texrun-preview-*`、mode 0700）とその下の `home/`・`work/` は、output root の fd から `mkdirat` で作り、`openat(O_NOFOLLOW)` で開く。後片付けも、開いた fd から `unlinkat` で行い、symlink は辿らない。
   - tool の cwd は、開いた `work/` の fd を使う（Linux では `/proc/self/fd` 経由で、子プロセスがその fd 自体に `chdir` する）。`/proc` が無い環境（macOS）では、path が同じ directory（dev / inode）を指すことを確認してから path で起動する。この確認と `chdir` の間は atomic ではない。
@@ -367,13 +380,15 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
   - **leader を reap する前に `killpg` する。** leader の終了は `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` で検知し、reap しない。leader の zombie が PID と PGID を確保しているので、`killpg` が無関係な process group に届くことは無い。
   - `killpg` の後で leader を reap する。timeout / cancel / 上限超過の場合も同じ順序で行う。
   - 途中で error や panic が起きた場合も、guard（`Drop`）が同じ順序で kill と reap を行う。
+- run が cgroup を持つ場合（§3.10）は、`killpg` のたびに `cgroup.kill` にも書く。process group から抜けたプロセス（新しい session を作った子孫など）も、これで止まる。leader の reap の後、cgroup が空になるのを最大 2 秒待ち、event を読んでから削除する。
 - cancel、timeout / deadline、出力サイズ（呼び出し側の check hook）は、同じ poll ループで確認する（#20 からの申し送りどおり）。
   - poll 間隔は全 program 共通で 10 ms（`texrun_process::POLL_INTERVAL`）。`waitid` は軽く、preview は短い tool を最大数百回起動するので、短い方に揃えた。
   - 重い check は、呼び出し側が間隔を指定する（latexmk の output dir の集計は 500 ms ごと、preview の画像 1 枚の `fstatat` は毎回）。
 - stdout / stderr の reader thread は、process group を kill した後に最大 500 ms（`texrun_process::READER_GRACE`）だけ待つ。group から抜けたプロセスが pipe を開いたままでも、compile や preview は終わる（それまでに読めた分を返す）。全ての書き手が kill された後の pipe はすぐ EOF になるので、通常は待たない。
 - `EINTR` は `waitid` と pipe の read で retry する。
-- 将来の拡張（#25 の CPU / プロセス数 / cgroup、#26 の container runtime）は、`texrun_process::Launcher`（起動方法、spawn 直後・kill 時・reap 後の hook。どれも leader の PID を受け取る）と `Resource`（`RLIMIT_CPU` / `RLIMIT_NPROC` を含む）を拡張して行う。hook の形は #25 / #26 で見直す。
-  - `StartMode::Immediate` と組み合わせた場合、spawn 直後の hook（cgroup への attach など）より前に起動された子孫は、その対象から漏れる。全ての子孫を含めるには、stdin gate か exec gate（§3.2）と組み合わせる。どちらも hook の間は子が合図を待っている。
+- 将来の拡張（#26 の container runtime）は、`texrun_process::Launcher`（起動方法、spawn 直後・kill 時・reap 後の hook。どれも leader の PID を受け取る）を拡張して行う。hook の形は #26 で見直す。
+  - #25 の cgroup は `Launcher` にせず、supervisor 自身が扱う（`Spec::cgroup`）。cgroup の kill は全ての group kill と一緒に行う必要があり、cgroup の event（OOM kill など）は結果（`Finished::cgroup`）に載せる必要があるためである。`Launcher::apply_rlimits() == false` の launcher（container runtime が limit を扱う場合）では、cgroup も使わない。
+  - `StartMode::Immediate` と組み合わせた場合、spawn 直後の hook と cgroup への移動より前に起動された子孫は、その対象から漏れる。全ての子孫を含めるには、stdin gate か exec gate（§3.2）と組み合わせる。どちらも hook と移動の間は子が合図を待っている。
 - Linux 以外では `prlimit` が無いので、exec gate を使わない場合、rlimit は既定では適用せずに実行し、結果（`Finished::rlimits_applied`）に記録する。呼び出し側は `Spec::require_rlimits` で、適用できない場合に実行せず `RunError::Unsupported` にすることを選べる（latexmk の stdin gate はこれを指定する）。
 - stdin gate の合図は poll ループの前に同期的に書くので、長さを 512 byte（POSIX の最小 `PIPE_BUF`）までに制限する。
 
@@ -418,6 +433,97 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
   - `.bib` / `.bst` の file は、`.blg` が database / style として名前を挙げ、entrypoint のディレクトリ（latexmk が BibTeX の `BIBINPUTS` / `BSTINPUTS` の先頭に置く）に workspace 内の通常ファイルとしてあるときだけ付ける。`.aux` 内の位置や installed な style には付けない
 - 既定では `SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE` を設定しないので、PDF の日時は compile した時刻になる。再現可能なビルドを求められた場合に限り、CLI の option（#6）で `SOURCE_DATE_EPOCH=<値>` と `FORCE_SOURCE_DATE=1` を env allowlist に加える。これで、PDF の日時が固定されることを確認した。
 - banner と log 内のパスは、MVP では抑制しない。生成物を第三者と共有する場合は、利用者の判断に委ねる。
+
+### 3.10 CPU・memory・プロセス数の上限（#25）
+
+engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview tool（mutool / pdfinfo / pdftoppm）に、次の上限を掛ける。
+層は 2 つある。プロセスごとの rlimit は常に掛け、process tree 全体の cgroup は、Linux で委譲された cgroup が使える場合だけ重ねる。
+
+| 対象 | 既定値 | 方法 | 範囲 |
+| --- | --- | --- | --- |
+| CPU 時間（engine の各プロセス） | soft = compile の timeout + **10 s**（既定 70 s）、hard = soft + 5 s | `RLIMIT_CPU` | プロセスごと。Linux・macOS |
+| CPU 時間（preview tool の各プロセス） | soft = preview の timeout + **10 s**（既定 40 s）、hard = soft + 5 s | `RLIMIT_CPU` | 同上 |
+| address space（engine の各プロセス） | **4 GiB** | `RLIMIT_AS` | プロセスごと。Linux のみ（macOS は §3.2 のとおり設定できない） |
+| address space（preview tool の各プロセス） | 2 GiB（#8 のまま） | `RLIMIT_AS` | 同上 |
+| memory（engine 全体） | **4 GiB**（page cache を含む。swap 0） | cgroup `memory.max`、`memory.swap.max = 0`、`memory.oom.group = 1` | latexmk と全子孫の合計。Linux で cgroup が使える場合 |
+| memory（preview tool 1 回） | **2 GiB** | 同上 | tool 1 回のプロセス全体。同上 |
+| プロセス数 + thread 数 | engine **64**、preview tool **32** | cgroup `pids.max` | 同上 |
+| CPU の同時使用 | **2 CPU** | cgroup `cpu.max`（`200000 100000`） | 同上 |
+| プロセス数（UID 単位） | **使わない** | （`RLIMIT_NPROC`） | — |
+
+値は `texrun_texlive::Limits`（engine）と `texrun-preview` の定数で、CLI からは変えられない（`--timeout` を伸ばすと CPU 時間の上限も伸びる）。
+
+**既定値の根拠（実測）。** 開発用コンテナ（§6 と同じ image、arm64、14 CPU）で、次の文書と tool を cgroup の中で動かし、`memory.peak` / `pids.peak` / `cpu.stat` を読んだ。`RLIMIT_AS` は `ulimit -v` で値を変えて成否を見た。
+
+| 対象 | 結果 |
+| --- | --- |
+| 417 ページの文書（40 章 × 4 節 × 7 段落、数式 1,120 個、図 120 個（4724×3543 の PNG、JPEG、PDF）、目次・図目次・相互参照・hyperref・bibtex・makeindex）の latexmk 全体 | wall 3.3 s、CPU 3.3 s、memory.peak 47 MiB、pids.peak 10 |
+| 同じ文書の pdflatex 1 pass | CPU 0.66 s、memory.peak 24 MiB。`RLIMIT_AS` 128 MiB で成功、64 MiB で失敗 |
+| 7874×5906 の RGBA PNG（pdfTeX が展開する）を 2 回含む文書の pdflatex | memory.peak 68 MiB。`RLIMIT_AS` 256 MiB で成功、128 MiB で失敗 |
+| 15000×11251 の RGBA PNG を含む文書の pdflatex | `RLIMIT_AS` 256 MiB で `fatal: memory exhausted (xmalloc of 168765000 bytes)`、512 MiB で成功。pdfTeX は alpha の平面（幅 × 高さ byte）を一度に確保するので、必要な address space は画素数に比例する |
+| 1 ページの文書 | pdflatex は `RLIMIT_AS` 96 MiB 以下では起動しない（`texmf.cnf` の配列を最初に確保するため）。latexmk（perl）は 32 MiB で動いた |
+| bibtex / makeindex | memory.peak 4 MiB / 1 MiB、CPU 10 ms 未満 |
+| mutool draw（150 dpi、20 ページ）/ pdftoppm（同） | CPU 0.46 s / 1.76 s、memory.peak 30 MiB / 15 MiB。300 dpi でも `RLIMIT_AS` 256 MiB で成功 |
+
+- address space と memory の 4 GiB は、実測の最大（pdflatex の `RLIMIT_AS` 256 MiB、memory.peak 68 MiB）に対して 16 倍以上の余裕がある。画素数で言えば、alpha 付きの画像は約 40 億画素（約 65000×65000）まで入る。大きな画像を含む文書でも誤爆しない値として、2 GiB（preview tool）より大きくした。
+- `pids.max` の 64 は、実測の 10 に対して十分に大きい。pids は thread も数える。
+- `cpu.max` の 2 CPU は、latexmk が pdflatex などを順に（同時には 1 つずつ）起動するので、通常の compile を遅くしない。複数のプロセスや thread で CPU を使い続ける場合に、host の CPU を占有させない。
+- **CPU 時間は timeout から決める。** `RLIMIT_CPU` はプロセスごとの CPU 時間なので、single thread のプロセスは wall-clock 以上の CPU 時間を使えない。soft を timeout + 10 s にすると、timeout より前に通常の文書で当たることはない（上の 417 ページの文書は 1 pass 0.66 s）。この上限の役割は、(1) 複数 thread で CPU を使うプロセス、(2) process group を抜けて texrun の kill から逃れたプロセス（cgroup が無い環境）が CPU を使い続けられる時間を抑えることである。
+- **soft と hard を分ける**（#44 の nit 5 の見送り分をここで決めた）。Linux は soft と hard が等しいと、`SIGXCPU` を送らずにすぐ `SIGKILL` する。`SIGXCPU` なら texrun が原因を判定できるので、soft で `SIGXCPU` を受け、`SIGXCPU` を無視するプロセスは hard（5 s 後）の `SIGKILL` で止める。§3.2 のとおり、soft は texrun 自身の soft limit も超えない。
+- **`RLIMIT_NPROC` は使わない。** 実 UID ごとに、host 上のそのユーザーの全プロセスを数えるためである。開発機（macOS）では、そのユーザーのプロセスが 1,241 個あった。上限は「その時点の数 + 余裕」としか決められず、ブラウザなど他のアプリがプロセスを増やすと engine の fork が失敗する。root には効かない（dev コンテナは root で動く）。代わりに、cgroup の `pids.max` で process tree 単位に数える。cgroup が無い環境では、プロセス数は §2 のとおり OS では制限しない。`texrun_process::Resource::Processes` は library の利用者向けに残す。
+
+**latexmk の起動（exec gate への統一）。** CLI は latexmk も preview tool と同じ exec gate（`texrun __exec-gate`）で起動する（§3.2）。これで macOS でも latexmk とその子孫に `RLIMIT_FSIZE` / `RLIMIT_CPU` / `RLIMIT_CORE` が最初から掛かる。exec gate が使えない場合の Linux の fallback として、rc の stdin gate を残す（§3.2）。engine には `LatexmkConfig::with_exec_gate(ExecGate)` で gate を渡す。library の利用者は、自分の binary の隠しサブコマンドで `texrun_process::run_gate` を呼ぶか、`texrun-process` の `texrun-exec-gate` binary を指定する（§3.2 の preview と同じ）。
+
+**cgroup（Linux、cgroup v2）。**
+
+- 使う cgroup は `Cgroups::detect` で探す。次の 2 か所だけを、この順に見る。
+  1. **texrun 自身の cgroup。** texrun に明示的に委譲されていて（例: `systemd-run --user --scope -p Delegate=yes texrun compile ...`）、ほかのプロセスがいない場合に使う。委譲されていることは、systemd の委譲の印（xattr の `trusted.delegate` か `user.delegate` が `1`。systemd 251 以降が `Delegate=yes` の cgroup に付ける）で判断する。次のものは委譲の証拠にしない。
+     - 書き込めること: root はどの cgroup にも書き込めるので、systemd が唯一の書き手として管理する cgroup（`Delegate=` の無い service など）を変更してしまう。
+     - 所有者が texrun の（root でない）ユーザーであること: `user@<uid>.service` の下の cgroup（端末の app scope など）は全てそのユーザーの所有だが、`systemd --user` が管理しており、それ自身がさらに委譲した cgroup にしか印が付かない。
+
+     印の無い古い systemd などで使わせたい場合は、library の `Cgroups::at(dir)` で明示する。
+
+     cgroup v2 は、プロセスのいない cgroup からしか子 cgroup に controller を渡せない。そのため texrun は、まず自分を leaf の子 cgroup（`texrun-<pid>.main`）に移し、それから `memory` / `pids` / `cpu` を有効にする（systemd が委譲先に勧めている方法）。leaf は texrun の終了後に空のまま残り、委譲元（systemd の scope など）が消すときに一緒に消える。
+  2. **cgroup namespace の root。** host の root cgroup ではなく（container の中）、cgroup v2 が `nsdelegate` 付きで mount されていて（kernel が namespace を委譲の境界として扱う。container の runtime が container に渡した cgroup である）、書き込めて、root 自身にプロセスがいない場合に使う（例: container のプロセスを leaf に移した場合。`docker/dev/with-cgroup.sh`）。
+  
+  これより上の、単に書き込めるだけの cgroup（`systemd --user` の slice など）は使わない。ほかの manager が管理しているためである。明示的に使わせたい cgroup は、library の `Cgroups::at(dir)` で指定する（委譲の判断は呼び出し側の責任）。
+
+  どちらの場合も、`cgroup.kill`（Linux 5.14 以降）があることを、自分を移す前に確かめる。`memory` と `pids` の controller を有効にし（`cpu` は別に試し、有効にできなければ `cpu.max` を使わない）、上限を持つ試験用の cgroup を作って消せることを確かめてから使う。途中で失敗した場合は、有効にした controller と自分の移動を元に戻す。
+- texrun が強制終了された（`SIGKILL` など）場合、その run の cgroup が残る。中のプロセスが終わった後も、空のディレクトリは残る。`Cgroups::detect` は、親の直下にある `texrun-<pid>.*` のうち、その pid のプロセスがもう無いものを `rmdir` する。`rmdir` は空の cgroup にしか成功しないので、プロセスのいる cgroup は消さない（kill もしない）。
+- run（latexmk 1 回、preview tool 1 回）ごとに子 cgroup `texrun-<pid>.<n>` を作って上限を書く。supervisor は spawn の直後、子が gate で合図を待っている間に、子をこの cgroup に移す（exec gate でも rc の stdin gate でも同じ）。そのため、全ての子孫が最初から cgroup の中にいる。kill のたびに `cgroup.kill` にも書き（§3.6）、reap の後に `memory.events` の `oom_kill` と `pids.events` の `max` を読んでから cgroup を消す。
+- gate を使わない preview（library で `StartMode::Immediate`）では、移動より前に起動された子孫が cgroup から漏れる（§3.6）。CLI では起きない。
+- **使えない場合の扱い（fail-open / fail-closed）は CLI の `--cgroup` で選ぶ。**
+  - `auto`（既定、fail-open）: 使えれば使う。使えなければ rlimit だけで compile し、結果の `resource_limits` に記録する（`"cgroup": false`、`notes` に理由）。
+  - `required`（fail-closed）: 使えなければ、project をコピーする前に exit 3（`error.stage = "setup"`、`kind = "unsupported"`）で終わる。途中で使えなくなった場合（run の cgroup を作れない、移せない）も、engine は latexmk を動かさずに `EngineError::Unsupported` / I/O error を返す。preview は tool を動かさずに skip し、`resource_limits` の notice を出す。
+  - `off`: 使わない。
+  - 既定を fail-open にした理由: 委譲された cgroup は、ほとんどの環境に無い（端末の session の scope は root の所有、Docker の既定では cgroup の mount が read-only、GitHub Actions の runner のユーザーにも委譲されていない、macOS には無い）。fail-closed を既定にすると、texrun がほとんどの環境で動かなくなる。rlimit の層は、CLI では常に掛かる（gate は必須、§3.2）。
+- library として使う場合は、`LatexmkConfig::with_cgroups` / `Previewer::with_cgroups` に `Cgroups::detect()`（または `Cgroups::at(dir)`）を渡す。`Cgroups::with_required(true)` が `--cgroup required` に当たる。
+- 確認した環境: dev コンテナ（`docker compose run`、OrbStack）は `/sys/fs/cgroup` が read-only の mount で、cgroup は使えない（`auto` で rlimit だけになる）。`--privileged` のコンテナで `docker/dev/with-cgroup.sh` を使うと、namespace の root が使える。GitHub Actions の `test (linux)`（runner 上で直接実行）では使えない。cgroup の test はこれらの環境では skip し、CI の `integration` job で privileged のコンテナを使って実行する（[development.md](development.md#cgroup-test)）。
+
+**上限に達したときの表現。** §3.2 の出力上限と揃える。
+
+- `CompileOutcome::Failed` にし、`severity = error`、`kind = resource_limit` の diagnostic を付ける。message は「resource limit exceeded: ...」で、どの上限かを書く。専用の outcome は追加しない。消費側は、失敗の理由を diagnostic の kind で分けられるためである。
+- timeout や cancel で止まった場合は、`TimedOut` / `Cancelled` のままにする。その前に上限に達していた場合は、同じ diagnostic も付ける。たとえば perl は `pids.max` で拒否された `fork` を 5 秒ごとに再試行するので、プロセス数の上限は timeout で終わることが多い。
+- **成功した compile は `Failed` にしない。** プロセス数の上限は、一時的に達しても、perl の再試行で compile が最後まで進み、PDF ができることがある。その場合は `Succeeded` のままにし、`resource_limit` の diagnostic を warning で付ける。memory（`memory.oom.group` で全体が止まる）と CPU 時間（latexmk が 128 + signal で終わる）は、成功した compile では起きない。
+- 判定の方法:
+
+  | 上限 | 判定 |
+  | --- | --- |
+  | CPU 時間 | latexmk、または latexmk が起動したツールが `SIGXCPU` で終わった。texrun 管理 rc の `texrun_run` は、ツールが `SIGXCPU` / `SIGXFSZ` で終わったら latexmk を終了コード 128 + signal ですぐに終わらせる。latexmk 自身の終了コードは 128 未満で、文書から latexmk の終了コードは決められない |
+  | memory（cgroup） | `memory.events` の `oom_kill` が 1 以上 |
+  | address space（`RLIMIT_AS`） | 失敗した compile で、確保に失敗したプログラム自身のメッセージが、stderr に**行全体として**ある: kpathsea の `fatal: memory exhausted (xmalloc of <n> bytes).`、perl の `Out of memory!`（またはその行頭の形）。さらに、同じ行が main の `.log` に無いこと。これらのメッセージは stderr にだけ出る一方、文書が latexmk や TeX に出力させる文字列（ラベル名など）は行頭に来ないか（latexmk は `Latexmk:` の後やインデントの後に出す）、log にも残る。そのため、文書からこの判定は成立させられない |
+  | プロセス数（cgroup） | `pids.events` の `max` が 1 以上 |
+  | 1 ファイルのサイズ | §3.2（`SIGXFSZ` と、終了後の集計） |
+
+- CLI: exit code は 1（compile の失敗）。JSON には diagnostic と、どの層が効いていたかの `resource_limits`（`{"rlimits": true, "cgroup": false, "notes": [...]}`）が入る。人間向けの出力は、diagnostic を error として表示し、最後の行を「Failed to compile ... : a resource limit was reached」にする。
+- preview tool が上限に達した場合は、`limit_exceeded` の notice（warning）を出して preview をそこで止める。compile の結果と exit code は変わらない（§3.2）。
+
+**テスト。** 上限を超える fixture は、防御の確認に必要な最小限にとどめる。
+
+- `crates/texrun-process/tests/limits.rs`: CPU を使い続ける `sh` のループが `SIGXCPU` で止まる、`cpu.max` で throttle される（`nr_throttled`）、perl の大きな確保が `RLIMIT_AS`（Linux）と cgroup の `memory.max` で止まる、`sleep` を 40 個起動する script が `pids.max` で止まり、起動されたプロセスが残らない、新しい session に移ったプロセスも `cgroup.kill` で止まる（対照: cgroup が無いと残る）、run の cgroup が消える、soft と hard が別々に渡る、core を無効にしない CPU / file size の limit を拒否する。
+- `crates/texrun-texlive/tests/limits.rs`: 既存の `timeout` fixture（無限ループ）が CPU 時間 2 s で `resource_limit` になる（macOS の library 利用で gate が無い場合は timeout になる）、`minimal` が小さい `RLIMIT_AS` / `memory.max` / `pids.max` で止まる、200 ページ超の文書（test の中で生成）が既定の上限に当たらない。
+- `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、委譲の印のある cgroup では自分を leaf に移し、印の無い cgroup には、root で書き込める場合も、texrun のユーザーの所有の場合も、何もしない（controller も有効にしない）こと、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
+- unit test: 委譲の印の判定（書き込めることや所有者では判定しない）、`nsdelegate` の読み取り、`RLIMIT_AS` のメッセージの行全体での照合（行の一部や log にもある行では成立しない）、一時的なプロセス数の上限で成功した compile が warning になること、engine の gate の分岐（exec gate、Linux の stdin gate、macOS の必須の gate）。
 
 ## 4. 将来の sandbox backend（#26）
 
@@ -504,4 +610,8 @@ TeX Live の版や OS が違う場合は、確認をやり直すこと。
 | ログを出し続けるループ | 5 秒でログが約 160 MB、latexmk の stdout も約 160 MB になった |
 | `RLIMIT_FSIZE` 20 MiB で同上 | ログが 20 MiB で止まり、latexmk は失敗終了した |
 | 空白 20,000 ページ | 約 9 秒で成功した。PDF は 3.5 MB、ログは 170 KB |
+| 大きな文書・画像の CPU 時間と memory（#25） | §3.10 の表。417 ページの文書の latexmk 全体で memory.peak 47 MiB、pids.peak 10 |
+| `RLIMIT_CPU` の soft = hard（Linux） | `SIGXCPU` が来ずに `SIGKILL` で終わった。soft < hard では soft で `SIGXCPU` になった（§3.10） |
+| `pids.max` を 1 にした cgroup での latexmk | perl の `system` が `fork` の失敗を再試行し続け、timeout で止まった |
+| cgroup の mount | `docker compose run` のコンテナでは read-only（`0::/`）。`--privileged` では書き込めた |
 | 生成物の host 情報 | `.fls` に workspace の絶対パスが入った。PDF には作成日時と pdfTeX / TeX Live の banner が入った。`SOURCE_DATE_EPOCH=0` と `FORCE_SOURCE_DATE=1` で、日時が固定された |

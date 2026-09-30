@@ -19,12 +19,15 @@ pub const DEFAULT_OUTPUT_DIR_NAME: &str = "texrun-out";
 const EXIT_CODES_HELP: &str = "\
 Exit codes:
   0    the document compiled and a PDF was produced
-  1    the document failed to compile (see the diagnostics)
+  1    the document failed to compile (see the diagnostics), including when
+       a resource limit stopped it (output size, CPU time, memory,
+       processes: diagnostics of kind resource_limit)
   2    usage or input error: invalid arguments, entrypoint not found or
        outside --root, project rejected (symlink leaving the root, input
        limits exceeded, unsafe project root)
   3    texrun runtime error: latexmk missing or unusable, I/O errors,
-       artifacts could not be copied to the output directory
+       artifacts could not be copied to the output directory, --cgroup
+       required without a usable cgroup
   4    the compile timed out (see --timeout)
   130  interrupted by SIGINT (Ctrl-C); 143 for SIGTERM, 129 for SIGHUP.
        A signal counts even if it arrives after the compile (e.g. while
@@ -119,6 +122,16 @@ pub struct CompileArgs {
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(i64).range(0..))]
     pub source_date_epoch: Option<i64>,
 
+    #[allow(clippy::doc_markdown, reason = "the doc comment is the --help text")]
+    /// Run the engine and the preview tools in cgroups of their own, with
+    /// limits on their memory, processes and CPU use (Linux, cgroup v2):
+    /// auto uses a delegated cgroup if there is one (e.g. under
+    /// `systemd-run --user --scope -p Delegate=yes`) and otherwise relies on
+    /// the per-process limits alone (recorded in resource_limits in the
+    /// JSON); required fails (exit 3) instead; off never uses one.
+    #[arg(long, value_enum, value_name = "MODE", default_value = "auto")]
+    pub cgroup: CgroupMode,
+
     #[command(flatten)]
     pub preview: PreviewArgs,
 }
@@ -147,6 +160,14 @@ pub struct PreviewArgs {
     /// otherwise Poppler (pdftoppm)].
     #[arg(long, value_enum, value_name = "BACKEND")]
     pub preview_backend: Option<PreviewBackend>,
+}
+
+/// `--cgroup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CgroupMode {
+    Auto,
+    Required,
+    Off,
 }
 
 /// `--preview-backend`.
@@ -193,6 +214,7 @@ mod tests {
         assert_eq!(args.timeout, texrun_texlive::DEFAULT_TIMEOUT);
         assert!(!args.keep_workspace);
         assert_eq!(args.source_date_epoch, None);
+        assert_eq!(args.cgroup, CgroupMode::Auto);
         assert!(!args.preview.no_preview);
         assert_eq!(args.preview.pages, None);
     }
