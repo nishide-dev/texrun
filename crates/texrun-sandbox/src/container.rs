@@ -572,8 +572,10 @@ impl<'r> Container<'r> {
     }
 }
 
-impl Launcher for Container<'_> {
-    fn command(&self, spec: &Spec<'_>) -> Result<Command, RunError> {
+impl Container<'_> {
+    /// Creates the container for `spec` and checks its restrictions
+    /// (without starting it); returns its ID.
+    pub(crate) fn create(&self, spec: &Spec<'_>) -> Result<String, RunError> {
         let invalid = |e: SandboxError| RunError::InvalidSpec(e.to_string());
         let (user, root) = self.user();
         let args = self.create_args(spec, user).map_err(invalid)?;
@@ -644,7 +646,41 @@ impl Launcher for Container<'_> {
             self.remove();
             return Err(RunError::Unsupported(reason));
         }
+        Ok(id)
+    }
 
+    /// The ID of the created container.
+    pub(crate) fn id(&self) -> Option<String> {
+        self.lock().id.clone()
+    }
+
+    /// Whether the container was removed.
+    pub(crate) fn is_removed(&self) -> bool {
+        self.lock().removed
+    }
+
+    /// Reads the state of the container and removes it (see
+    /// [`Launcher::on_kill`]).
+    pub(crate) fn stop(&self) {
+        self.remove();
+    }
+
+    /// The runtime of the container.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        self.runtime
+    }
+
+    /// Whether the kernel's OOM killer has stopped a process of the running
+    /// container so far (`None` if it cannot be read).
+    pub(crate) fn oom_killed_now(&self) -> Option<bool> {
+        let id = self.id()?;
+        self.inspect(&id).map(|o| o.oom_killed)
+    }
+}
+
+impl Launcher for Container<'_> {
+    fn command(&self, spec: &Spec<'_>) -> Result<Command, RunError> {
+        let id = self.create(spec)?;
         let mut cmd = Command::new(self.runtime.program());
         cmd.args(["start", "--attach", "--"])
             .arg(&id)
@@ -848,7 +884,7 @@ fn chown_tree(dir: &Path, user: (u32, u32)) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use texrun_process::{EnvAllowlist, Rlimits};
 
@@ -985,7 +1021,7 @@ mod tests {
     }
 
     /// A `HostConfig` as Docker records it for [`expected`].
-    fn host_config(memory: i64) -> String {
+    pub(crate) fn host_config(memory: i64) -> String {
         serde_json::json!({
             "Memory": memory,
             "MemorySwap": 4096,
@@ -1074,7 +1110,7 @@ mod tests {
 
     /// A fake `docker` that answers like a daemon which accepted `create`
     /// but recorded `hostconfig.json`, and logs its calls.
-    fn fake_runtime(dir: &Path, hostconfig: &str) -> Runtime {
+    pub(crate) fn fake_runtime(dir: &Path, hostconfig: &str) -> Runtime {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("docker");
         std::fs::write(dir.join("hostconfig.json"), hostconfig).unwrap();

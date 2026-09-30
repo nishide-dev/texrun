@@ -68,6 +68,7 @@ compile_error!("texrun-sandbox supports Unix hosts only");
 mod container;
 mod error;
 mod runtime;
+mod session;
 
 pub use container::{
     Container, ContainerLimits, ContainerOutcome, ContainerSpec, ContainerUser, Mount,
@@ -75,6 +76,7 @@ pub use container::{
 };
 pub use error::SandboxError;
 pub use runtime::{RUNTIME_ENV, Runtime, RuntimeKind};
+pub use session::Session;
 
 /// Image used when none is configured. Built from `docker/engine/Dockerfile`
 /// (`docker build -t texrun-engine:latest docker/engine`).

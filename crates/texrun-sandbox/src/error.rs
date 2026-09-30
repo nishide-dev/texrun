@@ -8,6 +8,11 @@ pub enum SandboxError {
     /// not reachable, too old, or the image does not exist.
     #[error("{0}")]
     Unavailable(String),
+    /// The runtime created the container without a restriction that was
+    /// asked for (e.g. a limit its kernel does not support), so it was
+    /// removed without being started (fail closed).
+    #[error("{0}")]
+    Refused(String),
     /// The container cannot be set up as requested (e.g. a mount path with
     /// a character the runtime's option syntax cannot carry).
     #[error("{0}")]

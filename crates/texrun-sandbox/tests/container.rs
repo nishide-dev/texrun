@@ -20,6 +20,7 @@ use texrun_process::{
 };
 use texrun_sandbox::{
     Container, ContainerLimits, ContainerSpec, DEFAULT_IMAGE, LABEL, Mount, Runtime, SandboxError,
+    Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -364,4 +365,263 @@ fn a_missing_image_is_unavailable() {
     let runtime = require_sandbox!();
     let err = runtime.image_id("texrun-no-such-image:0").unwrap_err();
     assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
+}
+
+/// The `NetworkMode` the runtime records for the container `name`.
+fn network_mode(runtime: &Runtime, name: &str) -> String {
+    let out = Command::new(runtime.program())
+        .args([
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            "--",
+            name,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A perl script (perl is in the image for latexmk) that tries to reach
+/// public addresses over IPv4 and IPv6 (TCP, and a UDP `connect`) and to
+/// resolve a name, printing `<probe>=<error>` or `<probe>=connected`.
+const NETWORK_PROBE: &str = r#"
+use strict; use warnings;
+use Socket qw(:addrinfo AF_INET AF_INET6 SOCK_STREAM SOCK_DGRAM inet_pton pack_sockaddr_in pack_sockaddr_in6);
+my @probes = (
+  ["tcp4", AF_INET, SOCK_STREAM, pack_sockaddr_in(443, inet_pton(AF_INET, "1.1.1.1"))],
+  ["udp4", AF_INET, SOCK_DGRAM, pack_sockaddr_in(53, inet_pton(AF_INET, "8.8.8.8"))],
+  ["tcp6", AF_INET6, SOCK_STREAM, pack_sockaddr_in6(443, inet_pton(AF_INET6, "2606:4700:4700::1111"))],
+);
+for my $p (@probes) {
+  my ($name, $family, $type, $addr) = @$p;
+  my $s;
+  if (!socket($s, $family, $type, 0)) { print "$name=socket: $!\n"; next; }
+  if (connect($s, $addr)) { print "$name=connected\n"; } else { print "$name=$!\n"; }
+}
+my ($err) = getaddrinfo("example.com", "443", { socktype => SOCK_STREAM });
+print "dns=", ($err ? "failed" : "resolved"), "\n";
+"#;
+
+fn perl(script: &str) -> Spec<'static> {
+    Spec::new("/usr/bin/perl", Cwd::Path(Path::new("/")))
+        .with_args(["-e", script])
+        .with_env(EnvAllowlist::new().with("PATH", "/usr/bin:/bin"))
+}
+
+/// No route out of the container: every connection fails at once with
+/// "Network is unreachable" (there is no interface but loopback, so this
+/// is neither a firewall nor a timeout), and names do not resolve (#24).
+fn assert_no_network(text: &str) {
+    let f = fields(text);
+    for probe in ["tcp4", "udp4", "tcp6"] {
+        let result = f.get(probe).map_or("", String::as_str);
+        assert!(
+            result == "Network is unreachable" || result.starts_with("socket: "),
+            "{probe}: {text}"
+        );
+    }
+    assert_eq!(f.get("dns").map(String::as_str), Some("failed"), "{text}");
+}
+
+#[test]
+fn a_container_cannot_reach_the_network() {
+    let runtime = require_sandbox!();
+    let container = Container::new(runtime, ContainerSpec::new(image(), limits()));
+    let finished = run(
+        &container,
+        &perl(NETWORK_PROBE),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    let text = stdout(&finished);
+    assert!(finished.status.success(), "{finished:?}\n{text}");
+    assert_no_network(&text);
+}
+
+fn exec(
+    session: &Session<'_>,
+    spec: &Spec<'_>,
+    watch: Watch<'_>,
+) -> Result<Finished, texrun_process::RunError> {
+    run_with(session, spec, watch)
+}
+
+fn session_ulimits() -> Rlimits {
+    Rlimits::new()
+        .with(Resource::FileSize, 1_000_000)
+        .with(Resource::Core, 0)
+        .with_soft_hard(Resource::Cpu, 30, 35)
+}
+
+fn start_session(runtime: &Runtime, spec: ContainerSpec, lifetime: Duration) -> Session<'_> {
+    Session::start(runtime, spec, lifetime, session_ulimits()).unwrap()
+}
+
+#[test]
+fn a_session_runs_programs_one_after_another_in_one_container() {
+    let runtime = require_sandbox!();
+    let dir = tempdir();
+    let (input, work) = (dir.path().join("in"), dir.path().join("work"));
+    std::fs::create_dir(&input).unwrap();
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(input.join("input.txt"), "input\n").unwrap();
+    let spec = ContainerSpec::new(image(), limits())
+        .with_mount(Mount::read_only(canonical(&input), "/texrun/in"))
+        .with_mount(Mount::writable(canonical(&work), "/texrun/work"));
+    let session = start_session(runtime, spec, Duration::from_secs(120));
+    let name = session.name().to_owned();
+    assert_eq!(network_mode(runtime, &name), "none");
+
+    let script = r#"
+echo "uid=$(id -u)"
+sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
+echo "net=$(ls /sys/class/net | tr '\n' ' ')"
+echo "input=$(cat /texrun/in/input.txt)"
+if touch /texrun/in/probe 2>/dev/null; then echo in=writable; else echo in=read-only; fi
+if touch probe 2>/dev/null; then echo work=writable; else echo work=read-only; fi
+if touch /usr/probe 2>/dev/null; then echo root_fs=writable; else echo root_fs=read-only; fi
+echo "env=$(env | cut -d= -f1 | sort | tr '\n' ' ')"
+echo "pwd=$(pwd)"
+echo "pids_max=$(cat /sys/fs/cgroup/pids.max)"
+grep -E '^Max (cpu time|file size|core file size|address space)' /proc/self/limits
+"#;
+    let spec = Spec::new("/bin/sh", Cwd::Path(Path::new("/texrun/work")))
+        .with_args(["-c", script])
+        .with_env(
+            EnvAllowlist::new()
+                .with("PATH", "/usr/bin:/bin")
+                .with("HOME", "/texrun/work"),
+        )
+        .with_rlimits(
+            Rlimits::new()
+                .with(Resource::FileSize, 1000)
+                .with(Resource::Core, 0)
+                .with_soft_hard(Resource::Cpu, 20, 25)
+                .with(Resource::AddressSpace, 1 << 30),
+        );
+    let watch = || Watch::new().with_timeout(Duration::from_secs(60));
+    let finished = exec(&session, &spec, watch()).unwrap();
+    let text = stdout(&finished);
+    assert!(finished.status.success(), "{finished:?}\n{text}");
+    let f = fields(&text);
+    let get = |k: &str| f.get(k).map_or("", String::as_str);
+    assert_eq!(get("uid"), rustix_uid(), "{text}");
+    assert_eq!(get("capeff"), "0000000000000000", "{text}");
+    assert_eq!(get("nonewprivs"), "1", "{text}");
+    assert_eq!(get("net"), "lo", "{text}");
+    assert_eq!(get("input"), "input", "{text}");
+    assert_eq!(get("in"), "read-only", "{text}");
+    assert_eq!(get("work"), "writable", "{text}");
+    assert_eq!(get("root_fs"), "read-only", "{text}");
+    // The image's `PATH` and the runtime's `HOSTNAME`, besides the spec's.
+    assert_eq!(get("env"), "HOME HOSTNAME PATH PWD", "{text}");
+    assert_eq!(get("pwd"), "/texrun/work", "{text}");
+    assert_eq!(get("pids_max"), "32", "{text}");
+    // Set by `prlimit` for this run, below the session's limits.
+    let limit = |name: &str| {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name}: {text}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(limit("Max cpu time").contains("20 25"), "{text}");
+    assert!(limit("Max file size").contains("1000 1000"), "{text}");
+    assert!(limit("Max core file size").contains("0 0"), "{text}");
+    assert!(
+        limit("Max address space").contains(&format!("{0} {0}", 1u64 << 30)),
+        "{text}"
+    );
+    assert!(work.join("probe").exists());
+    assert!(!input.join("probe").exists());
+
+    // The next run is in the same container, which is still up.
+    let finished = exec(&session, &perl(NETWORK_PROBE), watch()).unwrap();
+    assert!(finished.status.success(), "{finished:?}");
+    assert_no_network(&stdout(&finished));
+    assert!(!session.is_stopped());
+    assert_eq!(containers_named(runtime, &name).len(), 1);
+
+    // A limit above the session's hard limit fails the run.
+    let too_large = sh("true").with_rlimits(
+        Rlimits::new()
+            .with(Resource::FileSize, 2_000_000)
+            .with(Resource::Core, 0),
+    );
+    let finished = exec(&session, &too_large, watch()).unwrap();
+    assert!(!finished.status.success(), "{finished:?}");
+
+    drop(session);
+    assert!(containers_named(runtime, &name).is_empty());
+}
+
+#[test]
+fn a_killed_run_stops_the_session() {
+    let runtime = require_sandbox!();
+    let session = start_session(
+        runtime,
+        ContainerSpec::new(image(), limits()),
+        Duration::from_secs(120),
+    );
+    let name = session.name().to_owned();
+    let finished = exec(
+        &session,
+        &sh("sleep 120"),
+        Watch::new().with_timeout(Duration::from_secs(2)),
+    )
+    .unwrap();
+    assert_eq!(finished.stop, Some(Stop::TimedOut));
+    // The program in the container is gone with the container.
+    assert!(session.is_stopped());
+    assert!(containers_named(runtime, &name).is_empty());
+    assert!(exec(&session, &sh("true"), Watch::new()).is_err());
+}
+
+#[test]
+fn an_oom_kill_in_a_session_is_recorded() {
+    let runtime = require_sandbox!();
+    let limits = ContainerLimits::new(32 * 1024 * 1024, 32, 1);
+    let session = start_session(
+        runtime,
+        ContainerSpec::new(image(), limits),
+        Duration::from_secs(120),
+    );
+    assert_eq!(session.oom_killed(), Some(false));
+    let finished = exec(
+        &session,
+        &sh("x=$(head -c 134217728 /dev/zero | tr '\\0' a); echo ${#x}"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    )
+    .unwrap();
+    assert!(!finished.status.success(), "{finished:?}");
+    // Recorded asynchronously by the runtime.
+    let mut oom = session.oom_killed();
+    for _ in 0..20 {
+        if oom == Some(true) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        oom = session.oom_killed();
+    }
+    assert_eq!(oom, Some(true), "{finished:?}");
+}
+
+#[test]
+fn a_session_ends_by_itself_after_its_lifetime() {
+    let runtime = require_sandbox!();
+    let session = start_session(
+        runtime,
+        ContainerSpec::new(image(), limits()),
+        Duration::from_secs(2),
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let finished = exec(
+        &session,
+        &sh("echo still here"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    )
+    .unwrap();
+    assert!(!finished.status.success(), "{finished:?}");
 }
