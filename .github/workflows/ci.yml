@@ -118,15 +118,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # TeX Live tests are selected at run time (TEXRUN_REQUIRE_TEXLIVE), and
-      # this job does not pass `--ignored`: an `#[ignore]`d TeX test would
-      # silently never run here.
-      - name: Check that no TeX Live test is ignored
-        run: |
-          if git grep -niE '#\[ignore.*(tex ?live|latexmk|pdflatex)' -- '*.rs'; then
-            echo "::error::TeX Live tests must use require_texlive!() instead of #[ignore] (docs/development.md)"
-            exit 1
-          fi
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Layers are cached in the GitHub Actions cache, so the image is only
       # rebuilt when the Dockerfile (or its base image digest) changes. The
@@ -156,8 +147,14 @@ jobs:
         run: |
           docker run --rm "${IMAGE}" sh -c \
             'cargo --version && latexmk -v | head -n 2 && pdflatex --version | head -n 1 && mutool -v 2>&1 | head -n 1 && pdfinfo -v 2>&1 | head -n 1'
-      - name: Run tests (TeX Live required)
+      # TeX Live tests are selected at run time (TEXRUN_REQUIRE_TEXLIVE), and
+      # this job does not pass `--ignored`: an `#[ignore]`d test would
+      # silently never run here. So the job fails if any test binary reports
+      # an ignored test, whatever the reason given for it.
+      - name: Run tests (TeX Live required, nothing ignored)
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p "${RUNNER_TEMP}/cargo-registry"
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
@@ -167,7 +164,11 @@ jobs:
             -e TEXRUN_REQUIRE_TEXLIVE=1 \
             -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
             "${IMAGE}" \
-            cargo test --workspace --all-features --locked
+            cargo test --workspace --all-features --locked 2>&1 | tee "${RUNNER_TEMP}/integration.log"
+          if grep -E 'test result: .* [1-9][0-9]* ignored' "${RUNNER_TEMP}/integration.log"; then
+            echo "::error::Some tests are #[ignore]d and never run in CI; use require_texlive!() / run-time detection instead (docs/development.md)"
+            exit 1
+          fi
       - name: Save cargo cache
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -276,18 +276,31 @@ fn project_error(args: &CompileArgs, e: &WorkspaceError) -> ErrorInfo {
 
 fn output_error(output: &Path, e: OutputDirError) -> ErrorInfo {
     match e {
-        OutputDirError::Unsafe(at) => ErrorInfo::new(
+        OutputDirError::Symlink(at) => ErrorInfo::new(
             Stage::Output,
             kind::UNSAFE_OUTPUT_PATH,
             Category::Runtime,
             format!(
-                "refusing to use the output directory {}: {} is a symlink inside the project or \
-                 not a directory",
+                "refusing to use the output directory {}: {} is a symlink inside the project",
                 human::show(output),
                 human::show(&at)
             ),
         )
-        .with_hint("remove it, or pass --output with a directory outside the project"),
+        .with_hint(
+            "texrun does not follow symlinks inside the project to its output directory; \
+             remove the symlink, or pass --output with a directory outside the project",
+        ),
+        OutputDirError::NotDirectory(at) => ErrorInfo::new(
+            Stage::Output,
+            kind::UNSAFE_OUTPUT_PATH,
+            Category::Runtime,
+            format!(
+                "cannot use the output directory {}: {} exists and is not a directory",
+                human::show(output),
+                human::show(&at)
+            ),
+        )
+        .with_hint("pass --output with a directory path (it is created if missing)"),
         OutputDirError::Io(what, at, e) => ErrorInfo::new(
             Stage::Output,
             kind::IO,

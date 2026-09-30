@@ -112,7 +112,7 @@ docker compose down --volumes
 - skip したときは、test binary ごとに 1 回だけ stderr に `SKIPPED ... (set TEXRUN_REQUIRE_...=1 to fail instead)` と表示する。libtest の capture を通さずに書くので `cargo test` でそのまま見える。`cargo nextest run`（CI の `test (linux)` / `test (macos)`）では、`.config/nextest.toml` の設定で成功した test の出力も実行の最後に表示されるので、そこに `SKIPPED` 行が出る。nextest は test ごとに process を分けるため、この場合は binary ごとではなく test ごとに 1 行出る。nextest の集計の `skipped` は 0 のままである（test としては pass 扱い）。
 - `=1` 以外の値は未設定と同じ扱いになる。
 - CI の `integration` job は両方を `1` にしてコンテナ内で全 test を実行するので、tool が無いことで黙って成功することはない。
-- TeX Live / preview tool を使う test に `#[ignore]` は使わない。`integration` job は `--ignored` を付けないので、ignore された test は CI で一度も実行されない。これを防ぐため、job の最初の step で、TeX Live に言及する `#[ignore]` が repo 内に無いことを確認している。
+- TeX Live / preview tool を使う test に `#[ignore]` は使わない。`integration` job は `--ignored` を付けないので、ignore された test は CI で一度も実行されない。これを防ぐため、job は test の出力に ignored が 1 件でもあれば（`test result: ... N ignored` の N が 1 以上）失敗する。
 
 dev コンテナ内で TeX Live の test を含めて全件実行する（CI の `integration` job と同じ条件）:
 

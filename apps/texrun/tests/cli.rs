@@ -709,6 +709,19 @@ fn symlinked_output_directory_inside_the_project_is_refused() {
         stderr(&plain)
     );
 
+    // A regular file given as --output gets its own message.
+    env.file("proj/not-a-dir", "x");
+    let out = env.run(&["compile", "--json", "-o", "not-a-dir", "main.tex"]);
+    assert_eq!(code(&out), 3);
+    let doc = json(&out);
+    assert_eq!(doc["error"]["kind"], "unsafe_output_path");
+    let message = doc["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("exists and is not a directory"),
+        "{message}"
+    );
+    assert!(!message.contains("symlink"), "{message}");
+
     // A symlink outside the project, given explicitly, is the user's choice.
     std::os::unix::fs::symlink(env.path("elsewhere"), env.path("out-link")).unwrap();
     let link = env.path("out-link");

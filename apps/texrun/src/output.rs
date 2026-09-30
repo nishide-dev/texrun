@@ -20,8 +20,10 @@ use std::path::{Component, Path, PathBuf};
 /// Why the output directory cannot be used.
 #[derive(Debug)]
 pub enum OutputDirError {
-    /// A symlink inside the project root, or a non-directory, is in the way.
-    Unsafe(PathBuf),
+    /// A symlink inside the project root is in the way.
+    Symlink(PathBuf),
+    /// A file (or other non-directory) is in the way.
+    NotDirectory(PathBuf),
     /// An I/O error at `path`.
     Io(&'static str, PathBuf, io::Error),
 }
@@ -52,19 +54,19 @@ pub fn walk(
         };
         let next = current.join(name);
         match fs::symlink_metadata(&next) {
-            Ok(meta) if meta.is_dir() => current = next,
+            Ok(meta) if meta.is_dir() => current = real_dir(&current, next)?,
             Ok(meta) if meta.file_type().is_symlink() => {
                 if current.starts_with(project_root) {
-                    return Err(OutputDirError::Unsafe(next));
+                    return Err(OutputDirError::Symlink(next));
                 }
                 let target = fs::canonicalize(&next)
                     .map_err(|e| OutputDirError::Io("resolving", next.clone(), e))?;
                 if !target.is_dir() {
-                    return Err(OutputDirError::Unsafe(next));
+                    return Err(OutputDirError::NotDirectory(next));
                 }
                 current = target;
             }
-            Ok(_) => return Err(OutputDirError::Unsafe(next)),
+            Ok(_) => return Err(OutputDirError::NotDirectory(next)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if !create {
                     return Ok(None);
@@ -76,8 +78,11 @@ pub fn walk(
                     Err(e) => return Err(OutputDirError::Io("creating directory", next, e)),
                 }
                 match fs::symlink_metadata(&next) {
-                    Ok(meta) if meta.is_dir() => current = next,
-                    Ok(_) => return Err(OutputDirError::Unsafe(next)),
+                    Ok(meta) if meta.is_dir() => current = real_dir(&current, next)?,
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(OutputDirError::Symlink(next));
+                    }
+                    Ok(_) => return Err(OutputDirError::NotDirectory(next)),
                     Err(e) => return Err(OutputDirError::Io("inspecting", next, e)),
                 }
             }
@@ -85,6 +90,29 @@ pub fn walk(
         }
     }
     Ok(Some(current))
+}
+
+/// The canonical spelling of `next`, a directory just seen (not a symlink)
+/// in the directory `parent` (canonical).
+///
+/// The walk compares paths with the project root, which is canonical. On a
+/// case- or normalization-insensitive filesystem (default APFS) the path as
+/// given may be spelled differently from the stored names, so every
+/// component is replaced with its stored spelling. If `next` was replaced
+/// by a symlink in the meantime, its canonical path is somewhere else and
+/// it is refused.
+fn real_dir(parent: &Path, next: PathBuf) -> Result<PathBuf, OutputDirError> {
+    let real =
+        fs::canonicalize(&next).map_err(|e| OutputDirError::Io("resolving", next.clone(), e))?;
+    if real.parent() != Some(parent) {
+        return Err(OutputDirError::Symlink(next));
+    }
+    match fs::symlink_metadata(&real) {
+        Ok(meta) if meta.is_dir() => Ok(real),
+        Ok(meta) if meta.file_type().is_symlink() => Err(OutputDirError::Symlink(next)),
+        Ok(_) => Err(OutputDirError::NotDirectory(next)),
+        Err(e) => Err(OutputDirError::Io("inspecting", real, e)),
+    }
 }
 
 /// Whether `output` (canonical) is below `project_root` but not directly in
@@ -131,11 +159,11 @@ mod tests {
         for create in [false, true] {
             assert!(matches!(
                 walk(&root.join("src/texrun-out"), &root, create),
-                Err(OutputDirError::Unsafe(p)) if p == root.join("src/texrun-out")
+                Err(OutputDirError::Symlink(p)) if p == root.join("src/texrun-out")
             ));
             assert!(matches!(
                 walk(&root.join("src/texrun-out/deeper"), &root, create),
-                Err(OutputDirError::Unsafe(_))
+                Err(OutputDirError::Symlink(_))
             ));
         }
         assert!(
@@ -153,7 +181,7 @@ mod tests {
         fs::write(root.join("file"), "x").unwrap();
         assert!(matches!(
             walk(&root.join("file"), &root, true),
-            Err(OutputDirError::Unsafe(_))
+            Err(OutputDirError::NotDirectory(_))
         ));
     }
 
@@ -170,7 +198,7 @@ mod tests {
         symlink(base.join("elsewhere"), root.join("src/evil")).unwrap();
         assert!(matches!(
             walk(&base.join("into/evil"), &root, true),
-            Err(OutputDirError::Unsafe(_))
+            Err(OutputDirError::Symlink(_))
         ));
     }
 
@@ -182,6 +210,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(out, root.join("out"));
+    }
+
+    /// Default APFS matches names case- and normalization-insensitively; a
+    /// differently spelled path must still be recognized as inside the
+    /// project, so the symlink below is refused, not followed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn differently_spelled_paths_are_still_inside_the_project() {
+        let (_dir, base) = setup();
+        let root = base.join("proj");
+        symlink(base.join("elsewhere"), root.join("src/texrun-out")).unwrap();
+
+        // Case: the path as given says `PROJ/SRC`.
+        let upper = base.join("PROJ/SRC/texrun-out");
+        assert!(upper.exists(), "the test expects a case-insensitive APFS");
+        for create in [false, true] {
+            assert!(matches!(
+                walk(&upper, &root, create),
+                Err(OutputDirError::Symlink(_))
+            ));
+        }
+
+        // Normalization: the project directory is stored in NFC, the path
+        // as given uses NFD.
+        let nfc = base.join("caf\u{e9}");
+        fs::create_dir_all(nfc.join("src")).unwrap();
+        symlink(base.join("elsewhere"), nfc.join("src/texrun-out")).unwrap();
+        let nfd = base.join("cafe\u{301}/src/texrun-out");
+        assert!(
+            nfd.exists(),
+            "the test expects a normalization-insensitive APFS"
+        );
+        for create in [false, true] {
+            assert!(matches!(
+                walk(&nfd, &nfc, create),
+                Err(OutputDirError::Symlink(_))
+            ));
+        }
+        assert!(
+            fs::read_dir(base.join("elsewhere"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        // A differently spelled path to a real directory resolves to the
+        // stored spelling.
+        let out = walk(&base.join("PROJ/SRC"), &root, true).unwrap().unwrap();
+        assert_eq!(out, root.join("src"));
     }
 
     #[test]

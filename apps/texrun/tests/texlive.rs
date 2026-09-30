@@ -1,13 +1,16 @@
 //! End-to-end tests of `texrun compile` against a real TeX Live + latexmk.
 //!
-//! `#[ignore]`d until #10 decides how TeX Live tests are enabled. Run them in
-//! the dev container (docs/development.md):
+//! Selected at run time like the engine crate's integration tests
+//! (docs/development.md): each test starts with `require_texlive!()` and is
+//! skipped when latexmk is missing, unless `TEXRUN_REQUIRE_TEXLIVE=1` (and
+//! `TEXRUN_REQUIRE_PREVIEW_TOOLS=1` for previews) makes that a failure:
 //!
 //! ```text
-//! docker compose run --rm dev cargo test -p texrun -- --ignored
+//! docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+//!     dev cargo test -p texrun
 //! ```
-//!
-//! They fail (rather than skip) when latexmk is missing.
+
+mod common;
 
 use std::fs;
 use std::path::Path;
@@ -45,9 +48,16 @@ fn run_json(dir: &Path, args: &[&str]) -> (i32, Value, String) {
     (out.status.code().unwrap(), doc, stderr)
 }
 
+/// Arguments to compile the engine crate's `timeout` fixture (a macro that
+/// expands forever) with `--output` in `out`, so nothing is written next to
+/// the fixture sources.
+fn timeout_fixture_args<'a>(out: &'a str, entry: &'a str, timeout: &'a str) -> Vec<&'a str> {
+    vec!["compile", "--json", "--timeout", timeout, "-o", out, entry]
+}
+
 #[test]
-#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_compiles_a_document_with_includes() {
+    common::require_texlive!();
     let dir = project(&[
         (
             "main.tex",
@@ -58,6 +68,7 @@ fn texlive_compiles_a_document_with_includes() {
     let (code, doc, stderr) = run_json(dir.path(), &["compile", "--json", "main.tex"]);
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
     assert_eq!(doc["outcome"], "succeeded");
+    assert_eq!(doc["texrun_exit_code"], 0);
     assert!(
         doc["engine"]["version"]
             .as_str()
@@ -77,10 +88,33 @@ fn texlive_compiles_a_document_with_includes() {
     assert!(text.contains("PDF: texrun-out/main.pdf"), "{text}");
 }
 
+#[test]
+fn texlive_compiles_a_fixture_without_writing_next_to_it() {
+    common::require_texlive!();
+    let fixture = common::texlive_fixture("minimal");
+    let entry = fixture.join("main.tex");
+    let out = tempfile::tempdir().unwrap();
+    let (code, doc, stderr) = run_json(
+        out.path(),
+        &[
+            "compile",
+            "--json",
+            "--no-preview",
+            "-o",
+            out.path().to_str().unwrap(),
+            entry.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    assert!(out.path().join("main.pdf").is_file());
+    assert!(!fixture.join("texrun-out").exists());
+}
+
 /// Also needs `mutool` or Poppler (both are in the dev container).
 #[test]
-#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_renders_page_previews() {
+    common::require_texlive!();
+    common::require_preview_tools!();
     let dir = project(&[(
         "main.tex",
         "\\documentclass{article}\n\\begin{document}\nPage 1.\\newpage\nPage 2.\\newpage\n\
@@ -113,8 +147,8 @@ fn texlive_renders_page_previews() {
 }
 
 #[test]
-#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_reports_located_errors() {
+    common::require_texlive!();
     let dir = project(&[
         (
             "main.tex",
@@ -153,31 +187,34 @@ fn texlive_reports_located_errors() {
     );
 }
 
-const INFINITE_LOOP: &str =
-    "\\documentclass{article}\n\\begin{document}\n\\def\\x{\\x}\\x\n\\end{document}\n";
-
 #[test]
-#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_timeout_exits_4() {
-    let dir = project(&[("main.tex", INFINITE_LOOP)]);
+    common::require_texlive!();
+    let fixture = common::texlive_fixture("timeout");
+    let entry = fixture.join("main.tex");
+    let out = tempfile::tempdir().unwrap();
     let start = Instant::now();
     let (code, doc, stderr) = run_json(
-        dir.path(),
-        &["compile", "--json", "--timeout", "2s", "main.tex"],
+        out.path(),
+        &timeout_fixture_args(out.path().to_str().unwrap(), entry.to_str().unwrap(), "2s"),
     );
     assert_eq!(code, 4, "{doc:#}\n{stderr}");
     assert_eq!(doc["outcome"], "timed_out");
+    assert_eq!(doc["texrun_exit_code"], 4);
     assert!(start.elapsed() < Duration::from_secs(30));
+    assert!(!fixture.join("texrun-out").exists());
 }
 
 #[test]
-#[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn texlive_sigint_stops_pdflatex() {
-    let dir = project(&[("main.tex", INFINITE_LOOP)]);
+    common::require_texlive!();
+    let fixture = common::texlive_fixture("timeout");
+    let entry = fixture.join("main.tex");
+    let out = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let child = texrun(
-        dir.path(),
-        &["compile", "--json", "--timeout", "60s", "main.tex"],
+        out.path(),
+        &timeout_fixture_args(out.path().to_str().unwrap(), entry.to_str().unwrap(), "60s"),
     )
     .env("TMPDIR", tmp.path())
     .stdout(Stdio::piped())
