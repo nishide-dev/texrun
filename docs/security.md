@@ -477,9 +477,11 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 **cgroup（Linux、cgroup v2）。**
 
 - 使う cgroup は `Cgroups::detect` で探す。次の 2 か所だけを、この順に見る。
-  1. **texrun 自身の cgroup。** texrun に明示的に委譲されていて（例: `systemd-run --user --scope -p Delegate=yes texrun compile ...`）、ほかのプロセスがいない場合に使う。委譲されていることは、次のどちらかで判断する。書き込めるだけでは使わない。root はどの cgroup にも書き込めるので、systemd が唯一の書き手として管理する cgroup（`Delegate=` の無い service など）を変更してしまうためである。
-     - systemd の委譲の印（xattr の `trusted.delegate` か `user.delegate` が `1`。`Delegate=yes` の cgroup に付く）がある
-     - cgroup のディレクトリ・`cgroup.procs`・`cgroup.subtree_control` の所有者が texrun の euid で、euid が 0 でない（ユーザーに委譲された cgroup は chown される）
+  1. **texrun 自身の cgroup。** texrun に明示的に委譲されていて（例: `systemd-run --user --scope -p Delegate=yes texrun compile ...`）、ほかのプロセスがいない場合に使う。委譲されていることは、systemd の委譲の印（xattr の `trusted.delegate` か `user.delegate` が `1`。systemd 251 以降が `Delegate=yes` の cgroup に付ける）で判断する。次のものは委譲の証拠にしない。
+     - 書き込めること: root はどの cgroup にも書き込めるので、systemd が唯一の書き手として管理する cgroup（`Delegate=` の無い service など）を変更してしまう。
+     - 所有者が texrun の（root でない）ユーザーであること: `user@<uid>.service` の下の cgroup（端末の app scope など）は全てそのユーザーの所有だが、`systemd --user` が管理しており、それ自身がさらに委譲した cgroup にしか印が付かない。
+
+     印の無い古い systemd などで使わせたい場合は、library の `Cgroups::at(dir)` で明示する。
 
      cgroup v2 は、プロセスのいない cgroup からしか子 cgroup に controller を渡せない。そのため texrun は、まず自分を leaf の子 cgroup（`texrun-<pid>.main`）に移し、それから `memory` / `pids` / `cpu` を有効にする（systemd が委譲先に勧めている方法）。leaf は texrun の終了後に空のまま残り、委譲元（systemd の scope など）が消すときに一緒に消える。
   2. **cgroup namespace の root。** host の root cgroup ではなく（container の中）、cgroup v2 が `nsdelegate` 付きで mount されていて（kernel が namespace を委譲の境界として扱う。container の runtime が container に渡した cgroup である）、書き込めて、root 自身にプロセスがいない場合に使う（例: container のプロセスを leaf に移した場合。`docker/dev/with-cgroup.sh`）。
@@ -520,8 +522,8 @@ engine（latexmk とその子孫の pdflatex / bibtex / makeindex）と preview 
 
 - `crates/texrun-process/tests/limits.rs`: CPU を使い続ける `sh` のループが `SIGXCPU` で止まる、`cpu.max` で throttle される（`nr_throttled`）、perl の大きな確保が `RLIMIT_AS`（Linux）と cgroup の `memory.max` で止まる、`sleep` を 40 個起動する script が `pids.max` で止まり、起動されたプロセスが残らない、新しい session に移ったプロセスも `cgroup.kill` で止まる（対照: cgroup が無いと残る）、run の cgroup が消える、soft と hard が別々に渡る、core を無効にしない CPU / file size の limit を拒否する。
 - `crates/texrun-texlive/tests/limits.rs`: 既存の `timeout` fixture（無限ループ）が CPU 時間 2 s で `resource_limit` になる（macOS の library 利用で gate が無い場合は timeout になる）、`minimal` が小さい `RLIMIT_AS` / `memory.max` / `pids.max` で止まる、200 ページ超の文書（test の中で生成）が既定の上限に当たらない。
-- `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、委譲の印のある cgroup では自分を leaf に移し、印の無い cgroup には何もしない（controller も有効にしない）こと、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
-- unit test: 委譲の印と所有者の判定、`nsdelegate` の読み取り、`RLIMIT_AS` のメッセージの行全体での照合（行の一部や log にもある行では成立しない）、一時的なプロセス数の上限で成功した compile が warning になること、engine の gate の分岐（exec gate、Linux の stdin gate、macOS の必須の gate）。
+- `apps/texrun/tests`: CLI の JSON の `resource_limits`、`--cgroup auto / required / off`、委譲の印のある cgroup では自分を leaf に移し、印の無い cgroup には、root で書き込める場合も、texrun のユーザーの所有の場合も、何もしない（controller も有効にしない）こと、事前の確認の後に gate が消えた場合の `resource_limits` の notice。
+- unit test: 委譲の印の判定（書き込めることや所有者では判定しない）、`nsdelegate` の読み取り、`RLIMIT_AS` のメッセージの行全体での照合（行の一部や log にもある行では成立しない）、一時的なプロセス数の上限で成功した compile が warning になること、engine の gate の分岐（exec gate、Linux の stdin gate、macOS の必須の gate）。
 
 ## 4. 将来の sandbox backend（#26）
 

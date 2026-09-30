@@ -165,7 +165,7 @@ cgroup による上限（[docs/security.md](security.md) §3.10）の test は�
 
 - `crates/texrun-process/tests/limits.rs`（fake script: memory、process 数、group 外に出たプロセスの kill）
 - `crates/texrun-texlive/tests/limits.rs`（TeX Live）
-- `apps/texrun/tests/texlive.rs`（`texlive_uses_a_delegated_cgroup_of_its_own`: 委譲の印のある cgroup で texrun が自分を leaf に移る経路。`texlive_leaves_a_cgroup_that_was_not_delegated_alone`: 印の無い cgroup には何もしないこと）、`apps/texrun/tests/cli.rs`（`--cgroup`）
+- `apps/texrun/tests/texlive.rs`（`texlive_uses_a_delegated_cgroup_of_its_own`: 委譲の印のある cgroup で texrun が自分を leaf に移る経路。`texlive_leaves_a_cgroup_that_was_not_delegated_alone`: 印の無い cgroup には、root で書き込める場合も、texrun のユーザーに chown されている場合も、何もしないこと）、`apps/texrun/tests/cli.rs`（`--cgroup`）
 
 通常の dev コンテナ（`docker compose run`）では cgroup の mount が read-only なので、cgroup は使えない。GitHub Actions の runner（`test (linux)`）でも、runner のユーザーに委譲された cgroup は無い。どちらでも、これらの test は `skipped: no delegated cgroup (...)` を出して何もしない（`cli.rs` の test は、使えない場合の挙動を確認する）。
 

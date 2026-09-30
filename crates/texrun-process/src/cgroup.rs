@@ -156,9 +156,11 @@ impl Cgroups {
     /// 1. **this process's own cgroup**, if it was explicitly delegated
     ///    (e.g. `systemd-run --user --scope -p Delegate=yes`): it carries
     ///    systemd's delegation marker (the `trusted.delegate` or
-    ///    `user.delegate` xattr), or it is owned by this process's user,
-    ///    which is not root. Being writable is not enough (root can write
-    ///    to every cgroup, including those systemd manages alone). No
+    ///    `user.delegate` xattr set to `1`, systemd 251 and later). Being
+    ///    writable is not enough (root can write to every cgroup, including
+    ///    those systemd manages alone), and neither is being owned by this
+    ///    user (the whole `user@<uid>.service` tree is, while `systemd
+    ///    --user` manages it). No
     ///    other process may be in it: the cgroup v2 rule that only a cgroup
     ///    without processes can hand controllers to its children means this
     ///    process first moves itself into a leaf child
@@ -454,15 +456,15 @@ pub(crate) mod linux {
         prepare(dir, is_own)
     }
 
-    /// `Ok` if `dir` was explicitly delegated to this process: it carries
-    /// systemd's delegation marker (the `trusted.delegate` or
-    /// `user.delegate` xattr, set for `Delegate=yes`), or it is owned by
-    /// this process's user, which is not root (a cgroup delegated to a
-    /// user is chowned to them). Being writable is not enough: root can
-    /// write to every cgroup, including those another manager owns.
+    /// `Ok` if `dir` was explicitly delegated: it carries systemd's
+    /// delegation marker (the `trusted.delegate` or `user.delegate` xattr
+    /// set to `1`, which systemd 251 and later puts on a `Delegate=yes`
+    /// cgroup). Being writable is not enough: root can write to every
+    /// cgroup, including those another manager owns. Being owned by this
+    /// (non-root) user is not enough either: everything below
+    /// `user@<uid>.service` belongs to the user, but is managed by
+    /// `systemd --user` except where it delegated a cgroup further.
     fn delegated(dir: &Path) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt;
-
         let markers: Vec<Option<Vec<u8>>> = ["trusted.delegate", "user.delegate"]
             .iter()
             .map(|name| {
@@ -472,31 +474,19 @@ pub(crate) mod linux {
                     .map(|n| buf[..n].to_vec())
             })
             .collect();
-        let owners: Vec<Option<u32>> = ["", "cgroup.procs", "cgroup.subtree_control"]
-            .iter()
-            .map(|name| fs::metadata(dir.join(name)).ok().map(|m| m.uid()))
-            .collect();
-        let euid = rustix::process::geteuid().as_raw();
-        if has_delegation_evidence(&markers, &owners, euid) {
+        if has_delegation_marker(&markers) {
             Ok(())
         } else {
             Err(format!(
-                "{} is not delegated to texrun (no delegation marker, and not owned by this \
-                 non-root user)",
+                "{} is not delegated (no trusted.delegate or user.delegate marker)",
                 dir.display()
             ))
         }
     }
 
-    /// See [`delegated`]: a marker `1`, or every file owned by `euid` ≠ 0.
-    pub(super) fn has_delegation_evidence(
-        markers: &[Option<Vec<u8>>],
-        owners: &[Option<u32>],
-        euid: u32,
-    ) -> bool {
-        let marked = markers.iter().flatten().any(|m| m.as_slice() == b"1");
-        let owned = euid != 0 && !owners.is_empty() && owners.iter().all(|o| *o == Some(euid));
-        marked || owned
+    /// See [`delegated`]: one of the markers is `1`.
+    pub(super) fn has_delegation_marker(markers: &[Option<Vec<u8>>]) -> bool {
+        markers.iter().flatten().any(|m| m.as_slice() == b"1")
     }
 
     /// `Ok` if `mount`, the root of this process's cgroup namespace, is a
@@ -759,29 +749,14 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn delegation_needs_a_marker_or_a_non_root_owner() {
-        use super::linux::has_delegation_evidence as evidence;
+    fn delegation_needs_a_marker() {
+        use super::linux::has_delegation_marker as marked;
         let one = Some(b"1".to_vec());
-        let owned = [Some(1000), Some(1000), Some(1000)];
-        let root = [Some(0), Some(0), Some(0)];
-        // Writable to root, but no marker: not delegated.
-        assert!(!evidence(&[None, None], &root, 0));
-        assert!(evidence(&[one.clone(), None], &root, 0));
-        assert!(evidence(&[None, one], &root, 0));
-        assert!(!evidence(&[Some(b"0".to_vec()), None], &root, 0));
-        // Chowned to a non-root user.
-        assert!(evidence(&[None, None], &owned, 1000));
-        assert!(!evidence(&[None, None], &owned, 1001));
-        assert!(!evidence(
-            &[None, None],
-            &[Some(1000), Some(0), Some(1000)],
-            1000
-        ));
-        assert!(!evidence(
-            &[None, None],
-            &[Some(1000), None, Some(1000)],
-            1000
-        ));
+        assert!(!marked(&[None, None]), "writable or owned is not enough");
+        assert!(marked(&[one.clone(), None]));
+        assert!(marked(&[None, one]));
+        assert!(!marked(&[Some(b"0".to_vec()), None]));
+        assert!(!marked(&[Some(b"1\n".to_vec()), Some(Vec::new())]));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

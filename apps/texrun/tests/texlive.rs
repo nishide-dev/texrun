@@ -315,17 +315,46 @@ struct OwnCgroupRun {
     children: Vec<String>,
 }
 
-/// Runs `texrun compile --json <args> main.tex` as the only process of a
-/// new cgroup below `parent`, marked as delegated (`trusted.delegate=1`,
-/// as systemd does for `Delegate=yes`) or not, and removes the cgroup.
+/// How [`compile_in_own_cgroup`] prepares the cgroup.
 #[cfg(target_os = "linux")]
-fn compile_in_own_cgroup(parent: &Path, delegated: bool, args: &[&str]) -> OwnCgroupRun {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupSetup {
+    /// Marked as delegated (`trusted.delegate=1`, as systemd does for
+    /// `Delegate=yes`).
+    Delegated,
+    /// Neither marked nor chowned.
+    Plain,
+    /// Chowned to this user, who runs texrun, but not marked (like a
+    /// cgroup below `user@<uid>.service` that `systemd --user` manages).
+    ChownedTo(u32),
+}
+
+/// Runs `texrun compile --json <args> main.tex` as the only process of a
+/// new cgroup below `parent`, prepared as `setup` says, and removes the
+/// cgroup.
+#[cfg(target_os = "linux")]
+fn compile_in_own_cgroup(parent: &Path, setup: CgroupSetup, args: &[&str]) -> OwnCgroupRun {
     let own = parent.join(format!(
-        "texrun-cli-test-{}-{delegated}",
-        std::process::id()
+        "texrun-cli-test-{}-{}",
+        std::process::id(),
+        match setup {
+            CgroupSetup::Delegated => "delegated".to_owned(),
+            CgroupSetup::Plain => "plain".to_owned(),
+            CgroupSetup::ChownedTo(uid) => format!("uid{uid}"),
+        }
     ));
     fs::create_dir(&own).unwrap();
-    if delegated {
+    if let CgroupSetup::ChownedTo(uid) = setup {
+        for name in [
+            "",
+            "cgroup.procs",
+            "cgroup.subtree_control",
+            "cgroup.threads",
+        ] {
+            std::os::unix::fs::chown(own.join(name), Some(uid), Some(uid)).unwrap();
+        }
+    }
+    if setup == CgroupSetup::Delegated {
         rustix::fs::setxattr(
             &own,
             "trusted.delegate",
@@ -338,9 +367,19 @@ fn compile_in_own_cgroup(parent: &Path, delegated: bool, args: &[&str]) -> OwnCg
         "main.tex",
         "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n",
     )]);
-    let out = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .args(["-c", "echo $$ > \"$0/cgroup.procs\" && exec \"$@\""])
-        .arg(&own)
+        .arg(&own);
+    if let CgroupSetup::ChownedTo(uid) = setup {
+        // texrun runs as that user, in a project it can write to.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        command
+            .args(["/usr/bin/setpriv", "--clear-groups"])
+            .args([format!("--reuid={uid}"), format!("--regid={uid}")]);
+    }
+    let out = command
         .args([env!("CARGO_BIN_EXE_texrun"), "compile", "--json"])
         .args(args)
         .arg("main.tex")
@@ -379,7 +418,7 @@ fn texlive_uses_a_delegated_cgroup_of_its_own() {
     let Some(parent) = cgroup_parent() else {
         return;
     };
-    let run = compile_in_own_cgroup(&parent, true, &["--cgroup", "required"]);
+    let run = compile_in_own_cgroup(&parent, CgroupSetup::Delegated, &["--cgroup", "required"]);
     let doc = &run.doc;
     assert_eq!(run.code, Some(0), "{doc:#}\n{}", run.stderr);
     assert_eq!(
@@ -407,10 +446,11 @@ fn texlive_uses_a_delegated_cgroup_of_its_own() {
     );
 }
 
-/// A cgroup that is writable (texrun runs as root here) but carries no
-/// delegation marker is left alone: texrun neither moves itself into a
-/// leaf nor enables controllers there. (It may still use the container's
-/// cgroup namespace root.)
+/// A cgroup without the delegation marker is left alone, whether it is
+/// merely writable (texrun runs as root) or owned by the user texrun runs
+/// as: texrun neither moves itself into a leaf nor enables controllers
+/// there. (As root it may still use the container's cgroup namespace
+/// root.)
 #[cfg(target_os = "linux")]
 #[test]
 fn texlive_leaves_a_cgroup_that_was_not_delegated_alone() {
@@ -418,8 +458,20 @@ fn texlive_leaves_a_cgroup_that_was_not_delegated_alone() {
     let Some(parent) = cgroup_parent() else {
         return;
     };
-    let run = compile_in_own_cgroup(&parent, false, &["--cgroup", "auto"]);
-    assert_eq!(run.code, Some(0), "{:#}\n{}", run.doc, run.stderr);
-    assert_eq!(run.subtree_control.trim(), "", "controllers were enabled");
-    assert!(run.children.is_empty(), "{:?}", run.children);
+    for setup in [CgroupSetup::Plain, CgroupSetup::ChownedTo(65534)] {
+        let run = compile_in_own_cgroup(&parent, setup, &["--cgroup", "auto"]);
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{setup:?}: {:#}\n{}",
+            run.doc,
+            run.stderr
+        );
+        assert_eq!(
+            run.subtree_control.trim(),
+            "",
+            "{setup:?}: controllers were enabled"
+        );
+        assert!(run.children.is_empty(), "{setup:?}: {:?}", run.children);
+    }
 }
