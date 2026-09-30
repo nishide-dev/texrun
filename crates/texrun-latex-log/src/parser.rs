@@ -52,6 +52,7 @@ pub(crate) fn parse(lines: &Lines, config: &Config<'_>) -> ParsedLog {
         out: Collector::new(config.max_diagnostics),
         stopped: false,
         undefined_reported: false,
+        untrusted_stop_line: false,
     };
     let mut i = 0;
     while i < lines.len() {
@@ -81,6 +82,8 @@ struct Parser<'a> {
     stopped: bool,
     /// An undefined reference or citation has been reported.
     undefined_reported: bool,
+    /// The next `Emergency stop.` repeats a line that was found to be wrong.
+    untrusted_stop_line: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -146,6 +149,13 @@ impl<'a> Parser<'a> {
             ErrorHeader { file: None, .. } => self.current_file(),
         };
 
+        // Set by a missing package / class whose line was dropped: this is
+        // the `Emergency stop.` right after it, reporting the same position.
+        let drop_line = std::mem::take(&mut self.untrusted_stop_line)
+            && class.kind == DiagnosticKind::EmergencyStop
+            && !class.fatal_summary;
+        let mut untrusted_stop_line = false;
+
         let message_end = end;
         let context = self.find_context(end);
         let mut line = header.line;
@@ -160,7 +170,13 @@ impl<'a> Parser<'a> {
                 || self.stop_context_is_request(header.text, ctx.index)
             {
                 line = line.or(Some(ctx.line));
+            } else {
+                // The following `Emergency stop.` has the same (wrong) line.
+                untrusted_stop_line = true;
             }
+        }
+        if drop_line {
+            line = None;
         }
 
         if class.kind == DiagnosticKind::UndefinedControlSequence
@@ -177,6 +193,7 @@ impl<'a> Parser<'a> {
         if class.kind == DiagnosticKind::EmergencyStop {
             self.stopped = true;
         }
+        self.untrusted_stop_line = untrusted_stop_line;
 
         self.push(
             Severity::Error,

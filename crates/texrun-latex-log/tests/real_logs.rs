@@ -113,12 +113,14 @@ fn missing_package() {
         "{}",
         d[0].message
     );
-    // The fatal-error summary after `Emergency stop.` is not repeated.
+    // The stop that follows reports the same wrong position (even in its
+    // `./main.tex:4:` prefix), so it has no line either. The fatal-error
+    // summary after `Emergency stop.` is not repeated.
     assert_at(
         &d[1],
         Severity::Error,
         K::EmergencyStop,
-        (Some("main.tex"), Some(4)),
+        (Some("main.tex"), None),
     );
     assert_eq!(d[1].message, "Emergency stop.");
 }
@@ -127,6 +129,7 @@ fn missing_package() {
 fn missing_input_file() {
     let d = parse("missing-input");
     assert_eq!(kinds(&d), [K::MissingFile, K::EmergencyStop]);
+    // For `\input` the position is where the file was requested.
     assert_at(
         &d[0],
         Severity::Error,
@@ -134,6 +137,12 @@ fn missing_input_file() {
         (Some("main.tex"), Some(4)),
     );
     assert!(d[0].message.contains("chapters/nothere.tex"));
+    assert_at(
+        &d[1],
+        Severity::Error,
+        K::EmergencyStop,
+        (Some("main.tex"), Some(4)),
+    );
 }
 
 #[test]
@@ -347,7 +356,7 @@ fn missing_class() {
         &d[1],
         Severity::Error,
         K::EmergencyStop,
-        (Some("main.tex"), Some(2)),
+        (Some("main.tex"), None),
     );
 }
 

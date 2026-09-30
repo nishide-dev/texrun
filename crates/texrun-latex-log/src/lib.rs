@@ -62,6 +62,11 @@
 //! notice with the number omitted. Aggregating similar diagnostics for
 //! display is left to the caller (the CLI).
 //!
+//! The whole log is decoded into one buffer plus 16 bytes per line, so memory
+//! is linear in the log size (about 0.9 GB for 100 MB of very short lines).
+//! A streaming parser that keeps only a window of recent lines is possible
+//! if that ever matters.
+//!
 //! # Assumed engine settings
 //!
 //! The parser works best with the options used by the TeX Live engine:
@@ -150,7 +155,9 @@ impl LogParser {
     /// The maximum number of diagnostics returned. Errors are kept in
     /// preference to warnings and info; beyond the limit, diagnostics are
     /// dropped (later ones first) and a single notice with the number
-    /// omitted is appended (see [`ParsedLog`]).
+    /// omitted is appended (see [`ParsedLog`]). Within each group, the first
+    /// ones in log order are kept; the variety of kinds is not considered, so
+    /// a small limit may be filled by repetitions of one message.
     #[must_use]
     pub fn with_max_diagnostics(mut self, max_diagnostics: usize) -> Self {
         self.max_diagnostics = max_diagnostics;
