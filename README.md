@@ -267,8 +267,8 @@ texrun compile --backend container main.tex
 ```
 
 Page previews are rendered on the host with either backend (with the
-per-process limits of `--cgroup`); running them in the container too is a
-follow-up. See [docs/security.md](docs/security.md) §2 and §4 for exactly
+per-process limits of `--cgroup`); running them in the container too is
+tracked in [#46](https://github.com/nishide-dev/texrun/issues/46). See [docs/security.md](docs/security.md) §2 and §4 for exactly
 what each backend guarantees.
 
 ## System requirements

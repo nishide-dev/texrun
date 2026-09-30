@@ -12,12 +12,13 @@
 # - /usr/bin/latexmk, and pdflatex / bibtex / makeindex in /usr/bin;
 # - /usr/bin/timeout (coreutils), which bounds the lifetime of the container
 #   even if texrun itself is killed;
+# - /usr/bin/prlimit (util-linux), which sets RLIMIT_AS (the runtimes'
+#   --ulimit does not take it);
 # - nothing of its own at /workspace or /texrun (texrun mounts there).
 #
 # The TeX Live packages are the same as in the dev image, so the #10
 # fixtures behave the same with both backends. MuPDF and Poppler are
-# included for running the preview in the sandbox as well (a follow-up of
-# #26).
+# included for running the preview in the sandbox as well (#46).
 
 # Pinned by digest (multi-arch index); Dependabot (docker ecosystem)
 # updates it.

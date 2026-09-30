@@ -164,8 +164,8 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 - **sandbox backend でも保証しないもの:**
   - container runtime・OCI runtime（runc など）・Linux kernel の脆弱性による container からの脱出。より強い隔離（gVisor の `runsc`、microVM）は §4 の比較に留める。
   - workspace と output dir の中身は container から読める・書ける（in-process 実行と同じ。入力は read-only だが、書き込める場所は §3.2 のサイズ上限だけで、ファイル数は制限しない）。
-  - プロセス数の上限（`pids.max`）に達したことの判定。container の cgroup の event を texrun は読まないので、fork の失敗を perl が再試行し続けた場合は timeout として報告される（memory の上限は OOM kill の記録で判定する）。
-  - rootless mode の Docker（`dockerd-rootless`）は想定していない。container の uid が host の subordinate uid に写るので、output dir に書けずに compile が失敗する（安全側には倒れる）。
+  - プロセス数の上限（`pids.max`）に達したことの判定。container の cgroup の event を texrun は読まないので、fork の失敗を perl が再試行し続けた場合は timeout として報告される（memory の上限は OOM kill の記録で判定する。#49）。
+  - rootless mode の Docker（`dockerd-rootless`）は想定していない（#47）。container の uid が host の subordinate uid に写るので、output dir に書けずに compile が失敗する（安全側には倒れる）。
   - macOS では container は runtime の VM の中で動く。workspace は VM と共有された host の temp dir にある（Docker Desktop / OrbStack の既定の共有範囲）。
 - **表示上の偽装。** `WorkspacePath` は bidi 制御文字（U+202A〜U+202E、U+2066〜U+2069）とゼロ幅文字（U+200B〜U+200F、U+FEFF）を許容している。
   - 人間向けの出力でこれらを含む path を表示するときは、escape する（#6）。
@@ -573,7 +573,7 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 | 候補 | 得られるもの | 主な課題 | 判断 |
 | --- | --- | --- | --- |
 | Docker | filesystem・network・PID・IPC の namespace、cgroup による CPU / memory / pids 制限、read-only の root filesystem と image の texmf | daemon が必要。macOS では VM を経由する | **最初の backend にする。** CI（GitHub Actions の runner）と開発環境（OrbStack、Docker Desktop）にあり、毎回 test できる |
-| Podman（rootless） | Docker と同じ。daemon 無しで、container の root も host の非特権ユーザーになる | 環境による差（cgroup の委譲、`podman machine`）がある | **同じ CLI 互換の実装で受ける**（`--container-runtime podman`）。CI では test していない（follow-up） |
+| Podman（rootless） | Docker と同じ。daemon 無しで、container の root も host の非特権ユーザーになる | 環境による差（cgroup の委譲、`podman machine`）がある | **同じ CLI 互換の実装で受ける**（`--container-runtime podman`）。CI では test していない（#47） |
 | gVisor（`runsc`） | container の隔離に加え、syscall を user-space kernel で仲介し、kernel の攻撃面を縮小する | Linux のみ、I/O 性能 | library の `ContainerConfig::oci_runtime`（`--runtime runsc`）で指定できるようにしたが、test していない。CLI には出さない |
 | microVM（Firecracker 等） | VM 境界による強い隔離 | image と起動の管理が複雑で、KVM が必須 | 比較に留める |
 
@@ -586,10 +586,10 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 `docker/engine/Dockerfile`。dev image（`docker/dev`）とは別の、最小の runtime image である。
 
 - base は `debian:trixie-slim` を multi-arch index の digest で固定し、Dependabot が digest を更新する。
-- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview を sandbox 内で動かすとき（follow-up）のために、MuPDF と Poppler も入れる。Rust toolchain やコンパイラは入れない。
+- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview を sandbox 内で動かすとき（#46）のために、MuPDF と Poppler も入れる。Rust toolchain やコンパイラは入れない。
 - 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
 - texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout`（coreutils）、`/usr/bin/prlimit`（util-linux）。
-- CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image 名は `texrun-engine:latest`（`--container-image` で変えられる）。registry への公開は follow-up とする。
+- CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image 名は `texrun-engine:latest`（`--container-image` で変えられる）。registry への公開は #48 で扱う。
 
 ### container の設定
 
@@ -614,7 +614,7 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
 
 - texrun は container を `create`（名前 `texrun-<pid>-<n>-<nanos>` と label `org.texrun.sandbox=1`、`org.texrun.sandbox.pid=<pid>`）で作り、`start --attach` を supervisor（§3.6）の子プロセスとして起動する。stdout / stderr と終了コードは container のもので、latexmk の終了（`128 + signal` を含む、§3.10）はそのまま判定に使える。
 - runtime の CLI を kill しても container は止まらない。そのため supervisor の kill のたび（timeout、cancel、出力上限、正常終了の後の念のための kill）に、container の状態（OOM kill、終了コード）を読んでから `rm --force` で消す（中で動いているものも kill される）。消せなかった場合は、reap の後と texrun 側の値の drop で再試行する。`create` した container は、`start` しなかった場合も含めて、texrun の全ての経路で消える。
-- texrun 自身が `SIGKILL` などで終了した場合は、container が残りうる。その場合も、container の中の `timeout --signal=KILL` が compile の timeout + 45 秒（CPU 時間の余裕 15 秒 + 30 秒）で engine を止め、container は終了する。残った container は label で見つけて消せる（`docker ps -a --filter label=org.texrun.sandbox`）。次回の起動時に自動で回収することは follow-up とする。
+- texrun 自身が `SIGKILL` などで終了した場合は、container が残りうる。その場合も、container の中の `timeout --signal=KILL` が compile の timeout + 45 秒（CPU 時間の余裕 15 秒 + 30 秒）で engine を止め、container は終了する。残った container は label で見つけて消せる（`docker ps -a --filter label=org.texrun.sandbox`）。次回の起動時に自動で回収することは #49 で扱う。
 - 実測（OrbStack、macOS、arm64）: 1 ページの文書で CLI 全体が約 1.4 秒（probe の `latexmk -v` の container、compile の container の作成・削除を含む）、そのうち container の中の latexmk の実行は約 0.2 秒だった。
 
 ### path mapping と diagnostics
@@ -627,7 +627,7 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
 
 - preview（#8）は、どちらの backend でも **host で** 動かす（exec gate、rlimit、`--cgroup`、§3.2・3.10）。
 - 理由: preview tool の起動は 1 回の preview で最大数百回あり（ページごとの描画）、container の起動のオーバーヘッドがそのまま掛かる。また、preview の出力先と tool の path の対応を、engine と同じ path mapping で扱う設計（`texrun-preview` への launcher の導入）が別に要る。MVP では compile の隔離を優先した。
-- そのため、sandbox backend でも preview tool（poppler / MuPDF）の脆弱性と network は、in-process 実行と同じ扱いである（§2 の「保証しない」）。engine image には preview tool を入れてあり、sandbox 内での preview は follow-up で扱う。
+- そのため、sandbox backend でも preview tool（poppler / MuPDF）の脆弱性と network は、in-process 実行と同じ扱いである（§2 の「保証しない」）。engine image には preview tool を入れてあり、sandbox 内での preview は #46 で扱う。
 
 ### CLI
 
