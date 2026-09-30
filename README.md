@@ -54,7 +54,7 @@ distribution or execution backend, so that other engines or stronger isolation
 
 ## MVP scope
 
-All items below are planned for the first milestone:
+The first milestone covers:
 
 - TeX Live backend (via `latexmk`)
 - local CLI
@@ -225,7 +225,8 @@ removes the workspace and then exits.
 
 ## Local development
 
-Run the quality gates before opening a pull request (the same checks as CI):
+Run the quality gates before opening a pull request (the fast CI jobs run the
+same checks):
 
 ```bash
 cargo check --workspace --all-targets --all-features
@@ -245,18 +246,25 @@ A Docker-based environment with the Rust toolchain, TeX Live, latexmk and a
 preview tool is provided for running commands that need TeX, for example:
 
 ```bash
-docker compose run --rm dev cargo test --workspace
+docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+  dev cargo test --workspace --all-features
 ```
+
+Without TeX Live, tests that need it are skipped and reported as `SKIPPED` on
+stderr; the CI `integration` job runs them inside this image.
 
 See [docs/development.md](docs/development.md) for setup details.
 
 ## Security model
 
 TeX can read files and, if enabled, run external commands, so texrun treats
-documents as untrusted input. The MVP plans to disable shell escape, restrict
-paths to the workspace, limit the environment passed to TeX and enforce a
-timeout, but in-process execution is **not** a complete sandbox (for example,
-parts of the host such as the TeX Live tree remain readable).
+documents as untrusted input. texrun disables shell escape, runs latexmk with a
+texrun-managed configuration, restricts TeX file access to the workspace where
+kpathsea allows it, passes a minimal environment and enforces a timeout and
+output limits. In-process execution is **not** a complete sandbox, though (for
+example, parts of the host such as the TeX Live tree remain readable); a
+container-based backend is tracked in
+[#26](https://github.com/nishide-dev/texrun/issues/26).
 
 See [docs/security.md](docs/security.md) for the trust boundary, guarantees,
 limitations and execution limits (Japanese), and [SECURITY.md](SECURITY.md) for
