@@ -1,0 +1,36 @@
+# Development environment with Rust + TeX Live. See docs/development.md.
+#
+#   docker compose build dev
+#   docker compose run --rm dev cargo test --workspace
+#
+# Cache layout:
+# - Build output goes to `target/docker/` inside the bind-mounted checkout, so
+#   every checkout (including git worktrees) has its own target directory and
+#   never reuses stale artifacts from another checkout. `/target/` is already
+#   gitignored, and it stays separate from the host build in `target/debug`.
+# - The cargo registry / git caches are content-addressed and safe to share,
+#   so they live in named volumes shared by all checkouts.
+
+# Fixed project name so every checkout uses the same cache volumes
+# (texrun_cargo-registry / texrun_cargo-git) without compose warnings.
+name: texrun
+
+services:
+  dev:
+    build:
+      context: docker/dev
+      dockerfile: Dockerfile
+    # Shared by all checkouts: rebuilding from a checkout with a modified
+    # Dockerfile replaces the image used by the other checkouts too.
+    image: texrun-dev:latest
+    working_dir: /workspace
+    environment:
+      CARGO_TARGET_DIR: /workspace/target/docker
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+
+volumes:
+  cargo-registry:
+  cargo-git:
