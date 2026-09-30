@@ -1,0 +1,20 @@
+% Three pages with different sizes; page 3 carries /Rotate 90. Each page
+% shows a black rule (no fonts, to keep the PDF small).
+% Built with plain pdfTeX by ../regenerate.sh (reproducible: no dates / IDs).
+\pdfinfoomitdate=1
+\pdftrailerid{}
+\pdfsuppressptexinfo=-1
+\pdfcompresslevel=9
+\pdfobjcompresslevel=2
+\nopagenumbers
+\parindent=0pt
+\hoffset=-1in \voffset=-1in
+\def\page#1#2#3{%
+  \pdfpagewidth=#1bp \pdfpageheight=#2bp
+  \hsize=#1bp \vsize=#2bp
+  \vbox to #2bp{\vss\hbox to #1bp{\hss\vrule width #3bp height 10bp\hss}\vss}\eject}
+\page{300}{400}{1}
+\page{400}{300}{2}
+\pdfpageattr{/Rotate 90}
+\page{200}{100}{3}
+\bye

@@ -1,0 +1,19 @@
+% 25 small pages, for the default page limit (first 20 pages). Page N shows
+% a black rule N bp wide (no fonts, to keep the PDF small).
+% Built with plain pdfTeX by ../regenerate.sh (reproducible: no dates / IDs).
+\pdfinfoomitdate=1
+\pdftrailerid{}
+\pdfsuppressptexinfo=-1
+\pdfcompresslevel=9
+\pdfobjcompresslevel=2
+\nopagenumbers
+\parindent=0pt
+\hoffset=-1in \voffset=-1in
+\pdfpagewidth=72bp \pdfpageheight=72bp
+\hsize=72bp \vsize=72bp
+\count255=0
+\loop
+  \advance\count255 by 1
+  \vbox to 72bp{\vss\hbox to 72bp{\hss\vrule width \count255 bp height 10bp\hss}\vss}\eject
+\ifnum\count255<25 \repeat
+\bye

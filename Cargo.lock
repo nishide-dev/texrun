@@ -434,6 +434,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "texrun-preview"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "texrun-core",
+ "thiserror",
+]
+
+[[package]]
 name = "texrun-texlive"
 version = "0.1.0"
 dependencies = [

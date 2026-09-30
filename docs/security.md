@@ -130,6 +130,7 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
 | PDF artifact | 256 MiB（`RLIMIT_FSIZE` と同じ値で自動的に頭打ちになる） | — |
 | preview のページ数 | 既定は **先頭 20 ページ**。範囲を指定した場合（`--pages`）も **最大 200 ページ** | #8 |
 | preview 画像の合計サイズ | **128 MiB**。超えた時点で以降のページを生成せず、warning を出す | #8 |
+| preview 画像 1 枚の長辺 | **4096 px**。超えるページは DPI を下げて描画し、info を出す | #8。PDF が宣言するページサイズ（信頼できない値）の parse に依存しないよう、3 段で強制する（下記）。1 ページあたりの出力と、Linux 以外でのメモリを抑える唯一の手段 |
 
 - `RLIMIT_FSIZE` を超えて書き込もうとすると、engine は `SIGXFSZ` で終了する。20 MiB に制限してログを出し続けさせたところ、ログはちょうど 20 MiB で止まり、latexmk は失敗終了した。
 - `RLIMIT_FSIZE` の設定方法:
@@ -140,6 +141,23 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
 - 設定する値は、texrun 自身の hard limit（子プロセスが継承する値）と上限値の小さい方とする。上限を強める方向にだけ働くので、権限は要らない。
 - **core dump は無効にする**（`RLIMIT_CORE=0`、soft・hard とも。Linux で `RLIMIT_FSIZE` と同時に設定する）。`SIGXFSZ` の既定の動作は core dump で、core ファイルは TeX の cwd（workspace 内）に作られ、output dir の集計の対象外になるためである。macOS では `RLIMIT_FSIZE` を設定せず、停止は `SIGKILL` で行うので、core は作られない。
 - 上限によって停止した場合は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。`CompileOutcome` は `#[non_exhaustive]` なので、専用の outcome を追加するかは #5 で判断してよい。
+- preview（#8）の長辺の上限は、次の 3 段で強制する。
+  1. ページサイズから DPI を下げる。`mutool` はページの拡大係数（`UserUnit`）を反映して描画するので、係数を掛けたサイズで計算する。
+  2. `mutool draw` には、上限を bounding box（`-w` / `-h`）としても渡す。縮小だけに効き、小さいページは拡大しない。`pdftoppm` には拡大を伴わずに上限を渡す option が無いので、この段は無い。
+  3. 描画後に PNG の IHDR の寸法を確認し、上限（丸め分 2 px を許容）を超えた画像は捨てて `render_failed` にする。
+- preview tool の資源制限は OS によって異なる。
+  - Linux: spawn 直後に `prlimit(2)` で設定する。
+    - `RLIMIT_AS`: 2 GiB
+    - `RLIMIT_FSIZE`: 残りの画像予算 + 1 byte。ただし 16 MiB 未満にはしない（`HOME` に fontconfig の cache などを書くため）
+    - `RLIMIT_CORE`: 0
+    - 設定値は、latexmk と同じく texrun 自身の hard limit を超えない
+    - 起動してから設定するまでの間は制限されない。tool はこの間に大きな確保をしない。
+  - macOS: `prlimit` が無いので、上限は長辺の上限と出力サイズの poll だけで強制する。tool のメモリ使用量は制限しない。
+- preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。
+  - 移動は `renameat` で、directory の fd 間で行う。
+  - `preview/` は `mkdirat` で作り、`openat(O_NOFOLLOW)` で 1 component ずつ開く。
+  - 同じ名前の既存 file や symlink は置き換える。symlink の先には書き込まない。
+  - これは #21 の artifact 収集と同じ水準である。compile から残ったプロセスが directory を symlink に差し替えても、画像の書き込み先は output root の外に出ない。
 
 ### 3.3 入力の上限と除外（#4、#21 の実装値と揃える）
 
@@ -183,6 +201,7 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
 - 再現可能なビルド用の変数（`SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE`）は §3.9 で扱う。
 - latexmk の実行ファイルを明示的に指定した場合（`LatexmkConfig::latexmk`、#6 の option 候補）も、起動前に絶対パスに解決する（相対パスは texrun の cwd を基準に解決し、symlink も解決する）。相対パスのまま起動すると、子プロセスの cwd（workspace 内）を基準に解決されうる。これは `PATH` の相対 entry を除くのと同じ理由である。
 - trade-off: `HOME` を差し替えるので、user が `~/texmf` に入れたパッケージは使えない。必要になったら、明示的な option（例: 追加の読み取り専用 texmf ツリー）として設計する。
+- preview tool（`mutool` / `pdfinfo` / `pdftoppm`、#8）には `PATH`・`LC_ALL=C`・`HOME`（preview ごとに作る空の一時ディレクトリ）だけを渡す。kpathsea の変数は不要なので渡さない。tool は検出時に解決した絶対パスで起動する。`PATH` の相対 entry（`.` など）は、検出に使わず、tool に渡す `PATH` からも除く。
 
 ### 3.5 latexmk の起動（#5）
 
