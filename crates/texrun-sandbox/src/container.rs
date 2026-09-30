@@ -1074,6 +1074,13 @@ esac
         Runtime::with_program(crate::RuntimeKind::Docker, script).unwrap()
     }
 
+    /// A container without mounts: the fake daemon mounts nothing, and a
+    /// texrun running as root would hand writable mounts to the container
+    /// user first.
+    fn unmounted() -> ContainerSpec {
+        ContainerSpec::new("texrun-engine:latest", ContainerLimits::new(4096, 64, 2))
+    }
+
     fn limited_run() -> Spec<'static> {
         Spec::new("/bin/true", Cwd::Path(Path::new("/"))).with_rlimits(
             Rlimits::new()
@@ -1086,7 +1093,7 @@ esac
     fn a_container_without_its_limits_is_not_started() {
         let dir = tempfile::tempdir().unwrap();
         let rt = fake_runtime(dir.path(), &host_config(0));
-        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let container = Container::new(&rt, unmounted());
         let err = container.command(&limited_run()).unwrap_err();
         assert!(
             matches!(&err, RunError::Unsupported(r) if r.contains("memory limit")),
@@ -1107,7 +1114,7 @@ esac
     fn a_container_with_its_limits_is_started() {
         let dir = tempfile::tempdir().unwrap();
         let rt = fake_runtime(dir.path(), &host_config(4096));
-        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let container = Container::new(&rt, unmounted());
         let command = container.command(&limited_run()).unwrap();
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, ["start", "--attach", "--", "fake-id"]);
@@ -1126,7 +1133,7 @@ esac
             .replace("echo fake-id", "exit 1");
         std::fs::write(&script, text).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let container = Container::new(&rt, spec("texrun-engine:latest"));
+        let container = Container::new(&rt, unmounted());
         let err = container.command(&limited_run()).unwrap_err();
         assert!(matches!(err, RunError::Spawn { .. }), "{err:?}");
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
