@@ -158,6 +158,12 @@ pub enum NoticeKind {
     Cancelled,
     /// The images could not be written to the output root.
     OutputError,
+    /// The resource limits of the tools could not be set before they
+    /// started, because the exec gate cannot be used
+    /// ([`Previewer::with_exec_gate`](crate::Previewer::with_exec_gate)):
+    /// either nothing was rendered (a required gate), or the limits were
+    /// set only after each tool started (best effort).
+    ResourceLimits,
     /// Anything else. Unknown values are deserialized as this variant.
     #[serde(other)]
     Other,

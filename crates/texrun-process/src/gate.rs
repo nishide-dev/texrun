@@ -22,9 +22,20 @@
 //! where `<gate args>` are those of [`ExecGate::with_args`] (e.g. a hidden
 //! subcommand) and `<name>` is one of `fsize`, `core`, `as`, `cpu`,
 //! `nproc`. Everything after `--` is the program (an absolute path) and its
-//! arguments, which the gate passes to `exec` unchanged: they are never
-//! parsed, expanded or given to a shell. The environment and the working
-//! directory are the gate's own, i.e. exactly those the supervisor gave it.
+//! arguments, which the gate passes to `exec` unchanged: the gate never
+//! parses or expands them, and never hands them to a shell. (`exec` goes
+//! through the C library's `execvp`, which runs a file without a known
+//! executable format with `/bin/sh`, exactly as a spawn without the gate
+//! would; the programs are executables found by the caller.) The
+//! environment and the working directory are the gate's own, i.e. exactly
+//! those the supervisor gave it.
+//!
+//! File descriptors: the program gets stdin (`/dev/null`), stdout and
+//! stderr from the supervisor, and none of the gate's own descriptors
+//! (they are close-on-exec). A descriptor that is *not* close-on-exec and
+//! was inherited by the host process from whoever started it is inherited
+//! by the program as well, with or without the gate: closing descriptors
+//! the gate does not own needs `unsafe`, which the workspace forbids.
 //!
 //! stdin of the gate is one end of a Unix socket pair; the supervisor holds
 //! the other:
@@ -67,7 +78,10 @@ const MAX_REPORT: usize = 256;
 ///
 /// There is no default location: a library cannot know where its host
 /// binary is. The texrun CLI uses its own executable with a hidden
-/// subcommand (`ExecGate::new(current_exe).with_args(["__exec-gate"])`);
+/// subcommand, and requires it ([`ExecGate::with_required`]): on Linux
+/// `ExecGate::new("/proc/self/exe")`, which the child resolves to the image
+/// it runs (so it works even after the file was replaced, for children on
+/// this host only), elsewhere `std::env::current_exe()`;
 /// another program can do the same by calling [`run_gate`] for that
 /// subcommand, or use the `texrun-exec-gate` binary of this crate. Nothing
 /// is looked up in `PATH` or taken from the environment.
@@ -75,6 +89,9 @@ const MAX_REPORT: usize = 256;
 pub struct ExecGate {
     program: PathBuf,
     args: Vec<OsString>,
+    /// Set by [`ExecGate::unavailable`].
+    problem: Option<String>,
+    required: bool,
 }
 
 impl ExecGate {
@@ -94,7 +111,41 @@ impl ExecGate {
         Self {
             program: program.into(),
             args: Vec::new(),
+            problem: None,
+            required: false,
         }
+    }
+
+    /// A gate that cannot be used, because of `reason` (e.g. the host
+    /// binary could not find its own executable). Runs with it fall back or
+    /// fail as for any unusable gate ([`ExecGate::check`]), with `reason`
+    /// as the explanation.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            problem: Some(reason.into()),
+            ..Self::new(PathBuf::new())
+        }
+    }
+
+    /// Whether a run must fail rather than fall back to
+    /// [`StartMode::Immediate`](crate::StartMode::Immediate) when this gate
+    /// cannot be used: with `true`, an unusable gate is
+    /// [`RunError::Unsupported`](crate::RunError::Unsupported) before
+    /// anything is spawned, whatever [`Spec::require_rlimits`](crate::Spec::require_rlimits)
+    /// says. Default: `false`.
+    ///
+    /// Unlike `require_rlimits`, this does not also require every limit to
+    /// be settable (macOS cannot set `RLIMIT_AS`, see
+    /// [`Resource::AddressSpace`]).
+    #[must_use]
+    pub fn with_required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+
+    /// See [`ExecGate::with_required`].
+    pub fn is_required(&self) -> bool {
+        self.required
     }
 
     /// Arguments placed before the protocol arguments, e.g. the hidden
@@ -119,19 +170,24 @@ impl ExecGate {
         &self.args
     }
 
-    /// Why the gate cannot be used, or `None` if it looks usable (an
-    /// absolute path of an executable regular file).
-    pub(crate) fn unusable(&self) -> Option<String> {
+    /// Checks that the gate looks usable (an absolute path of an
+    /// executable regular file), or says why not. The supervisor does the
+    /// same check before every run; a caller can use it to find out once,
+    /// up front.
+    pub fn check(&self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
 
+        if let Some(problem) = &self.problem {
+            return Err(problem.clone());
+        }
         let shown = self.program.display();
         if !self.program.is_absolute() {
-            return Some(format!("the exec gate {shown} is not an absolute path"));
+            return Err(format!("the exec gate {shown} is not an absolute path"));
         }
         match self.program.metadata() {
-            Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0 => None,
-            Ok(_) => Some(format!("the exec gate {shown} is not an executable file")),
-            Err(e) => Some(format!("the exec gate {shown} cannot be used: {e}")),
+            Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0 => Ok(()),
+            Ok(_) => Err(format!("the exec gate {shown} is not an executable file")),
+            Err(e) => Err(format!("the exec gate {shown} cannot be used: {e}")),
         }
     }
 
@@ -166,13 +222,25 @@ impl ExecGate {
 ///
 /// Call it first thing in `main`, before anything else touches stdin or
 /// the resource limits.
+///
+/// Reports go to stdin only if it is a socket (as set up by the
+/// supervisor), so a gate started by hand never writes into a terminal or
+/// file.
 pub fn run_gate<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = OsString>,
 {
-    // The report channel: a close-on-exec copy of stdin (the socket shared
-    // with the supervisor), so that a successful `exec` closes it.
-    let report = rustix::io::fcntl_dupfd_cloexec(rustix::stdio::stdin(), 3).ok();
+    // The report channel: a close-on-exec copy of stdin, so that a
+    // successful `exec` closes it. Only when stdin is a socket (the one the
+    // supervisor shares): a gate run by hand must not write into a
+    // terminal or a file on its stdin.
+    let stdin = rustix::stdio::stdin();
+    let report = rustix::fs::fstat(stdin)
+        .ok()
+        .filter(|st| {
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Socket
+        })
+        .and_then(|_| rustix::io::fcntl_dupfd_cloexec(stdin, 3).ok());
     let fail = |stage: &str, error: Option<&io::Error>, message: String, status: u8| {
         let errno = error.and_then(io::Error::raw_os_error);
         let code = errno.map_or_else(|| "-".to_owned(), |e| e.to_string());
@@ -342,8 +410,12 @@ impl Channel {
 
     /// Releases the gate. An error means the gate is gone already; its
     /// report (or its absence) says why.
+    ///
+    /// Never raises `SIGPIPE` (`MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on
+    /// macOS), so a host that does not ignore it survives a gate that is
+    /// already gone.
     pub(crate) fn release(&mut self) {
-        let _ = self.stream.write_all(TOKEN);
+        let _ = send_token(&self.stream);
         if self.stream.set_nonblocking(true).is_err() {
             // Without non-blocking reads the channel cannot be polled.
             self.eof = true;
@@ -371,6 +443,25 @@ impl Channel {
     pub(crate) fn report(&self) -> Report {
         parse_report(&self.buf)
     }
+}
+
+/// Writes [`TOKEN`] to `stream` without raising `SIGPIPE`.
+fn send_token(stream: &UnixStream) -> io::Result<()> {
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd"))]
+    rustix::net::sockopt::set_socket_nosigpipe(stream, true)?;
+    let mut rest = TOKEN;
+    while !rest.is_empty() {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = rustix::net::SendFlags::NOSIGNAL;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let flags = rustix::net::SendFlags::empty();
+        match rustix::net::send(stream, rest, flags) {
+            Ok(n) => rest = &rest[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 fn parse_report(buf: &[u8]) -> Report {
@@ -481,13 +572,13 @@ mod tests {
 
     #[test]
     fn a_gate_must_be_an_absolute_executable() {
-        assert!(ExecGate::new("sh").unusable().is_some());
-        assert!(
-            ExecGate::new("/nonexistent/texrun-gate")
-                .unusable()
-                .is_some()
-        );
-        assert!(ExecGate::new("/").unusable().is_some());
-        assert_eq!(ExecGate::new("/bin/sh").unusable(), None);
+        assert!(ExecGate::new("sh").check().is_err());
+        assert!(ExecGate::new("/nonexistent/texrun-gate").check().is_err());
+        assert!(ExecGate::new("/").check().is_err());
+        assert_eq!(ExecGate::new("/bin/sh").check(), Ok(()));
+        let gone = ExecGate::unavailable("no executable path");
+        assert_eq!(gone.check(), Err("no executable path".to_owned()));
+        assert!(!gone.is_required());
+        assert!(gone.with_required(true).is_required());
     }
 }

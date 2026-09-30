@@ -175,7 +175,9 @@ CI の `integration` job で毎回実行する（[development.md](development.md
     3. `setrlimit(2)` で自分に limit を設定する（texrun 自身の hard limit を超えない）。失敗したら exec しない。
     4. stdin を `/dev/null` に差し替え、supervisor に `ok` を報告してから、tool を `exec` する。報告用の fd は close-on-exec なので、exec が成功すると閉じる。exec の失敗（tool が無いなど）も報告され、supervisor は gate を使わない場合と同じ spawn error にする。
   - rlimit は exec の後も引き継がれ、PID（= PGID）も変わらない。そのため tool は最初の命令から制限された状態で動き、tool が起動する子孫もすべて limit を継承する。process group の kill と reap の前提（§3.6）もそのまま成り立つ。
-  - gate は tool の引数や PDF のパスを解釈しない。`--` の後はそのまま `exec` の argv に渡し、shell も `PATH` の検索も使わない（tool は絶対パスで指定する）。環境変数と cwd は、supervisor が gate に与えたもの（§3.4 の allowlist、`work/` の fd）をそのまま引き継ぐ。
+  - gate は tool の引数や PDF のパスを解釈しない。`--` の後はそのまま `exec` の argv に渡し、shell で解釈させることも、`PATH` を検索することもない（tool は絶対パスで指定する）。なお `exec` は C library の `execvp` を経由するので、実行形式として認識されない file（ENOEXEC）は `/bin/sh` で実行し直される。これは gate を使わない spawn（std）と同じ挙動で、tool は texrun が検出した実行ファイルである。環境変数と cwd は、supervisor が gate に与えたもの（§3.4 の allowlist、`work/` の fd）をそのまま引き継ぐ。
+  - tool が受け取る fd は、stdin（`/dev/null`）・stdout・stderr だけである。gate 自身の fd（socket pair と報告用の fd）は close-on-exec なので継承されない。**既知の制約**: texrun を起動した親から close-on-exec でない fd を継承していた場合、その fd は gate を経て tool にも継承される（gate を使わない spawn と同じ）。自分が所有しない fd を閉じるには `unsafe` が要るので、gate は fd を整理しない。
+  - gate が報告を書くのは、stdin が socket の場合（supervisor が用意したもの）だけである。利用者が手で起動した場合に、端末や stdin の file へ書き込むことはない。合図の送信は `SIGPIPE` を起こさない（Linux は `MSG_NOSIGNAL`、macOS は `SO_NOSIGPIPE`）。
   - `unsafe`（`pre_exec`）は使わない。`setrlimit` も `exec` も safe な API である。
   - 設定する値:
     - `RLIMIT_AS`: 2 GiB（Linux のみ。macOS は既に確保済みの address space より小さい値を拒否し、強制もしないので設定しない）
@@ -183,7 +185,13 @@ CI の `integration` job で毎回実行する（[development.md](development.md
     - `RLIMIT_CORE`: 0
   - `setrlimit` は macOS にもあるので、macOS でも `RLIMIT_FSIZE` と `RLIMIT_CORE` が exec 前から効く。
   - #25 の cgroup への attach は、gate が合図を待っている間に `Launcher::on_spawn` で行うか、gate の手順（3 と 4 の間）に加える。どちらの場合も exec 前なので、全ての子孫が対象になる。
-  - gate を使えない場合（`ExecGate` の path が実行可能な file でない。CLI では自分の実行ファイルの path が分からない場合）は、`Spec::require_rlimits` なら実行せずに `RunError::Unsupported` にし、そうでなければ `StartMode::Immediate`（spawn 直後に親から `prlimit(2)`、Linux のみ）に fallback して `Finished::gate_fallback` に記録する。preview は後者で、library として gate を指定せずに使った場合も `Immediate` になる。`Immediate` の保証範囲（設定までの間隔は時間で抑えられない、その間の確保や書き込みは取り消されない、その間に起動された子孫は制限されない）は `StartMode::Immediate` の rustdoc に書いてある。CLI は常に gate を指定するので、この gap は CLI の preview には無い。
+  - gate を使えない場合（`ExecGate` の path が実行可能な file でない、など）の動作は、次のとおりである。
+    - `ExecGate::with_required(true)` か `Spec::require_rlimits` を指定した場合は、何も spawn せずに `RunError::Unsupported` にする。
+    - それ以外の場合は `StartMode::Immediate`（spawn 直後に親から `prlimit(2)`、Linux のみ）に fallback し、`Finished::gate_fallback` に理由を記録する。`Immediate` の保証範囲（設定までの間隔は時間で抑えられない、その間の確保や書き込みは取り消されない、その間に起動された子孫は制限されない）は `StartMode::Immediate` の rustdoc に書いてある。
+    - preview は、gate が使えないことを最初に `ExecGate::check` で確かめ、warning の notice（`resource_limits`。CLI の JSON にも出る）で報告する。gate が必須なら、tool を 1 つも動かさずに preview を skip する（status は `skipped`）。必須でなければ、上記の fallback で描画する。実行中に gate が使えなくなった場合も、同じ notice を 1 回だけ出す。
+    - **CLI は gate を必須にする（fail-closed）**。preview が失敗しても compile の結果や exit code は変わらない（§3.2 の preview の方針）ので、制限を弱めて描画するより、描画しない方を選ぶ。
+    - CLI の gate は、Linux では `/proc/self/exe` である。spawn された子（exec 前の texrun 自身）の中で解決されるので、実行中に binary が削除・置き換えされても（package の更新など）、いま動いている texrun と同じ image が gate になる。host で起動する子に限って成り立つ（将来の container launcher、#26 では使わない）。macOS では `current_exe()` を使い、その path が使えない場合は上記のとおり preview を skip して notice を出す。
+    - library として gate を指定せずに `Previewer` を使った場合は、`Immediate` になる。
   - library として使う場合、gate の実行ファイルは呼び出し側が明示する（`ExecGate::new`。自分の binary の隠しサブコマンドで `texrun_process::run_gate` を呼ぶか、`texrun-process` の `texrun-exec-gate` binary を使う）。環境変数や `PATH` からは探さない。
   - latexmk は従来どおり rc の stdin gate（上記。Linux の `prlimit`）を使う。rc の gate は latexmk がファイルを書く前・子プロセスを起動する前に limit を設定する点で exec gate と同じ保証である。macOS で latexmk に `RLIMIT_FSIZE` を exec gate で設定することは、engine 側に gate の path を渡す API が要るので別途扱う。
 - preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。

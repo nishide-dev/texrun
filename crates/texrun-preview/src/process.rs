@@ -106,6 +106,9 @@ pub(crate) struct RunOutput {
     pub(crate) end: RunEnd,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    /// Why the exec gate was not used for this run
+    /// ([`texrun_process::Finished::gate_fallback`]).
+    pub(crate) gate_fallback: Option<String>,
 }
 
 impl RunOutput {
@@ -114,6 +117,7 @@ impl RunOutput {
             end,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            gate_fallback: None,
         }
     }
 
@@ -187,6 +191,7 @@ pub(crate) fn run(
             },
             stdout: done.stdout.bytes,
             stderr: done.stderr.bytes,
+            gate_fallback: done.gate_fallback,
         },
         // The notice names the program already.
         Err(texrun_process::RunError::Spawn { source, .. }) => {

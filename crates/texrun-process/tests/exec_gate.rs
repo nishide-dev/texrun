@@ -348,3 +348,53 @@ fn the_program_waits_for_on_spawn() {
     );
     assert!(dir.path().join("ran").exists());
 }
+
+#[test]
+fn a_required_gate_that_cannot_be_used_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    for gate in [
+        ExecGate::new("/nonexistent/texrun-exec-gate"),
+        ExecGate::unavailable("no executable path known"),
+    ] {
+        // No `require_rlimits`: the gate itself is required.
+        let spec = gated_sh(dir.path(), "touch ran")
+            .with_start(StartMode::ExecGate(gate.with_required(true)))
+            .with_rlimits(Rlimits::new().with(Resource::Core, 0));
+        let err = run(&spec, Watch::<()>::new()).unwrap_err();
+        assert!(matches!(err, RunError::Unsupported(_)), "{err:?}");
+        assert!(!dir.path().join("ran").exists());
+    }
+}
+
+#[test]
+fn an_unavailable_gate_falls_back_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = gated_sh(dir.path(), "exit 0").with_start(StartMode::ExecGate(
+        ExecGate::unavailable("no executable path known"),
+    ));
+    let done = run(&spec, Watch::<()>::new()).unwrap();
+    assert!(done.status.success());
+    assert_eq!(
+        done.gate_fallback.as_deref(),
+        Some("no executable path known")
+    );
+}
+
+#[test]
+fn a_gate_run_by_hand_does_not_write_to_its_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stdin");
+    fs::write(&path, "").unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let out = gate_by_hand(&["bogus"], Stdio::from(file), dir.path());
+    assert_eq!(out.status.code(), Some(i32::from(ExecGate::EXIT_USAGE)));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"",
+        "a report was written to stdin"
+    );
+}

@@ -344,12 +344,11 @@ fn render_previews(
     let pdf = result.pdf()?;
     let output_root = ws.output_dir();
     let pdf = output_root.join(pdf.path.as_path());
-    let mut previewer = Previewer::detect();
-    if let Some(gate) = crate::gate::exec_gate() {
-        previewer = previewer.with_exec_gate(gate);
-    }
     // Options were validated up front; `render` cannot fail otherwise.
-    previewer.render(&pdf, &output_root, &options).ok()
+    Previewer::detect()
+        .with_exec_gate(crate::gate::exec_gate())
+        .render(&pdf, &output_root, &options)
+        .ok()
 }
 
 /// Checks that are not expressed in the clap definition.

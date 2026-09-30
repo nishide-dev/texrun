@@ -323,10 +323,12 @@ fn check_spec<'s>(launcher: &dyn Launcher, spec: &'s Spec<'_>) -> Result<Plan<'s
                     spec.program_name()
                 )));
             }
-            match gate.unusable() {
-                None => Start::ExecGate(gate),
-                Some(reason) if required => return Err(RunError::Unsupported(reason)),
-                Some(reason) => {
+            match gate.check() {
+                Ok(()) => Start::ExecGate(gate),
+                Err(reason) if required || gate.is_required() => {
+                    return Err(RunError::Unsupported(reason));
+                }
+                Err(reason) => {
                     gate_fallback = Some(reason);
                     Start::Immediate
                 }

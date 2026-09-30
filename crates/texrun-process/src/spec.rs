@@ -229,9 +229,13 @@ impl<'a> Spec<'a> {
 /// `process_group(0)` itself, spawns, calls [`Launcher::on_spawn`], applies
 /// [`Spec::rlimits`] (if [`Launcher::apply_rlimits`]) and releases the start
 /// gate. With [`StartMode::ExecGate`], [`Launcher::command`] is given a
-/// spec for the gate (program and arguments of the gate, everything else
-/// unchanged), and the limits are passed to the gate instead of being set
-/// with `prlimit`. Every time it kills the process group it also calls
+/// spec for the gate: its program is the gate's (a path on the host, e.g.
+/// `/proc/self/exe` for the texrun CLI) and its arguments are the gate's,
+/// everything else is unchanged. The limits are passed to the gate instead
+/// of being set with `prlimit`. A launcher that runs the program elsewhere
+/// (a container runtime, #26) or applies the limits itself
+/// ([`Launcher::apply_rlimits`] `== false`, in which case the gate gets no
+/// limits) should be used without an exec gate. Every time it kills the process group it also calls
 /// [`Launcher::on_kill`], and after reaping the leader
 /// [`Launcher::on_reaped`].
 ///
