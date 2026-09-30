@@ -171,7 +171,7 @@ pub(crate) fn render(options: RcOptions) -> String {
     for var in EMPTY_VARIABLES {
         let _ = writeln!(rc, "${var} = '';");
     }
-    rc.push_str("$print_type = 'none';\n@cus_dep_list = ();\n\n1;\n");
+    rc.push_str("$print_type = 'none';\n@cus_dep_list = ();\n%extra_rule_spec = ();\n\n1;\n");
     rc
 }
 
@@ -291,11 +291,24 @@ mod tests {
 
     #[test]
     fn no_placeholders_other_than_latexmk_ones() {
-        // Only latexmk's own `%O` / `%S` / `%D` placeholders appear.
+        // Only latexmk's own `%O` / `%S` / `%D` placeholders appear, besides
+        // the `%extra_rule_spec` hash.
         let rc = render(RcOptions { stdin_gate: true });
         for (i, _) in rc.match_indices('%') {
-            let next = rc[i + 1..].chars().next();
-            assert!(matches!(next, Some('O' | 'S' | 'D')), "unexpected % at {i}");
+            let rest = &rc[i + 1..];
+            assert!(
+                matches!(rest.chars().next(), Some('O' | 'S' | 'D'))
+                    || rest.starts_with("extra_rule_spec = ();"),
+                "unexpected % at {i}"
+            );
         }
+    }
+
+    #[test]
+    fn no_extra_rules_or_custom_dependencies() {
+        let rc = render(RcOptions::default());
+        assert!(rc.contains("\n@cus_dep_list = ();\n"));
+        assert!(rc.contains("\n%extra_rule_spec = ();\n"));
+        assert_eq!(assignment(&rc, "print_type").as_deref(), Some("'none';"));
     }
 }

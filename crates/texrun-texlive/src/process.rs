@@ -175,11 +175,26 @@ impl Drop for Group {
 /// Sends `SIGKILL` to the process group. `ESRCH` (nobody left) and other
 /// errors are ignored: there is nothing more to do about them.
 ///
-/// Safe to call after the leader was reaped: a process group ID is not
-/// reused while any member is alive, so the signal cannot reach an
-/// unrelated group.
+/// Only called while the leader has not been reaped: the leader (alive or a
+/// zombie) keeps the PGID reserved, so the signal cannot reach an unrelated
+/// group.
 fn kill_group(pgid: Pid) {
     let _ = kill_process_group(pgid, Signal::KILL);
+}
+
+/// Whether the leader has exited, without reaping it
+/// (`waitid(P_PID, EXITED | NOHANG | NOWAIT)`).
+fn leader_exited(pid: Pid) -> io::Result<bool> {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(WaitId::Pid(pid), options) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Spawns `cmd` (program, args, env and cwd already set) in a new process
@@ -217,13 +232,11 @@ pub(crate) fn run(mut cmd: Command, watch: &Watch<'_>) -> Result<Finished, Engin
     }
 
     let mut last_size_check = Instant::now();
-    let (status, stop) = loop {
-        if let Some(status) = group
-            .child
-            .try_wait()
-            .map_err(io_error("waiting for latexmk"))?
-        {
-            break (status, None);
+    let stop = loop {
+        // Detect the exit without reaping: the leader stays a zombie, which
+        // keeps its PID and PGID reserved until the group has been killed.
+        if leader_exited(pgid).map_err(io_error("waiting for latexmk"))? {
+            break None;
         }
         let stop = if watch.cancel.is_some_and(CancelToken::is_cancelled) {
             Some(StopReason::Cancelled)
@@ -237,19 +250,19 @@ pub(crate) fn run(mut cmd: Command, watch: &Watch<'_>) -> Result<Finished, Engin
         } else {
             None
         };
-        if let Some(stop) = stop {
-            group.kill();
-            let status = group
-                .child
-                .wait()
-                .map_err(io_error("waiting for latexmk"))?;
-            break (status, Some(stop));
+        if stop.is_some() {
+            break stop;
         }
         thread::sleep(POLL_INTERVAL);
     };
     let elapsed = start.elapsed();
-    // Clean up whatever latexmk left behind, even after a normal exit.
+    // Stop the group (or, after a normal exit, whatever latexmk left behind)
+    // while the leader is not yet reaped, then reap it.
     group.kill();
+    let status = group
+        .child
+        .wait()
+        .map_err(io_error("waiting for latexmk"))?;
     group.reaped = true;
 
     let deadline = Instant::now() + READER_GRACE;
@@ -284,7 +297,8 @@ pub(crate) fn check_output_size(dirs: &[&Path], limits: &Limits) -> Option<StopR
     }
 }
 
-/// Applies `RLIMIT_FSIZE` to the gated child and lets it proceed.
+/// Applies `RLIMIT_FSIZE` (and `RLIMIT_CORE = 0`) to the gated child and
+/// lets it proceed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn release_gate(
     pgid: Pid,
@@ -293,21 +307,36 @@ fn release_gate(
 ) -> Result<(), EngineError> {
     use std::io::Write;
 
-    use rustix::process::{Resource, Rlimit, prlimit};
+    use rustix::process::{Resource, prlimit};
 
-    // `pgid` is the child's PID (it leads its own group).
-    let limit = Rlimit {
-        current: Some(max_file_bytes),
-        maximum: Some(max_file_bytes),
-    };
-    prlimit(Some(pgid), Resource::Fsize, limit)
+    // `pgid` is the child's PID (it leads its own group). The child
+    // inherited texrun's limits, so these values only ever lower them.
+    let fsize = lowered_limit(Resource::Fsize, max_file_bytes);
+    prlimit(Some(pgid), Resource::Fsize, fsize)
         .map_err(|e| io_error("setting RLIMIT_FSIZE on latexmk")(e.into()))?;
+    // Hitting RLIMIT_FSIZE raises SIGXFSZ, whose default action dumps core
+    // into TeX's working directory, outside the size checks.
+    prlimit(Some(pgid), Resource::Core, lowered_limit(Resource::Core, 0))
+        .map_err(|e| io_error("setting RLIMIT_CORE on latexmk")(e.into()))?;
     if let Some(mut stdin) = stdin {
         // An error means latexmk is already gone; the poll loop sees its
         // exit status.
         let _ = stdin.write_all(crate::rc::START_TOKEN);
     }
     Ok(())
+}
+
+/// `value` as both soft and hard limit, capped at texrun's own hard limit
+/// (which the child inherited), so that setting it never needs privileges
+/// and never raises a limit.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn lowered_limit(resource: rustix::process::Resource, value: u64) -> rustix::process::Rlimit {
+    let hard = rustix::process::getrlimit(resource).maximum;
+    let value = hard.map_or(value, |h| h.min(value));
+    rustix::process::Rlimit {
+        current: Some(value),
+        maximum: Some(value),
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

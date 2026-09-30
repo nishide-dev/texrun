@@ -49,7 +49,9 @@ const RC_FILE_NAME: &str = "texrun.latexmkrc";
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LatexmkConfig {
-    /// Use this latexmk executable instead of searching `PATH`.
+    /// Use this latexmk executable instead of searching `PATH`. A relative
+    /// path is resolved against texrun's working directory; the resolved
+    /// absolute path (symlinks resolved) is what gets run.
     pub latexmk: Option<PathBuf>,
     /// The `PATH` used to find latexmk and passed to it (after dropping
     /// empty and relative entries). `None`: the host `PATH`.
@@ -137,6 +139,10 @@ pub struct LatexmkRun {
     pub stderr: CapturedOutput,
     /// PID of latexmk, which was also the process group ID; `0` if latexmk
     /// was not started (cancelled before the start).
+    ///
+    /// For diagnostics (logs, tests) only. The process has been reaped when
+    /// this value is returned, so the PID may already belong to an unrelated
+    /// process: never send signals to it.
     pub pid: u32,
 }
 
@@ -145,6 +151,11 @@ pub struct LatexmkRun {
 /// Discovery of latexmk happens on every [`TypesetEngine::probe`] /
 /// compile, so a missing installation is reported as
 /// [`EngineError::Unavailable`] at that point, not on construction.
+///
+/// The latexmk version is only known after a successful
+/// [`TypesetEngine::probe`]; until then [`TypesetEngine::info`] (and so
+/// [`CompileResult::engine`]) has no version. Callers that report the version
+/// (e.g. the CLI) should call `probe()` once before compiling.
 #[derive(Debug)]
 pub struct LatexmkEngine {
     config: LatexmkConfig,
@@ -186,8 +197,13 @@ impl LatexmkEngine {
     /// Finds the latexmk executable.
     pub fn locate(&self) -> Result<PathBuf, EngineError> {
         if let Some(explicit) = &self.config.latexmk {
-            return if command::is_executable_file(explicit) {
-                Ok(explicit.clone())
+            // Resolve now (a relative path against texrun's working
+            // directory): spawned with the workspace as working directory, a
+            // relative program path would name a file inside the workspace.
+            let resolved = fs::canonicalize(explicit)
+                .map_err(|e| unavailable(format!("cannot resolve {}: {e}", explicit.display())))?;
+            return if command::is_executable_file(&resolved) {
+                Ok(resolved)
             } else {
                 Err(unavailable(format!(
                     "{} is not an executable file",
@@ -205,6 +221,12 @@ impl LatexmkEngine {
 
     /// Compiles like [`TypesetEngine::compile`] and also returns the
     /// captured console output.
+    ///
+    /// An existing `<stem>.pdf` / `<stem>.log` in the output directory (e.g.
+    /// left from an earlier compile in the same workspace) is removed before
+    /// latexmk starts, so the reported artifacts are always from this run.
+    /// Other files in the output directory are left alone, and latexmk may
+    /// reuse them (e.g. `.aux`).
     pub fn run(
         &self,
         ctx: &CompileContext<'_>,
@@ -324,7 +346,7 @@ impl LatexmkEngine {
         let real = fs::canonicalize(dir.path())
             .map_err(io_error(format!("resolving {}", dir.path().display())))?;
         if real.starts_with(workspace_root) {
-            return Err(EngineError::InvalidRequest(format!(
+            return Err(unavailable(format!(
                 "the latexmk rc directory {} must be outside the workspace",
                 real.display()
             )));
@@ -506,6 +528,22 @@ impl Plan {
                     "{} resolves outside the workspace",
                     dir.display()
                 )));
+            }
+        }
+        // Stale artifacts would be reported as this run's output.
+        for ext in ["pdf", "log"] {
+            let path = self.output_dir.join(format!("{}.{ext}", self.stem));
+            match fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Ok(meta) if !meta.is_dir() => fs::remove_file(&path)
+                    .map_err(io_error(format!("removing the stale {}", path.display())))?,
+                Ok(_) => {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "{} is a directory",
+                        path.display()
+                    )));
+                }
+                Err(e) => return Err(io_error(format!("inspecting {}", path.display()))(e)),
             }
         }
         layout::mirror_subdirs(
@@ -798,6 +836,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_latexmk_is_resolved_to_an_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(bin.path()).unwrap().join("latexmk");
+        fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The same file, named relative to texrun's working directory.
+        let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(real.strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+
+        let engine = LatexmkEngine::new(LatexmkConfig::default().with_latexmk(&relative));
+        let located = engine.locate().unwrap();
+        assert!(located.is_absolute());
+        assert_eq!(located, real);
+
+        // A relative path that does not exist from texrun's working
+        // directory is unavailable, whatever exists in a workspace.
+        let engine =
+            LatexmkEngine::new(LatexmkConfig::default().with_latexmk("texrun-no-such-dir/latexmk"));
+        assert!(matches!(
+            engine.locate(),
+            Err(EngineError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_pdf_and_log_are_removed_before_the_run() {
+        let (_dir, root) = workspace_with(&["main.tex"]);
+        let plan = Plan::new(&root, &request("main.tex")).unwrap();
+        fs::create_dir_all(&plan.output_dir).unwrap();
+        for ext in ["pdf", "log", "aux"] {
+            fs::write(plan.output_dir.join(format!("main.{ext}")), "old").unwrap();
+        }
+        plan.prepare_dirs().unwrap();
+        assert!(!plan.output_dir.join("main.pdf").exists());
+        assert!(!plan.output_dir.join("main.log").exists());
+        assert!(plan.output_dir.join("main.aux").exists());
+        assert!(plan.collect_artifacts().is_empty());
+    }
+
+    #[test]
     fn rc_is_written_outside_the_workspace_and_removed() {
         let (_dir, root) = workspace_with(&["main.tex"]);
         let engine = LatexmkEngine::default();
@@ -813,7 +899,7 @@ mod tests {
         let engine = LatexmkEngine::new(LatexmkConfig::default().with_rc_parent(root.path()));
         assert!(matches!(
             engine.write_rc(root.path()),
-            Err(EngineError::InvalidRequest(_))
+            Err(EngineError::Unavailable { .. })
         ));
     }
 

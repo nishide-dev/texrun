@@ -137,6 +137,8 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
   - 代わりに Linux では、spawn 直後に親から `prlimit(2)` で latexmk に設定する。latexmk が設定前にファイルを書いたり子プロセスを起動したりしないよう、texrun 管理 rc（§3.5）の先頭で stdin から開始の合図を待たせる。親は `prlimit` の後に合図を送る。合図が来ずに stdin が閉じた場合、rc は何もせずに終了する（終了コード 125）。
   - macOS には `prlimit` が無い。1 ファイルの上限は poll（目安 500 ms ごと）でのみ強制するので、検出までの間は上限を超えて書かれうる（ログを出し続ける文書で約 16 MB）。
 - `RLIMIT_FSIZE` で書き込みが止まった場合も、終了後の集計で上限に達したファイルを検出し、同じ diagnostic を付ける。
+- 設定する値は、texrun 自身の hard limit（子プロセスが継承する値）と上限値の小さい方とする。上限を強める方向にだけ働くので、権限は要らない。
+- **core dump は無効にする**（`RLIMIT_CORE=0`、soft・hard とも。Linux で `RLIMIT_FSIZE` と同時に設定する）。`SIGXFSZ` の既定の動作は core dump で、core ファイルは TeX の cwd（workspace 内）に作られ、output dir の集計の対象外になるためである。macOS では `RLIMIT_FSIZE` を設定せず、停止は `SIGKILL` で行うので、core は作られない。
 - 上限によって停止した場合は `CompileOutcome::Failed` とし、texrun 由来の diagnostic（「output limit exceeded」等）を付ける。`CompileOutcome` は `#[non_exhaustive]` なので、専用の outcome を追加するかは #5 で判断してよい。
 
 ### 3.3 入力の上限と除外（#4、#21 の実装値と揃える）
@@ -179,6 +181,7 @@ engine が生成した log・PDF も信頼できない入力として扱う。di
   - latexmk の system rc を指定する `LATEXMKRCSYS`
   - token などの秘密情報を含みうる、その他の任意の変数
 - 再現可能なビルド用の変数（`SOURCE_DATE_EPOCH` / `FORCE_SOURCE_DATE`）は §3.9 で扱う。
+- latexmk の実行ファイルを明示的に指定した場合（`LatexmkConfig::latexmk`、#6 の option 候補）も、起動前に絶対パスに解決する（相対パスは texrun の cwd を基準に解決し、symlink も解決する）。相対パスのまま起動すると、子プロセスの cwd（workspace 内）を基準に解決されうる。これは `PATH` の相対 entry を除くのと同じ理由である。
 - trade-off: `HOME` を差し替えるので、user が `~/texmf` に入れたパッケージは使えない。必要になったら、明示的な option（例: 追加の読み取り専用 texmf ツリー）として設計する。
 
 ### 3.5 latexmk の起動（#5）
@@ -294,8 +297,8 @@ latexmk はログの特定の行を見てサブディレクトリを作る機能
   - latexmk だけに `SIGTERM` を送ると、その子プロセスが親 PID 1 のまま走り続けることを確認した。
   - TeX に graceful shutdown は不要で、途中までの log はファイルに残る。そのため `SIGTERM` による猶予は設けない。
 - latexmk が正常終了した後も `killpg(SIGKILL)` を 1 回送り、残った子孫を掃除する（`ESRCH` は無視する）。
-  - group に生存メンバーがいる間は、同じ ID の process group は作られない。
-  - そのため、leader を reap した後に `killpg` しても、無関係なプロセスには届かない。
+  - **leader を reap する前に `killpg` する。** leader の終了は `waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)` で検知し、reap しない。leader の zombie が PID と PGID を確保しているので、`killpg` が無関係な process group に届くことは無い。
+  - `killpg` の後で leader を reap する。timeout / cancel / 上限超過の場合も同じ順序で行う。
 - `ctx.cancel.is_cancelled()`、timeout、出力サイズは、同じ poll ループで確認する（#20 からの申し送りどおり）。
 - stdout / stderr の reader thread は、process group を kill した後に最大 2 秒だけ待つ。group から抜けたプロセスが pipe を開いたままでも、compile は終わる（それまでに読めた分を返す）。
 

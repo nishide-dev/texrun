@@ -396,6 +396,13 @@ fn japanese_and_space_file_names() {
     assert_succeeded(&run);
     assert_eq!(run.result.pdf().unwrap().path.as_str(), "論文 ドラフト.pdf");
     assert!(ws.output_dir().join("論文 ドラフト.pdf").is_file());
+
+    // A full-width space (U+3000) is allowed by the name check and must
+    // survive latexmk's argument splitting for `internal` commands.
+    let (wide, wide_ws, _wp) =
+        self::run(&[("全角\u{3000}空白.tex", MINIMAL)], "全角\u{3000}空白.tex");
+    assert_succeeded(&wide);
+    assert!(wide_ws.output_dir().join("全角\u{3000}空白.pdf").is_file());
 }
 
 #[test]
@@ -506,6 +513,7 @@ fn output_directory_limit_stops_the_compile() {
 #[test]
 #[ignore = "requires TeX Live with latexmk; run with --ignored (see docs/development.md)"]
 fn per_file_limit_stops_the_compile() {
+    allow_core_dumps();
     let max = 3 * 1024 * 1024;
     // A long check interval, so that on Linux RLIMIT_FSIZE is what stops the
     // writer; elsewhere the size check does.
@@ -545,6 +553,33 @@ fn per_file_limit_stops_the_compile() {
         assert!(run.result.elapsed < Duration::from_secs(30));
     }
     assert!(live_group_members(run.pid).is_empty());
+    // No core dump from the SIGXFSZ, even though texrun's own soft
+    // RLIMIT_CORE was raised above (texrun sets RLIMIT_CORE=0 for latexmk on
+    // Linux; elsewhere the group is stopped with SIGKILL, which never dumps).
+    let mut top: Vec<_> = fs::read_dir(ws.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    top.sort();
+    assert_eq!(
+        top,
+        [".texrun", "main.tex"],
+        "unexpected files in the workspace"
+    );
+}
+
+/// Raises this process's soft `RLIMIT_CORE` to its hard limit, so that a
+/// child would dump core unless texrun disables it.
+fn allow_core_dumps() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Core);
+    let _ = setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: limit.maximum,
+            maximum: limit.maximum,
+        },
+    );
 }
 
 #[test]

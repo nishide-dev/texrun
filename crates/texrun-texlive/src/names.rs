@@ -30,14 +30,28 @@ pub(crate) fn check_name(what: &str, name: &str) -> Result<(), EngineError> {
 }
 
 /// [`check_name`] for a host path, which must also be valid UTF-8.
+///
+/// Called only after the workspace-relative parts passed [`check_name`], so
+/// a failure is a property of the host (e.g. the temporary directory name)
+/// rather than of the request, and is reported as
+/// [`EngineError::Unavailable`].
 pub(crate) fn check_host_path(what: &str, path: &Path) -> Result<(), EngineError> {
+    let host_error = |detail: String| EngineError::Unavailable {
+        engine: crate::ENGINE_NAME.to_owned(),
+        reason: format!(
+            "{detail}; use a temporary directory whose path texrun accepts (e.g. set TMPDIR)"
+        ),
+    };
     let Some(text) = path.to_str() else {
-        return Err(EngineError::InvalidRequest(format!(
+        return Err(host_error(format!(
             "{what} {} is not valid UTF-8",
             path.display()
         )));
     };
-    check_name(what, text)
+    check_name(what, text).map_err(|e| match e {
+        EngineError::InvalidRequest(detail) => host_error(detail),
+        other => other,
+    })
 }
 
 fn is_allowed(c: char) -> bool {
@@ -149,6 +163,18 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(check_host_path("output directory", Path::new("/tmp/a\"b/out")).is_err());
+        // A bad host path is a host problem, not an invalid request.
+        assert!(matches!(
+            check_host_path("output directory", Path::new("/tmp/a\"b/out")),
+            Err(EngineError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn unicode_spaces_are_accepted() {
+        for c in ['\u{3000}', '\u{00A0}', '\u{2002}', '\u{2028}'] {
+            let name = format!("a{c}b.tex");
+            assert!(ok(&name), "{name:?} should be accepted");
+        }
     }
 }
