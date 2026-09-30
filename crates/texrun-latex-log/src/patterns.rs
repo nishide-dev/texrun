@@ -131,18 +131,6 @@ pub(crate) fn missing_file_name(text: &str) -> Option<&str> {
     })
 }
 
-/// Whether a context line shows a command that loads a package or class.
-pub(crate) fn loads_package_or_class(context: &str) -> bool {
-    [
-        "\\usepackage",
-        "\\RequirePackage",
-        "\\documentclass",
-        "\\LoadClass",
-    ]
-    .iter()
-    .any(|cmd| context.contains(cmd))
-}
-
 /// Recognizes `LaTeX <what>: `, `LaTeX Font <what>: `, `Package <name>
 /// <what>: ` and `Class <name> <what>: ` and returns the continuation-line
 /// prefix name and the text after the colon.
@@ -265,6 +253,14 @@ pub(crate) fn context_line(line: &str) -> Option<u32> {
     parse_line_number(&rest[..digits])
 }
 
+/// The text after `l.<n> ` of a context line (`""` for a bare `l.<n>`).
+pub(crate) fn context_text(line: &str) -> Option<&str> {
+    context_line(line)?;
+    let rest = line.strip_prefix("l.")?;
+    let rest = &rest[leading_digits(rest)..];
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// The control sequence at the end of the first context line of an
 /// `Undefined control sequence` error, e.g. `\foo` in `l.5 \foo`.
 pub(crate) fn trailing_control_sequence(line: &str) -> Option<&str> {
@@ -354,9 +350,6 @@ mod tests {
             Some("tikz.sty")
         );
         assert_eq!(missing_file_name("LaTeX Error: File `x"), None);
-        assert!(loads_package_or_class("l.7 \\usepackage{tikz}"));
-        assert!(loads_package_or_class("l.1 \\documentclass"));
-        assert!(!loads_package_or_class("l.8 \\begin"));
     }
 
     #[test]
@@ -480,6 +473,10 @@ mod tests {
         assert_eq!(context_line("l.12"), Some(12));
         assert_eq!(context_line("l.x"), None);
         assert_eq!(context_line("l.5x"), None);
+        assert_eq!(context_text("l.5 \\foo "), Some("\\foo "));
+        assert_eq!(context_text("l.8 ^^M"), Some("^^M"));
+        assert_eq!(context_text("l.12"), Some(""));
+        assert_eq!(context_text("l.x \\foo"), None);
         assert_eq!(trailing_control_sequence("l.5 \\foo"), Some("\\foo"));
         assert_eq!(
             trailing_control_sequence("\\mymacro ->\\foo@bar "),

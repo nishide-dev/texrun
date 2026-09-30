@@ -185,6 +185,47 @@ fn texlive_reports_located_errors() {
         text.contains("chapters/intro.tex:3: error: Undefined control sequence"),
         "{text}"
     );
+    // `-halt-on-error` stops TeX after it: still one error.
+    assert!(text.contains(" (1 error, 0 warnings)\n"), "{text}");
+    assert!(!text.contains("Fatal error"), "{text}");
+}
+
+#[test]
+fn texlive_missing_package_is_one_located_error() {
+    common::require_texlive!();
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage[draft]{texrunnonexistentpackage}\n% a comment\n\n\\begin{document}\nHi\n\\end{document}\n",
+    )]);
+    let out = texrun(dir.path(), &["compile", "main.tex"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with(
+            "main.tex:3: error: LaTeX Error: File `texrunnonexistentpackage.sty' not found.\n"
+        ),
+        "{text}"
+    );
+    assert!(text.contains(" (1 error, 0 warnings)\n"), "{text}");
+    assert!(!text.contains("Emergency stop"), "{text}");
+
+    let (_, doc, stderr) = run_json(dir.path(), &["compile", "--json", "main.tex"]);
+    let diagnostics = doc["diagnostics"].as_array().unwrap();
+    let severities: Vec<_> = diagnostics
+        .iter()
+        .map(|d| (d["severity"].as_str(), d["kind"].as_str()))
+        .collect();
+    assert_eq!(
+        severities,
+        [
+            (Some("error"), Some("missing_file")),
+            (Some("info"), Some("emergency_stop"))
+        ],
+        "{doc:#}\n{stderr}"
+    );
+    assert_eq!(diagnostics[0]["line"], 3);
 }
 
 #[test]

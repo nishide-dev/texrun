@@ -4,8 +4,10 @@ use std::path::Path;
 
 use texrun_core::{Diagnostic, DiagnosticKind, Severity, WorkspacePath, WorkspaceRoot};
 
+use crate::SourceFiles;
 use crate::lines::Lines;
 use crate::patterns::{self, ErrorHeader};
+use crate::request::{self, Missing};
 use crate::stack::FileStack;
 
 /// Maximum number of continuation lines appended to a message.
@@ -20,6 +22,10 @@ const MAX_MESSAGE_BYTES: usize = 2048;
 const MAX_EXCERPT_BYTES: usize = 4096;
 /// Upper bound of the number of lines in [`Diagnostic::raw_excerpt`].
 const MAX_EXCERPT_LINES: usize = 32;
+/// At most this many source files are read per log. TeX stops at the first
+/// missing package, so a real log needs one; document output could fake
+/// more, and each read may cost up to the caller's size limit.
+const MAX_SOURCE_READS: usize = 4;
 
 pub(crate) struct Config<'a> {
     pub workspace_root: Option<&'a WorkspaceRoot>,
@@ -28,6 +34,8 @@ pub(crate) struct Config<'a> {
     pub suspect_wrap_width: Option<usize>,
     /// See [`LogParser::with_max_diagnostics`](crate::LogParser::with_max_diagnostics).
     pub max_diagnostics: usize,
+    /// See [`LogParser::parse_with_sources`](crate::LogParser::parse_with_sources).
+    pub sources: &'a dyn SourceFiles,
 }
 
 /// The result of parsing a log.
@@ -51,6 +59,8 @@ pub(crate) fn parse(lines: &Lines, config: &Config<'_>) -> ParsedLog {
         stack: FileStack::default(),
         out: Collector::new(config.max_diagnostics),
         stopped: false,
+        errors_reported: 0,
+        source_reads: std::cell::Cell::new(0),
         undefined_reported: false,
         untrusted_stop_line: false,
     };
@@ -80,6 +90,10 @@ struct Parser<'a> {
     out: Collector,
     /// An emergency stop has been reported.
     stopped: bool,
+    /// Number of errors reported so far (whether or not they were kept).
+    errors_reported: usize,
+    /// Number of [`SourceFiles::read`] calls so far.
+    source_reads: std::cell::Cell<usize>,
     /// An undefined reference or citation has been reported.
     undefined_reported: bool,
     /// The next `Emergency stop.` repeats a line that was found to be wrong.
@@ -161,18 +175,27 @@ impl<'a> Parser<'a> {
         let mut line = header.line;
         let mut excerpt_end = end;
         if let Some(ctx) = context {
-            if !ctx.crossed_stop {
-                line = line.or(Some(ctx.line));
+            let requested = (class.kind == DiagnosticKind::MissingFile)
+                .then(|| patterns::missing_file_name(header.text).and_then(Missing::new))
+                .flatten();
+            if ctx.stop.is_none() {
                 // `l.<n> <before>` is followed by the rest of the line.
                 excerpt_end = (ctx.index + 2).min(self.lines.len());
                 end = self.skip_trailing(excerpt_end);
-            } else if class.kind != DiagnosticKind::MissingFile
-                || self.stop_context_is_request(header.text, ctx.index)
-            {
-                line = line.or(Some(ctx.line));
-            } else {
-                // The following `Emergency stop.` has the same (wrong) line.
+            }
+            if let Some(missing) = requested {
+                // A missing package or class: the context is where LaTeX
+                // looked ahead, not the request (see `request`).
+                let located = ctx
+                    .stop
+                    .and_then(|stop| self.locate_request(missing, stop, ctx, file.as_ref()));
+                line = line.or(located);
+                // The following `Emergency stop.` reports the looked-ahead
+                // position, which is not where to fix anything.
                 untrusted_stop_line = true;
+            } else {
+                // Otherwise (e.g. `\input`) the context is where TeX was.
+                line = line.or(Some(ctx.line));
             }
         }
         if drop_line {
@@ -195,8 +218,15 @@ impl<'a> Parser<'a> {
         }
         self.untrusted_stop_line = untrusted_stop_line;
 
+        // With `-halt-on-error` (or when nonstop mode cannot continue), a
+        // stop after an error is a consequence of it, not a second problem.
+        let severity = if class.kind == DiagnosticKind::EmergencyStop && self.errors_reported > 0 {
+            Severity::Info
+        } else {
+            Severity::Error
+        };
         self.push(
-            Severity::Error,
+            severity,
             class.kind,
             &message,
             file,
@@ -206,20 +236,52 @@ impl<'a> Parser<'a> {
         Some(end)
     }
 
-    /// For a missing file reported through the following `Emergency stop.`:
-    /// whether the stop's context line (at `index`) is where the file was
-    /// requested.
-    ///
-    /// For `\input` it is. For packages and classes LaTeX has already looked
-    /// ahead for an optional `[date]` argument, so TeX usually reports the
-    /// next line; the line is only trusted when it shows the loading command.
-    fn stop_context_is_request(&self, error_text: &str, index: usize) -> bool {
-        let package = patterns::missing_file_name(error_text).is_some_and(|f| {
-            Path::new(f).extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("sty") || ext.eq_ignore_ascii_case("cls")
-            })
+    /// The line of the `\usepackage` / `\documentclass` / ... that requested
+    /// a missing package or class, given the `Emergency stop.` at `stop` and
+    /// its context `ctx`; `None` unless certain.
+    fn locate_request(
+        &self,
+        missing: Missing<'_>,
+        stop: usize,
+        ctx: Context,
+        file: Option<&WorkspacePath>,
+    ) -> Option<u32> {
+        // `<read *>` (TeX was reading the file name from the terminal) must
+        // be the only context above the file's: a macro expansion in between
+        // would mean the request was not read from the file directly.
+        let only_terminal = (stop + 1..ctx.index).all(|i| {
+            let t = self.text(i).trim();
+            t.is_empty() || t == "<read *>"
         });
-        !package || patterns::loads_package_or_class(self.text(index))
+        // A `-file-line-error` stop names the same position.
+        let stop_header = patterns::error_header(self.text(stop))?;
+        let same_position = match (stop_header.file, stop_header.line) {
+            (Some(printed), Some(n)) => self.normalize(printed).as_ref() == file && n == ctx.line,
+            _ => true,
+        };
+        if !only_terminal || !same_position {
+            return None;
+        }
+        let first = self.text(ctx.index);
+        let before = patterns::context_text(first)?.trim_end();
+        let second = self.text(ctx.index + 1);
+        let after = second
+            .get(first.len()..)
+            .filter(|_| second.as_bytes()[..first.len()].iter().all(|&b| b == b' '))?;
+        let reads = self.source_reads.get();
+        let source = file.filter(|_| reads < MAX_SOURCE_READS).and_then(|f| {
+            self.source_reads.set(reads + 1);
+            self.config.sources.read(f)
+        });
+        request::locate(
+            missing,
+            request::Context {
+                line: ctx.line,
+                before,
+                after,
+            },
+            source.as_deref(),
+        )
     }
 
     /// Handles `Overfull \hbox ...` / `Underfull \vbox ...`.
@@ -288,24 +350,20 @@ impl<'a> Parser<'a> {
     /// followed by `Emergency stop.`, whose context is where TeX was reading;
     /// the scan continues past one such line and reports that it did.
     fn find_context(&self, start: usize) -> Option<Context> {
-        let mut crossed_stop = false;
+        let mut stop = None;
         let limit = start.saturating_add(MAX_CONTEXT_SCAN).min(self.lines.len());
         for index in start..limit {
             let t = self.text(index);
             if let Some(line) = patterns::context_line(t) {
-                return Some(Context {
-                    index,
-                    line,
-                    crossed_stop,
-                });
+                return Some(Context { index, line, stop });
             }
             if let Some(header) = patterns::error_header(t) {
                 let class = patterns::classify_error(header.text);
                 if class.kind == DiagnosticKind::EmergencyStop
                     && !class.fatal_summary
-                    && !crossed_stop
+                    && stop.is_none()
                 {
-                    crossed_stop = true;
+                    stop = Some(index);
                     continue;
                 }
                 return None;
@@ -345,6 +403,9 @@ impl<'a> Parser<'a> {
             DiagnosticKind::UndefinedReference | DiagnosticKind::UndefinedCitation
         ) {
             self.undefined_reported = true;
+        }
+        if severity == Severity::Error {
+            self.errors_reported += 1;
         }
         if !self.out.accepts(severity) {
             return;
@@ -458,7 +519,8 @@ impl Collector {
 struct Context {
     index: usize,
     line: u32,
-    crossed_stop: bool,
+    /// The `Emergency stop.` line the scan continued past.
+    stop: Option<usize>,
 }
 
 /// Converts a file name printed by TeX to a workspace path.

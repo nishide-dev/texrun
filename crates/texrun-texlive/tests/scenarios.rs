@@ -80,10 +80,15 @@ fn missing_package() {
     assert_outcome(&run, CompileOutcome::Failed);
     let d = find(&run, DiagnosticKind::MissingFile);
     assert_eq!(d.severity, Severity::Error);
-    // TeX only reports where it stopped (the line after `\usepackage`), so
-    // the diagnostic names the file but no line.
-    assert_eq!(common::file_of(d), Some("main.tex"), "{d:#?}");
+    // TeX reports where it stopped (the line after `\usepackage`); the
+    // engine hands the workspace sources to the parser, which finds the
+    // `\usepackage` on line 2.
+    assert_location(d, "main.tex", 2);
     assert!(d.message.contains("texrun-no-such-package"), "{d:#?}");
+    // The emergency stop that follows is not a second error.
+    let stop = find(&run, DiagnosticKind::EmergencyStop);
+    assert_eq!(stop.severity, Severity::Info, "{stop:#?}");
+    assert_eq!(run.result.errors().count(), 1, "{}", describe(&run));
 }
 
 #[test]

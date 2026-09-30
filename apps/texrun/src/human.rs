@@ -190,8 +190,11 @@ fn render_diagnostics(out: &mut String, diagnostics: &[Diagnostic], paths: &Path
     ] {
         let mut groups: Vec<(&Diagnostic, usize)> = Vec::new();
         for d in diagnostics.iter().filter(|d| d.severity == severity) {
-            // Rerun requests are handled by latexmk; not worth a line.
-            if d.kind == DiagnosticKind::RerunRequired {
+            // Rerun requests are handled by latexmk, and a stop after an
+            // error (info) only repeats that error; neither is worth a line.
+            if d.kind == DiagnosticKind::RerunRequired
+                || d.kind == DiagnosticKind::EmergencyStop && d.severity < Severity::Error
+            {
                 continue;
             }
             match groups.iter_mut().find(|(g, _)| same(g, d)) {
@@ -351,6 +354,53 @@ mod tests {
              Failed to compile paper/main.tex in 840ms (1 error, 1 warning)\n  \
              log: paper/texrun-out/main.log\n"
         );
+    }
+
+    #[test]
+    fn a_stop_after_an_error_is_neither_shown_nor_counted() {
+        let mut r = CompileResult::new(
+            CompileOutcome::Failed,
+            EngineInfo::new("texlive"),
+            Duration::from_millis(840),
+        );
+        let missing = "LaTeX Error: File `x.sty' not found.";
+        r.diagnostics
+            .push(diag(Severity::Error, missing, Some("main.tex"), Some(2)));
+        let mut stop = Diagnostic::new(
+            Severity::Info,
+            DiagnosticKind::EmergencyStop,
+            "Emergency stop.",
+        );
+        stop.file = Some(WorkspacePath::new("main.tex").unwrap());
+        r.diagnostics.push(stop);
+        let text = render_result(
+            &CompileReport::default(),
+            &r,
+            &paths(),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            text,
+            format!(
+                "paper/main.tex:2: error: {missing}\n\
+                 Failed to compile paper/main.tex in 840ms (1 error, 0 warnings)\n"
+            )
+        );
+
+        // A stop without an earlier error is the error.
+        r.diagnostics.remove(0);
+        r.diagnostics[0].severity = Severity::Error;
+        let text = render_result(
+            &CompileReport::default(),
+            &r,
+            &paths(),
+            Duration::from_secs(60),
+        );
+        assert!(
+            text.starts_with("paper/main.tex: error: Emergency stop.\n"),
+            "{text}"
+        );
+        assert!(text.contains("(1 error, 0 warnings)"), "{text}");
     }
 
     #[test]

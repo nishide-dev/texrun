@@ -38,6 +38,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// that stopped it (`-halt-on-error`).
 pub const MAX_PARSED_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Source files larger than this are not given to the log parser (it reads
+/// them only to locate the request of a missing package or class).
+const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// File name of the rc inside its temporary directory.
 const RC_FILE_NAME: &str = "texrun.latexmkrc";
 
@@ -575,10 +579,12 @@ impl Plan {
         let Ok(tex_cwd) = WorkspaceRoot::new(&self.cwd) else {
             return Vec::new();
         };
+        let sources =
+            |file: &WorkspacePath| read_source(&self.root, &self.cwd.join(file.as_path()));
         let parsed = LogParser::new()
             .with_workspace_root(&tex_cwd)
             .with_max_print_line(MAX_PRINT_LINE)
-            .parse(&buf);
+            .parse_with_sources(&buf, &sources);
         let mut diagnostics: Vec<Diagnostic> = parsed
             .diagnostics
             .into_iter()
@@ -600,6 +606,30 @@ impl Plan {
         }
         diagnostics
     }
+}
+
+/// Reads a source file TeX read, for the log parser: a regular file inside
+/// the (canonical) workspace `root`, of at most [`MAX_SOURCE_BYTES`].
+///
+/// The file type is checked before opening, and it is opened with
+/// `O_NOFOLLOW | O_NONBLOCK` and checked again with `fstat`, so a FIFO or a
+/// device never blocks the read.
+fn read_source(root: &Path, path: &Path) -> Option<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let real = fs::canonicalize(path).ok()?;
+    if !real.starts_with(root) || !fs::symlink_metadata(&real).ok()?.is_file() {
+        return None;
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = fs::File::from(rustix::fs::open(&real, flags, Mode::empty()).ok()?);
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_SOURCE_BYTES).read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Reads the log into `buf`: all of it, or its last
@@ -747,6 +777,54 @@ mod tests {
         .unwrap();
         let diagnostics = plan.parse_log();
         assert_eq!(diagnostics[0].file.as_ref().unwrap().as_str(), "main.tex");
+    }
+
+    #[test]
+    fn missing_packages_are_located_in_the_workspace_sources() {
+        let (_dir, root) = workspace_with(&["src/main.tex"]);
+        let plan = Plan::new(&root, &request("src/main.tex")).unwrap();
+        plan.prepare_dirs().unwrap();
+        let source = "\\documentclass{article}\n\\usepackage{nopkg}\n\\begin{document}\n";
+        fs::write(root.path().join("src/main.tex"), source).unwrap();
+        let log = "(./main.tex\n! LaTeX Error: File `nopkg.sty' not found.\n\n\
+                   Enter file name: \n./main.tex:3: Emergency stop.\n<read *> \n         \n\
+                   l.3 \\begin\n          {document}^^M\n";
+        fs::write(plan.output_dir.join("main.log"), log).unwrap();
+        let diagnostics = plan.parse_log();
+        let d = &diagnostics[0];
+        assert_eq!(d.kind, DiagnosticKind::MissingFile);
+        assert_eq!(d.file.as_ref().unwrap().as_str(), "src/main.tex");
+        assert_eq!(d.line, Some(2));
+        assert_eq!(diagnostics[1].severity, Severity::Info);
+    }
+
+    #[test]
+    fn sources_outside_the_workspace_are_not_read() {
+        let (_dir, root) = workspace_with(&["main.tex"]);
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.tex");
+        fs::write(&secret, "x").unwrap();
+        let link = root.path().join("link.tex");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert_eq!(read_source(root.path(), &link), None);
+        assert_eq!(read_source(root.path(), &secret), None);
+        assert_eq!(read_source(root.path(), root.path()), None);
+        // A FIFO is refused without blocking.
+        let fifo = root.path().join("fifo.tex");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        assert_eq!(read_source(root.path(), &fifo), None);
+        let big = root.path().join("big.tex");
+        fs::write(
+            &big,
+            vec![b'x'; usize::try_from(MAX_SOURCE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert_eq!(read_source(root.path(), &big), None);
+        assert_eq!(
+            read_source(root.path(), &root.path().join("main.tex")),
+            Some(Vec::new())
+        );
     }
 
     #[test]

@@ -799,6 +799,52 @@ fn json_carries_texrun_exit_code_separately_from_latexmk_exit() {
     assert_eq!(doc["texrun_exit_code"], 0);
 }
 
+/// The log of a missing package (as TeX Live writes it with
+/// `-halt-on-error -file-line-error`): the error has no position, and TeX
+/// stops at `l.4 \\begin`, where LaTeX looked ahead after `\\usepackage`.
+const FAKE_MISSING_PACKAGE: &str = r#"
+printf 'This is pdfTeX (fake)\n file:line:error style messages enabled.\n(./%s.tex\n! LaTeX Error: File `texrunnonexistentpackage.sty'"'"' not found.\n\nType X to quit or <RETURN> to proceed,\nor enter new name. (Default extension: sty)\n\nEnter file name: \n./%s.tex:4: Emergency stop.\n<read *> \n         \nl.4 \\begin\n          {document}^^M \nHere is how much of TeX'"'"'s memory you used:\n\n./%s.tex:4:  ==> Fatal error occurred, no output PDF file produced!\n' "$stem" "$stem" "$stem" > "$out/$stem.log"
+exit 12
+"#;
+
+#[test]
+fn missing_package_is_one_located_error() {
+    let env = Env::new(FAKE_MISSING_PACKAGE);
+    env.file(
+        "proj/main.tex",
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage{texrunnonexistentpackage}\n\\begin{document}\nHi\n\\end{document}\n",
+    );
+
+    let out = env.run(&["compile", "main.tex"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let text = stdout(&out);
+    // The `\\usepackage` line (from the workspace copy of main.tex), and the
+    // emergency stop is neither shown nor counted.
+    assert!(
+        text.starts_with(
+            "main.tex:3: error: LaTeX Error: File `texrunnonexistentpackage.sty' not found.\n\
+             Failed to compile main.tex in "
+        ),
+        "{text}"
+    );
+    assert!(text.contains(" (1 error, 0 warnings)\n"), "{text}");
+    assert!(!text.contains("stop"), "{text}");
+    assert!(!text.contains("Fatal"), "{text}");
+
+    let doc = json(&env.run(&["compile", "--json", "main.tex"]));
+    let diagnostics = doc["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2, "{doc:#}");
+    assert_eq!(diagnostics[0]["severity"], "error");
+    assert_eq!(diagnostics[0]["kind"], "missing_file");
+    assert_eq!(diagnostics[0]["file"], "main.tex");
+    assert_eq!(diagnostics[0]["line"], 3);
+    // Still in the JSON, as info, without the looked-ahead line.
+    assert_eq!(diagnostics[1]["severity"], "info");
+    assert_eq!(diagnostics[1]["kind"], "emergency_stop");
+    assert_eq!(diagnostics[1]["file"], "main.tex");
+    assert!(diagnostics[1].get("line").is_none(), "{doc:#}");
+}
+
 const FAKE_PARENT_INPUT: &str = r#"
 printf 'This is pdfTeX (fake)\n file:line:error style messages enabled.\n(./%s.tex\n./%s.tex:3: LaTeX Error: File `../common.tex'"'"' not found.\n\nType X to quit or <RETURN> to proceed,\nor enter new name. (Default extension: tex)\n\nEnter file name: \n./%s.tex:3: Emergency stop.\n<read *> \n         \nl.3 \\input{../common}\n\n)\n' "$stem" "$stem" "$stem" > "$out/$stem.log"
 exit 12

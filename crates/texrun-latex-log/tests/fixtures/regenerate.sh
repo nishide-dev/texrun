@@ -18,7 +18,8 @@
 # A few fixtures deliberately deviate to check that the parser degrades
 # gracefully:
 #
-# - `traditional`, `unusual-names-traditional`: without `-file-line-error`
+# - `traditional`, `unusual-names-traditional`,
+#   `missing-package-traditional`: without `-file-line-error`
 #   (`! ...` + `l.N` form);
 # - `wrapped`: without `max_print_line` (TeX's default 79-column wrapping);
 # - `rerun`: a single `pdflatex` pass with the same options, because latexmk
@@ -78,3 +79,10 @@ compile missing-class default
 compile unusual-names default
 compile unusual-names-traditional traditional unusual-names
 compile unbalanced-parens default
+compile missing-package-before-usepackage default
+compile missing-package-options default
+compile missing-package-list default
+compile missing-package-same-line default
+compile missing-package-in-sty default
+compile missing-package-traditional traditional missing-package-before-usepackage
+compile missing-package-indented default
