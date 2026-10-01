@@ -601,7 +601,24 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 - TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（`mupdf-tools` / `poppler-utils`）も dev image と揃えて入れる（#46。AGPL / GPL の配布条件は README）。Rust toolchain やコンパイラは入れない。
 - 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
 - texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout` と `/usr/bin/sleep`（coreutils）、`/usr/bin/prlimit`（util-linux）、`/usr/bin/mutool` または `/usr/bin/pdfinfo` + `/usr/bin/pdftoppm`（preview）。`/workspace` と `/texrun` には何も置かない。
-- CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image 名は `texrun-engine:latest`（`--container-image` で変えられる）。registry への公開は #48 で扱う。
+- CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image は、その版の texrun のために公開した `ghcr.io/nishide-dev/texrun-engine:<version>`（`texrun_sandbox::DEFAULT_IMAGE`、`--container-image` で変えられる）。公開の仕組みは次の「engine image の公開」を参照。
+
+### engine image の公開（#48）
+
+`.github/workflows/engine-image.yml` が、release（`v*` の tag の push）ごとに engine image を GHCR に公開する。
+
+- **tag と対応。** `ghcr.io/nishide-dev/texrun-engine:<version>`（`linux/amd64`、`linux/arm64`）。`<version>` は tag から `v` を除いたもので、`Cargo.toml` の `workspace.package.version` と一致しなければ公開しない。image の label `org.opencontainers.image.version` にも同じ版を入れる。
+- **上書きしない。** 同じ版の tag が既にあれば公開を止める。利用者が digest で固定した image と、その版の tag が指す image が常に一致する。`latest` などの動く tag は付けない。
+- **公開前の検証。** 同じ release の amd64 image を build し、CI の `sandbox` job と同じ container backend の test と、`engine.version` に `image version <version>` が出ることを確かめてから、その layer（GitHub Actions の cache）を使って multi-arch で push する。この検証の job は書き込みの権限を持たない（test は workspace の crate を build・実行するため）。`packages: write`（push）と `id-token: write` / `attestations: write`（署名付きの attestation）は、publish の job だけが持つ。
+- **SBOM と provenance。** buildx の `--sbom`（dpkg の database から作る SPDX。image の全パッケージと版）と `--provenance=mode=max`（SLSA provenance）を image と一緒に registry に置く。加えて `actions/attest` で、Sigstore で署名した GitHub の artifact attestation を作る（`gh attestation verify oci://ghcr.io/nishide-dev/texrun-engine:<version> -R nishide-dev/texrun`）。image の中の apt パッケージの版は build の日で決まるので、公開した image の SBOM が「その版の image に何が入っているか」の記録になる。
+- **PR と手動実行。** `docker/engine/` か workflow が変わる PR と、`workflow_dispatch`（既定は `publish` が off）では、push せずに multi-arch で build し、両方の platform の image と SBOM / provenance ができることを確かめる。`publish` を on にした手動実行は、`v*` の tag の上でだけ公開する（失敗した公開のやり直し用）。
+- **既定の image の参照に digest を使わない理由。** texrun の binary に image の digest を入れるには、image を build してから texrun を build する 2 段の release が要る（同じ tag から作る image の digest は、その tag の source には書けない）。そこで既定は版の tag にし、次のことで対応を保つ。
+  - 版の tag は上書きしない（上記）。
+  - texrun は pull しない（`--pull never`）ので、tag が指す image は利用者が明示的に取得したものだけである。
+  - `engine.version` に image の ID と版の label を出し、texrun の版と違えば `image version X, not Y of texrun` と書く。
+  - 固定したい利用者は `--container-image ghcr.io/nishide-dev/texrun-engine@sha256:<digest>` を使える（compile は、probe で解決した image の ID で行う）。
+- **ローカルの build。** `docker build -t ghcr.io/nishide-dev/texrun-engine:<version> docker/engine`、または任意の名前と `--container-image`。label が無いので `engine.version` は `image without a version label` になる。開発用の test は、既定で `texrun-engine:latest`（`TEXRUN_SANDBOX_IMAGE` で変えられる）を使う。
+- **配布条件。** image は texrun の code を含まず、Debian の未改変のパッケージ（TeX Live、latexmk、coreutils、util-linux、preview 用の MuPDF（AGPL）と Poppler（GPL）など）から成る。各パッケージの license は image の `/usr/share/doc/<package>/copyright` に残し、対応する source は Debian の archive から取得できる（README の「Engine image」）。
 
 ### container の設定
 

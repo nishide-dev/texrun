@@ -211,9 +211,20 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 - `TEXRUN_TEST_BACKEND=container` にすると、`crates/texrun-texlive/tests/common` の既定の engine（`Compile::new`）が `ContainerEngine` になる。host の TeX Live に依存する test（`PATH` の wrapper、pdflatex の直接実行、host backend での対照）は `host_only!()` で skip し、binary ごとに `SKIPPED host-only tests` を 1 行出す。これらは `integration` job（host backend）で実行される。
 - `crates/texrun-preview/tests/real_tools.rs` も `TEXRUN_TEST_BACKEND=container` で `Previewer::in_container` を使い、engine image の MuPDF / Poppler で同じ test を全て実行する。
-- `TEXRUN_SANDBOX_IMAGE` で image を変えられる（既定は `texrun-engine:latest`）。CI の `sandbox` job は `texrun-engine:ci` を build して使う。
+- `TEXRUN_SANDBOX_IMAGE` で image を変えられる（test の既定は、上で build する `texrun-engine:latest`。texrun 自身の既定の `ghcr.io/nishide-dev/texrun-engine:<version>` ではない）。CI の `sandbox` job は `texrun-engine:ci` を build して使う。
 - runtime や image が無い環境（dev コンテナ、`test (macos)`、image を build していない `test (linux)`）では、これらの test は `SKIPPED` を出して何もしない。CI の `sandbox` job は `TEXRUN_REQUIRE_SANDBOX=1` で実行し、最後に label `org.texrun.sandbox` の container が残っていないことも確認する。
 - texrun が強制終了された場合などに残った container は、`docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる。container 内の `timeout` により、残っても compile の timeout + 45 秒で終了する。
+
+### engine image の公開
+
+`.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。release の手順:
+
+1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にした commit を main に入れる。
+2. その commit に `v<version>` の tag を push する（または、その tag で GitHub release を作る）。workflow が版の一致と container backend の test を確かめ、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。
+3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
+4. workflow の summary に出る digest で `docker pull`・`gh attestation verify` を確かめる。
+
+公開した版の tag は上書きしない（workflow も拒否する）。やり直す場合は、GHCR から該当の版を消してから、`workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。PR と、`publish` が off の手動実行は、push しない multi-arch の build だけを行う。
 
 ## 注意事項
 

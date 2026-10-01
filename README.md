@@ -103,7 +103,7 @@ previews to the output directory. See `texrun compile --help` for details.
 | `--preview-backend <BACKEND>` | `auto` | `auto` (MuPDF, else Poppler), `mupdf` or `poppler` |
 | `--backend <BACKEND>` | `host` | Where TeX runs: `host` (the host's latexmk, as your user) or `container` (in a hardened container of the engine image; see [Engine backends](#engine-backends)) |
 | `--container-runtime <RUNTIME>` | `auto` | With `--backend container`: `auto` (Docker if installed and running, otherwise Podman), `docker` or `podman` |
-| `--container-image <IMAGE>` | `texrun-engine:latest` | With `--backend container`: the engine image; must exist locally, texrun never pulls |
+| `--container-image <IMAGE>` | `ghcr.io/nishide-dev/texrun-engine:<version>` | With `--backend container`: the engine image; must exist locally, texrun never pulls (see [Engine image](#engine-image)) |
 | `--cgroup <MODE>` | `auto` | Linux: run latexmk and the preview tools in cgroups of their own (memory, processes, CPU). `auto` uses a delegated cgroup if there is one (e.g. `systemd-run --user --scope -p Delegate=yes texrun ...`), otherwise only the per-process limits apply (see `resource_limits`); `required` fails with exit 3 instead; `off` never uses one |
 
 The workspace never contains VCS metadata, `texrun-out/`, `.texrun/`,
@@ -260,10 +260,10 @@ removes the workspace and then exits.
 
 Use `--backend container` for documents you do not trust. The default stays
 `host` because the container backend needs a container runtime and the image.
-Build the image once from this repository:
+Pull the image of your texrun version once ([Engine image](#engine-image)):
 
 ```bash
-docker build -t texrun-engine:latest docker/engine
+docker pull ghcr.io/nishide-dev/texrun-engine:0.1.0   # the version of `texrun --version`
 texrun compile --backend container main.tex
 ```
 
@@ -278,6 +278,65 @@ restrictions and the preview limits; the host's preview tools are not used
 (and need not be installed). See [docs/security.md](docs/security.md) §2
 and §4 for exactly what each backend guarantees.
 
+### Engine image
+
+Every release publishes the engine image (`docker/engine/Dockerfile`) for
+`linux/amd64` and `linux/arm64` as
+`ghcr.io/nishide-dev/texrun-engine:<version>`, where `<version>` is the
+texrun version without the `v` (`texrun --version`). That image is the
+default of `--container-image`, so the container backend works without
+cloning this repository:
+
+```bash
+cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.0 texrun
+docker pull ghcr.io/nishide-dev/texrun-engine:0.1.0
+texrun compile --backend container main.tex
+```
+
+- texrun never pulls (`--pull never`): downloading the image is always a
+  separate, explicit step. Without it, `--backend container` fails with
+  exit 3 and a hint.
+- A published version is never overwritten. To pin exactly what you
+  verified, pass the digest the release workflow printed:
+  `--container-image ghcr.io/nishide-dev/texrun-engine@sha256:<digest>`.
+- `engine.version` names the image, its ID and its version label, e.g.
+  `latexmk 4.86 (docker 29.4.0, image ghcr.io/nishide-dev/texrun-engine:0.1.0
+  3681cf4e3444, image version 0.1.0)`. It says `image version X, not Y of
+  texrun` when the image belongs to another texrun version, and `image
+  without a version label` for a local build.
+- The image carries an SBOM and SLSA provenance (buildx attestations) and a
+  signed GitHub artifact attestation:
+  `gh attestation verify oci://ghcr.io/nishide-dev/texrun-engine:0.1.0 -R nishide-dev/texrun`.
+- To build it yourself instead, from a checkout of the same version:
+  `docker build -t ghcr.io/nishide-dev/texrun-engine:0.1.0 docker/engine`
+  (or any name, with `--container-image`).
+
+Licensing of the image: texrun itself is MIT, but the image contains no
+texrun code. It is `debian:trixie-slim` with unmodified Debian packages,
+under their own licenses:
+
+| Packages | License |
+| --- | --- |
+| TeX Live (`texlive-base`, `texlive-latex-base`, `texlive-latex-recommended`, their dependencies) | free software licenses, mostly the LaTeX Project Public License and the GPL (pdfTeX, BibTeX and other programs) |
+| `latexmk` | GPL-2.0-or-later |
+| `coreutils` (`timeout`), `util-linux` (`prlimit`), the Debian base system | GPL and other free software licenses |
+| `mupdf-tools` (MuPDF), for page previews | AGPL-3.0-or-later |
+| `poppler-utils` (Poppler), for page previews | GPL-2.0-only or GPL-3.0-only |
+
+- The license of every package is kept in the image, at
+  `/usr/share/doc/<package>/copyright`; the SBOM lists every package and its
+  version.
+- The corresponding source of those exact versions is available from the
+  Debian archive (`apt-get source <package>=<version>`, or
+  [snapshot.debian.org](https://snapshot.debian.org/)); if you cannot get
+  it there, open an issue.
+- texrun starts these tools as separate processes and does not link them.
+  MuPDF is shipped unmodified, so the AGPL's network clause (for modified
+  versions) does not add anything beyond its source requirement.
+- If you redistribute the image (for example, mirror it to another
+  registry), the GPL / AGPL obligations for the binaries in it apply to you
+  as well.
+
 ## System requirements
 
 - **OS:** Linux or macOS. Windows is not supported.
@@ -288,8 +347,9 @@ and §4 for exactly what each backend guarantees.
   instead of installing TeX Live on the host.
 - **Container runtime (optional):** Docker 20.10+ (including Docker Desktop
   and OrbStack on macOS) or Podman 4+, and the engine image
-  (`docker/engine/Dockerfile`), for `--backend container`. Only Docker is
-  tested in CI.
+  (`ghcr.io/nishide-dev/texrun-engine:<version>`, or a local build of
+  `docker/engine/Dockerfile`; see [Engine image](#engine-image)), for
+  `--backend container`. Only Docker is tested in CI.
 - **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
   page previews with `--backend host` (`--backend container` uses the
   image's). MuPDF is used when both are installed; without either,
