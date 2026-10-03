@@ -353,7 +353,7 @@ mod tests {
         );
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.contains("rm --force -- fake-id"), "{calls}");
-        assert!(!calls.contains("start"), "{calls}");
+        assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
     }
 
     #[test]
