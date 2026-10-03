@@ -157,18 +157,7 @@ impl Runtime {
             .collect();
         let mut removed = 0;
         for chunk in ids.chunks(INSPECT_CHUNK) {
-            let mut args: Vec<&str> = vec![
-                "inspect",
-                "--format",
-                "{{.Id}} {{.Name}} {{.State.Status}} {{json .Config.Labels}}",
-                "--",
-            ];
-            args.extend(chunk.iter().map(String::as_str));
-            // A container removed in the meantime fails the whole command
-            // with some runtimes: skip this chunk then (the next run sees
-            // the rest again).
-            let Ok(out) = self.query(&args) else { continue };
-            for listed in parse_listing(&out) {
+            for listed in self.inspect_listing(chunk) {
                 let Some(creator) = candidate(&listed, &me, uid) else {
                     continue;
                 };
@@ -186,6 +175,32 @@ impl Runtime {
             }
         }
         Ok(removed)
+    }
+
+    /// The containers `ids` as `inspect` describes them. A container
+    /// removed since it was listed (e.g. by another texrun that just
+    /// finished) fails the whole command, so then each one is inspected on
+    /// its own and the missing ones are left out.
+    fn inspect_listing(&self, ids: &[String]) -> Vec<Listed> {
+        let inspect = |ids: &[String]| {
+            let mut args: Vec<&str> = vec![
+                "inspect",
+                "--format",
+                "{{.Id}} {{.Name}} {{.State.Status}} {{json .Config.Labels}}",
+                "--",
+            ];
+            args.extend(ids.iter().map(String::as_str));
+            self.query(&args).map(|out| parse_listing(&out))
+        };
+        match inspect(ids) {
+            Ok(listed) => listed,
+            Err(_) if ids.len() > 1 => ids
+                .chunks(1)
+                .filter_map(|id| inspect(id).ok())
+                .flatten()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -276,6 +291,63 @@ mod tests {
             candidate(&l, &me(), 501),
             Some(Creator::new(42, None, 0xabc))
         );
+    }
+
+    /// A container that disappears between `ps` and `inspect` (removed by
+    /// another texrun) does not keep the others from being reclaimed.
+    #[test]
+    fn a_container_removed_meanwhile_does_not_hide_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let me = Creator::current().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let labels = serde_json::json!({
+            crate::LABEL: "1",
+            LABEL_PID: dead.to_string(),
+            LABEL_UID: uid.to_string(),
+            LABEL_HOST: format!("{:016x}", me.host()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("left"),
+            format!("left-id /texrun-{dead}-0-0 exited {labels}\n"),
+        )
+        .unwrap();
+        let script = dir.path().join("docker");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+here=$(dirname "$0")
+echo "$*" >> "$here/calls"
+case "$1" in
+  version) echo "29.0.0 linux" ;;
+  context) echo "unix:///var/run/docker.sock" ;;
+  ps) echo gone-id; echo left-id ;;
+  inspect)
+    case "$*" in *gone-id*) echo "No such object" >&2; exit 1 ;; esac
+    cat "$here/left" ;;
+  rm) ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rt = loop {
+            match Runtime::with_program(crate::RuntimeKind::Docker, script.clone()) {
+                Ok(rt) => break rt,
+                Err(e) if e.to_string().contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(rt.reclaim_left_containers().unwrap(), 1);
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(calls.contains("rm -- left-id"), "{calls}");
+        assert!(!calls.contains("rm -- gone-id"), "{calls}");
     }
 
     #[test]
