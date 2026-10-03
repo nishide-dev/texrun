@@ -343,12 +343,14 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
     let (finished, address_space_limited, container_oom, container_pids_limit) =
         if let Start::Container(container) = &job.start {
             let mut finished = texrun_process::run_with(*container, &spec, watch)?;
-            let outcome = container.outcome();
-            let oom = outcome.is_some_and(|o| o.oom_killed);
             // Stopped by texrun: the container told when it was stopped;
             // ended on its own: in the last line of its stderr, which is
-            // removed from the output either way.
+            // removed from the output either way. Taken before the outcome,
+            // which adds the OOM kill counted there (rootless Podman does
+            // not record `OOMKilled`).
             let reported = container.take_pids_report(&mut finished.stderr);
+            let outcome = container.outcome();
+            let oom = outcome.is_some_and(|o| o.oom_killed);
             let pids = outcome
                 .and_then(|o| o.pids_limit_reached)
                 .or(reported)

@@ -12,7 +12,7 @@ use texrun_process::{CapturedOutput, Cwd, Launcher, Resource, Rlimits, RunError,
 use crate::caps::{capability_report, take_capability_report};
 use crate::container::{Container, ContainerSpec, RESTRICTIONS_NOT_APPLIED};
 use crate::error::SandboxError;
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, RuntimeKind};
 
 /// Where `sleep` is expected in the image (coreutils): the main process of
 /// a session, which bounds its lifetime.
@@ -20,6 +20,20 @@ const SLEEP: &str = "/usr/bin/sleep";
 
 /// Where `prlimit` is expected in the image (util-linux).
 const PRLIMIT: &str = "/usr/bin/prlimit";
+
+/// Where a POSIX shell is expected in the image.
+const SH: &str = "/bin/sh";
+
+/// Prints the `oom_kill` counter of the container's cgroup.
+const READ_OOM_KILL: &str = r#"for f in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.oom_control; do
+  if [ -r "$f" ]; then
+    while read -r k v; do [ "$k" = oom_kill ] && echo "$v"; done < "$f"
+    break
+  fi
+done"#;
+
+/// Timeout of reading the `oom_kill` counter.
+const OOM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout of `start` (detached: returns once the main process runs).
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -128,11 +142,35 @@ impl<'r> Session<'r> {
     /// Whether the kernel's OOM killer has stopped a process in the
     /// container (`--memory`); `None` if the runtime cannot tell (e.g. the
     /// session was stopped).
+    ///
+    /// Docker records it (`OOMKilled`); rootless Podman does not, so with
+    /// Podman the `oom_kill` counter of the container's cgroup is also read
+    /// from inside (`exec`). Like the process limit report of a compile,
+    /// that reading is advisory: it comes from a shell in the container.
     pub fn oom_killed(&self) -> Option<bool> {
         if self.is_stopped() {
             return None;
         }
-        self.container.oom_killed_now()
+        let recorded = self.container.oom_killed_now();
+        if recorded == Some(true) || self.container.runtime().kind() != RuntimeKind::Podman {
+            return recorded;
+        }
+        self.oom_kill_count().map(|n| n > 0).or(recorded)
+    }
+
+    /// The `oom_kill` counter of the container's cgroup (`memory.events`,
+    /// or `memory.oom_control` with cgroup v1), read with `exec`.
+    fn oom_kill_count(&self) -> Option<u64> {
+        let id = self.container.id()?;
+        let args: Vec<OsString> = ["exec", "--", &id, SH, "-c", READ_OOM_KILL]
+            .map(OsString::from)
+            .into();
+        let out = self
+            .container
+            .runtime()
+            .exec(&args, OOM_READ_TIMEOUT)
+            .ok()?;
+        out.trim().parse().ok()
     }
 
     /// The `exec` arguments for `spec`.

@@ -20,7 +20,7 @@ use texrun_process::{
 };
 use texrun_sandbox::{
     Container, ContainerLimits, ContainerSpec, IMAGE_VERSION_LABEL, LABEL, Mount, Runtime,
-    SandboxError, Session,
+    RuntimeKind, SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -353,14 +353,37 @@ fn the_deadline_ends_the_container_by_itself() {
 fn an_oom_kill_is_recorded() {
     let runtime = require_sandbox!();
     let limits = ContainerLimits::new(32 * 1024 * 1024, 32, 1);
-    let container = Container::new(runtime, ContainerSpec::new(image(), limits));
     // A shell variable of 128 MiB.
+    let script = "x=$(head -c 134217728 /dev/zero | tr '\\0' a); echo ${#x}";
+    let container = Container::new(runtime, ContainerSpec::new(image(), limits));
     let finished = run(
         &container,
-        &sh("x=$(head -c 134217728 /dev/zero | tr '\\0' a); echo ${#x}"),
+        &sh(script),
         Watch::new().with_timeout(Duration::from_secs(60)),
     );
     assert!(!finished.status.success(), "{finished:?}");
+    // Rootless Podman does not record `OOMKilled` (docs/security.md §4).
+    if runtime.kind() == RuntimeKind::Docker {
+        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    }
+
+    // With the report of the compile containers, both runtimes tell: the
+    // shell reads the cgroup's `oom_kill` counter.
+    let container = Container::new(
+        runtime,
+        ContainerSpec::new(image(), limits).with_report_pids(true),
+    );
+    let mut finished = run(
+        &container,
+        &sh(script),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(!finished.status.success(), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr),
+        Some(false),
+        "{finished:?}"
+    );
     assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
 }
 

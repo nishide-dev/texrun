@@ -335,6 +335,17 @@ impl Runtime {
             env: EnvAllowlist::new(),
         }
     }
+
+    /// [`Runtime::for_tests`] as Podman, rootless or not.
+    pub(crate) fn for_tests_podman(rootless: bool) -> Self {
+        Self {
+            kind: RuntimeKind::Podman,
+            program: PathBuf::from("/nonexistent/texrun-test-podman"),
+            version: "4.9.3".to_owned(),
+            rootless,
+            env: EnvAllowlist::new(),
+        }
+    }
 }
 
 /// The environment of the runtime CLI: [`RUNTIME_ENV`] from texrun's own

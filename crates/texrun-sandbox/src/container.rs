@@ -43,11 +43,13 @@ const SH: &str = "/bin/sh";
 /// (`sh -c REPORT_PIDS sh <nonce> <command...>`): runs the command, then
 /// kills whatever is left in the container (`kill -1` spares the shell and
 /// the init process) and reads the `max` counter of the container's
-/// `pids.events` (cgroup v2, or the v1 `pids` hierarchy).
+/// `pids.events` (cgroup v2, or the v1 `pids` hierarchy) and the
+/// `oom_kill` counter of its `memory.events` (cgroup v2; v1:
+/// `memory.oom_control`), `-` if that cannot be read.
 ///
-/// - When the command ends, it prints `texrun-sandbox-pids <nonce> <max>`
-///   as the last line of stderr ([`Container::take_pids_report`]) and exits
-///   with the command's status.
+/// - When the command ends, it prints `texrun-sandbox-pids <nonce> <max>
+///   <oom_kill>` as the last line of stderr
+///   ([`Container::take_pids_report`]) and exits with the command's status.
 /// - On `SIGTERM` (texrun stops a running container, [`Launcher::on_kill`])
 ///   it exits with [`PIDS_REACHED_EXIT`] or [`PIDS_NOT_REACHED_EXIT`]
 ///   instead, which texrun reads with `wait` before removing the container.
@@ -56,12 +58,18 @@ const SH: &str = "/bin/sh";
 /// handles `SIGTERM` while it runs, with the original stderr; the shell's
 /// own stderr is `/dev/null`, so that its job messages (e.g. for a command
 /// ended by `SIGXCPU`) do not add to the command's output.
-const REPORT_PIDS: &str = r#"n=$1; shift; h=
+const REPORT_PIDS: &str = r#"n=$1; shift; h=; o=
 r() {
   kill -s KILL -1 2>/dev/null
   for f in /sys/fs/cgroup/pids.events /sys/fs/cgroup/pids/pids.events; do
     if [ -r "$f" ]; then
       while read -r k v; do [ "$k" = max ] && h=$v; done < "$f"
+      break
+    fi
+  done
+  for f in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.oom_control; do
+    if [ -r "$f" ]; then
+      while read -r k v; do [ "$k" = oom_kill ] && o=$v; done < "$f"
       break
     fi
   done
@@ -72,7 +80,7 @@ exec 3>&2 2>/dev/null
 wait $!
 s=$?
 r
-[ -n "$h" ] && printf '\ntexrun-sandbox-pids %s %s\n' "$n" "$h" >&3
+[ -n "$h" ] && printf '\ntexrun-sandbox-pids %s %s %s\n' "$n" "$h" "${o:--}" >&3
 exit $s
 "#;
 
@@ -324,6 +332,9 @@ struct State {
     /// Why the created container was not started: the runtime did not
     /// apply a restriction that was asked for.
     refusal: Option<String>,
+    /// The cgroup's OOM kill counter was above 0 in the report of the
+    /// [`REPORT_PIDS`] shell ([`Container::take_pids_report`]).
+    reported_oom: bool,
 }
 
 /// One container for one supervised run: pass it to
@@ -374,8 +385,17 @@ impl<'r> Container<'r> {
 
     /// What the runtime recorded about the container before it was
     /// removed; `None` if it was never created or could not be inspected.
+    ///
+    /// [`ContainerOutcome::oom_killed`] is also set if the report taken by
+    /// [`Container::take_pids_report`] counted an OOM kill: rootless Podman
+    /// does not record `OOMKilled` (docs/security.md §4), so call that
+    /// first.
     pub fn outcome(&self) -> Option<ContainerOutcome> {
-        self.lock().outcome
+        let state = self.lock();
+        state.outcome.map(|mut o| {
+            o.oom_killed |= state.reported_oom;
+            o
+        })
     }
 
     /// What the runtime printed on stderr while creating the container
@@ -398,6 +418,7 @@ impl<'r> Container<'r> {
     /// refused a new process. `None` without the line (e.g. the output was
     /// truncated, or the cgroup's `pids.events` cannot be read in the
     /// container). Advisory, see [`ContainerOutcome::pids_limit_reached`].
+    /// An OOM kill counted in the line is added to [`Container::outcome`].
     ///
     /// The removed bytes are also taken off
     /// [`CapturedOutput::total_bytes`], so that it stays what the command
@@ -413,11 +434,16 @@ impl<'r> Container<'r> {
             .windows(PIDS_MARKER.len())
             .rposition(|w| w == PIDS_MARKER)?;
         let line = std::str::from_utf8(&bytes[start + PIDS_MARKER.len()..]).ok()?;
-        let (nonce, max) = line.strip_suffix('\n')?.split_once(' ')?;
-        if nonce != self.nonce || max.is_empty() || !max.bytes().all(|b| b.is_ascii_digit()) {
+        let (nonce, counters) = line.strip_suffix('\n')?.split_once(' ')?;
+        let (max, oom) = counters.split_once(' ').unwrap_or((counters, "-"));
+        let count = |c: &str| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit());
+        if nonce != self.nonce || !count(max) || !(oom == "-" || count(oom)) {
             return None;
         }
         let reached = max.bytes().any(|b| b != b'0');
+        if oom.bytes().any(|b| b.is_ascii_digit() && b != b'0') {
+            self.lock().reported_oom = true;
+        }
         let removed = bytes.len() - start;
         bytes.truncate(start);
         stderr.total_bytes = stderr
@@ -506,6 +532,12 @@ impl<'r> Container<'r> {
         ]);
         for label in crate::reclaim::creator_labels(Creator::current()) {
             args.extend(["--label".into(), label.into()]);
+        }
+        if self.runtime.kind() == crate::RuntimeKind::Podman {
+            // Podman adds `container=podman`, the image's `ENV` and the
+            // `env` of containers.conf (and the host's proxy variables) to
+            // the environment: only the spec's is wanted.
+            args.extend(["--unsetenv-all".into(), "--http-proxy=false".into()]);
         }
         if self.runtime.is_rootless_podman() {
             args.extend(["--userns".into(), "keep-id".into()]);
@@ -1154,6 +1186,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn podman_gets_only_the_specs_environment_and_keeps_the_uid() {
+        let run = Spec::new("/bin/x", Cwd::Path(Path::new("/w")));
+        let args = |rt: &Runtime| {
+            strings(
+                &Container::new(rt, spec("x"))
+                    .create_args(&run, (1, 1))
+                    .unwrap(),
+            )
+            .join(" ")
+        };
+        let docker = args(&runtime());
+        for podman_only in ["--unsetenv-all", "--http-proxy", "--userns"] {
+            assert!(!docker.contains(podman_only), "{docker}");
+        }
+        let rootless = args(&Runtime::for_tests_podman(true));
+        for expected in ["--unsetenv-all", "--http-proxy=false", "--userns keep-id"] {
+            assert!(
+                rootless.contains(expected),
+                "missing `{expected}` in {rootless}"
+            );
+        }
+        let rootful = args(&Runtime::for_tests_podman(false));
+        assert!(rootful.contains("--unsetenv-all"), "{rootful}");
+        assert!(!rootful.contains("--userns"), "{rootful}");
+    }
+
+    #[test]
     fn create_args_refuse_what_cannot_be_expressed() {
         let rt = runtime();
         let run = |program: &str, cwd: &'static str| {
@@ -1267,6 +1326,15 @@ pub(crate) mod tests {
             report(&format!("\ntexrun-sandbox-pids {nonce} 2\n")),
             (Some(true), String::new())
         );
+        // With the OOM kill counter (`-`: not readable).
+        assert_eq!(
+            report(&format!("out\n\ntexrun-sandbox-pids {nonce} 0 -\n")),
+            (Some(false), "out\n".to_owned())
+        );
+        assert_eq!(
+            report(&format!("out\n\ntexrun-sandbox-pids {nonce} 3 0\n")),
+            (Some(true), "out\n".to_owned())
+        );
         // Another nonce, a line that is not the last, a malformed count:
         // left as they are.
         for text in [
@@ -1275,6 +1343,9 @@ pub(crate) mod tests {
             format!("\ntexrun-sandbox-pids {nonce} -1\n"),
             format!("\ntexrun-sandbox-pids {nonce} \n"),
             format!("\ntexrun-sandbox-pids {nonce} 1"),
+            format!("\ntexrun-sandbox-pids {nonce} 1 x\n"),
+            format!("\ntexrun-sandbox-pids {nonce} 1 \n"),
+            format!("\ntexrun-sandbox-pids {nonce} 1 2 3\n"),
             "no report".to_owned(),
         ] {
             assert_eq!(report(&text), (None, text.clone()), "{text:?}");
@@ -1517,6 +1588,26 @@ esac
             calls.contains(&format!("rm --force -- {}", container.name())),
             "{calls}"
         );
+    }
+
+    #[test]
+    fn an_oom_kill_counted_by_the_report_is_in_the_outcome() {
+        for (counter, oom) in [("1", true), ("0", false), ("-", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let rt = fake_runtime(dir.path(), &host_config(4096));
+            let container = Container::new(&rt, unmounted().with_report_pids(true));
+            container.command(&limited_run()).unwrap();
+            container.on_reaped(1);
+            // The fake runtime never records `OOMKilled`, like rootless
+            // Podman.
+            assert!(!container.outcome().unwrap().oom_killed);
+            let mut stderr = captured(&format!(
+                "\ntexrun-sandbox-pids {} 0 {counter}\n",
+                container.nonce
+            ));
+            assert_eq!(container.take_pids_report(&mut stderr), Some(false));
+            assert_eq!(container.outcome().unwrap().oom_killed, oom, "{counter}");
+        }
     }
 
     #[test]
