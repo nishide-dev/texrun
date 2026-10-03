@@ -394,7 +394,12 @@ fn containers_carry_the_texrun_label() {
 fn the_image_is_inspected() {
     let runtime = require_sandbox!();
     let found = runtime.image(&image()).unwrap();
-    assert!(found.id.starts_with("sha256:"), "{found:?}");
+    // Docker reports `sha256:<hex>`, Podman the bare hex digits.
+    let hex = found.id.strip_prefix("sha256:").unwrap_or(&found.id);
+    assert!(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{found:?}"
+    );
     assert_eq!(runtime.image_id(&image()).unwrap(), found.id);
 }
 

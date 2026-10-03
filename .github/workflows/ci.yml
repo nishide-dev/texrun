@@ -329,7 +329,7 @@ jobs:
       - name: DEBUG podman behaviour
         continue-on-error: true
         run: |
-          set -x
+          set -x +e
           conmon --version || true
           crun --version || true
           img="${TEXRUN_SANDBOX_IMAGE}"
