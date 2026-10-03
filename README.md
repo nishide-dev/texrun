@@ -102,7 +102,7 @@ previews to the output directory. See `texrun compile --help` for details.
 | `--preview-dpi <DPI>` | `144` | Preview resolution (long edge at most 4096 px) |
 | `--preview-backend <BACKEND>` | `auto` | `auto` (MuPDF, else Poppler), `mupdf` or `poppler` |
 | `--backend <BACKEND>` | `host` | Where TeX runs: `host` (the host's latexmk, as your user) or `container` (in a hardened container of the engine image; see [Engine backends](#engine-backends)) |
-| `--container-runtime <RUNTIME>` | `auto` | With `--backend container`: `auto` (Docker if installed and running, otherwise Podman), `docker` or `podman` |
+| `--container-runtime <RUNTIME>` | `auto` | With `--backend container`: `auto` (Docker if installed and running, otherwise Podman), `docker` or `podman`. Rootless Docker is not supported (use rootless Podman); see [Engine backends](#engine-backends) |
 | `--container-image <IMAGE>` | `ghcr.io/nishide-dev/texrun-engine:<version>` | With `--backend container`: the engine image; must exist locally, texrun never pulls (see [Engine image](#engine-image)) |
 | `--cgroup <MODE>` | `auto` | Linux: run latexmk and the preview tools in cgroups of their own (memory, processes, CPU). `auto` uses a delegated cgroup if there is one (e.g. `systemd-run --user --scope -p Delegate=yes texrun ...`), otherwise only the per-process limits apply (see `resource_limits`); `required` fails with exit 3 instead; `off` never uses one |
 
@@ -256,7 +256,15 @@ removes the workspace and then exits.
 | Host files TeX can reach | whatever kpathsea's paranoid mode does not refuse by name (e.g. the TeX Live tree, font lookups, pdfTeX's file embedding primitives) | only the workspace (read-only, except the output directory) and the image's own read-only TeX Live tree |
 | Network | not blocked | none (`--network none`), for the compile and the previews |
 | Memory / processes / CPUs of the whole compile | only with a delegated cgroup (`--cgroup`) | always (the container's cgroup) |
-| Needs | TeX Live + latexmk on the host | Docker 20.10+ or Podman 4+, and the engine image |
+| Needs | TeX Live + latexmk on the host | Docker 20.10+ (running as root) or Podman 4+ (rootless: cgroup v2 with the memory, pids and cpu controllers delegated to your user), and the engine image |
+
+Rootless Podman is supported and tested in CI; texrun keeps your uid in the
+container (`--userns keep-id`), so the output belongs to you. Rootless Docker
+(`dockerd-rootless`) is detected and refused: its containers cannot write the
+output directory as a non-root user (with `--container-runtime auto`, texrun
+then tries Podman). Without the delegated cgroup controllers, rootless
+Podman cannot enforce the container limits, and texrun refuses it too
+(exit 3, with the reason).
 
 Use `--backend container` for documents you do not trust. The default stays
 `host` because the container backend needs a container runtime and the image.
@@ -353,7 +361,8 @@ under their own licenses:
   and OrbStack on macOS) or Podman 4+, and the engine image
   (`ghcr.io/nishide-dev/texrun-engine:<version>`, or a local build of
   `docker/engine/Dockerfile`; see [Engine image](#engine-image)), for
-  `--backend container`. Only Docker is tested in CI.
+  `--backend container`. Docker and rootless Podman are tested in CI;
+  rootless Docker is not supported.
 - **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
   page previews with `--backend host` (`--backend container` uses the
   image's). MuPDF is used when both are installed; without either,

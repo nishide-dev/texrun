@@ -951,8 +951,10 @@ pub(crate) struct Expected {
 /// against what texrun asked for; the error lists every difference.
 ///
 /// Field names are Docker's, which Podman's `inspect` also uses. Podman
-/// lists the dropped capabilities one by one instead of `ALL`, and may
-/// record the CPU limit as quota / period.
+/// lists the dropped capabilities one by one instead of `ALL` (its default
+/// set, so this check can only see that some were dropped: what a process
+/// in the container has is checked from inside, [`crate::capability_report`]),
+/// and may record the CPU limit as quota / period.
 #[allow(
     clippy::too_many_lines,
     reason = "one flat list of checks, easier to review in one place"
