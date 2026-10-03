@@ -149,7 +149,7 @@ fn the_container_is_isolated_and_unprivileged() {
         r#"
 echo "uid=$(id -u)"
 echo "gid=$(id -g)"
-sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p; s/^Seccomp:\t*/seccomp=/p' /proc/self/status
+sed -n 's/^CapEff:\t*/capeff=/p; s/^CapBnd:\t*/capbnd=/p; s/^NoNewPrivs:\t*/nonewprivs=/p; s/^Seccomp:\t*/seccomp=/p' /proc/self/status
 echo "net=$(ls /sys/class/net | tr '\n' ' ')"
 if touch /usr/texrun-probe 2>/dev/null; then echo root_fs=writable; else echo root_fs=read-only; fi
 if touch /tmp/probe 2>/dev/null; then echo tmp=writable; else echo tmp=read-only; fi
@@ -179,6 +179,8 @@ echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     assert_ne!(get("uid"), "0", "{text}");
     assert_eq!(get("uid"), rustix_uid(), "{text}");
     assert_eq!(get("capeff"), "0000000000000000", "{text}");
+    // Nothing can be gained either.
+    assert_eq!(get("capbnd"), "0000000000000000", "{text}");
     assert_eq!(get("nonewprivs"), "1", "{text}");
     // The runtime's default seccomp profile is in force (filter mode).
     assert_eq!(get("seccomp"), "2", "{text}");
@@ -198,6 +200,34 @@ echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     assert!(!ws.path().join("probe").exists());
     // Removed after the run.
     assert!(containers_named(runtime, container.name()).is_empty());
+}
+
+/// The capability report (as the engine's probe runs it) passes in a real
+/// container, and what is left is the program's own output.
+#[test]
+fn the_capability_report_passes_and_leaves_the_programs_output() {
+    let runtime = require_sandbox!();
+    let container = Container::new(runtime, ContainerSpec::new(image(), limits()));
+    let (program, args) = texrun_sandbox::capability_report(
+        Some(Path::new("/bin/echo")),
+        &["from the program".into()],
+    );
+    let spec = Spec::new(program, Cwd::Path(Path::new("/")))
+        .with_args(args)
+        .with_env(EnvAllowlist::new().with("PATH", "/usr/bin:/bin"));
+    let mut finished = run(
+        &container,
+        &spec,
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    let report = String::from_utf8_lossy(&finished.stdout.bytes).into_owned();
+    assert_eq!(
+        texrun_sandbox::take_capability_report(&mut finished.stdout),
+        Ok(()),
+        "{report}"
+    );
+    assert_eq!(stdout(&finished), "from the program\n");
 }
 
 /// texrun's uid, as the container reports it.

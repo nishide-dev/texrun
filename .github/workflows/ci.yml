@@ -326,6 +326,33 @@ jobs:
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
       - name: Build engine image
         run: podman build --tag "${TEXRUN_SANDBOX_IMAGE}" docker/engine
+      - name: DEBUG podman behaviour
+        continue-on-error: true
+        run: |
+          set -x
+          conmon --version || true
+          crun --version || true
+          img="${TEXRUN_SANDBOX_IMAGE}"
+          common=(--init --network none --read-only --cap-drop ALL --security-opt no-new-privileges --ipc none --user "$(id -u):$(id -g)" --userns keep-id --pids-limit 32 --memory 33554432 --memory-swap 33554432 --cpus 1 --log-driver none --pull never)
+          id=$(podman create "${common[@]}" --name oom1 --entrypoint /bin/sh -- "$img" -c 'x=$(head -c 134217728 /dev/zero | tr "\\0" a); echo ${#x}')
+          podman inspect --format '{{json .HostConfig}}' "$id" | jq -c '{CapDrop,CapAdd,SecurityOpt,Memory,MemorySwap,PidsLimit,NanoCpus,CpuQuota,CpuPeriod,Ulimits,NetworkMode,ReadonlyRootfs,Privileged,IpcMode}'
+          podman start --attach "$id"; echo "exit=$?"
+          for _ in 1 2 3 4 5; do podman inspect --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Status}} {{.State.Error}}' "$id"; sleep 1; done
+          podman rm -f "$id"
+          id=$(podman create "${common[@]}" --name oom2 --entrypoint /bin/sh -- "$img" -c 'x=$(head -c 134217728 /dev/zero | tr "\\0" a); echo ${#x}')
+          podman start "$id"; podman wait "$id"
+          podman inspect --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Status}}' "$id"
+          podman rm -f "$id"
+          # Without --init
+          id=$(podman create "${common[@]:1}" --name oom3 --entrypoint /bin/sh -- "$img" -c 'x=$(head -c 134217728 /dev/zero | tr "\\0" a); echo ${#x}')
+          podman start --attach "$id"; echo "exit=$?"
+          podman inspect --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Status}}' "$id"
+          podman rm -f "$id"
+          # memory.events from inside
+          podman run --rm "${common[@]}" --entrypoint /bin/sh -- "$img" -c 'cat /proc/self/cgroup; ls /sys/fs/cgroup; (x=$(head -c 134217728 /dev/zero | tr "\\0" a)); echo sub=$?; cat /sys/fs/cgroup/memory.events'
+          podman run --rm "${common[@]}" --unsetenv-all --http-proxy=false --entrypoint /bin/sh -- "$img" -c 'env'
+          podman run --rm "${common[@]}" --entrypoint /bin/sh -- "$img" -c 'env'
+          journalctl --user -n 50 --no-pager || true
       - name: Install Rust toolchain
         run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
