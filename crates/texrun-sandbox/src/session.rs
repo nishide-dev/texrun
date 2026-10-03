@@ -7,11 +7,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use texrun_process::{Cwd, Launcher, Resource, Rlimits, RunError, Spec};
+use texrun_process::{CapturedOutput, Cwd, Launcher, Resource, Rlimits, RunError, Spec};
 
-use crate::container::{Container, ContainerSpec};
+use crate::caps::{capability_report, take_capability_report};
+use crate::container::{Container, ContainerSpec, RESTRICTIONS_NOT_APPLIED};
 use crate::error::SandboxError;
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, RuntimeKind};
 
 /// Where `sleep` is expected in the image (coreutils): the main process of
 /// a session, which bounds its lifetime.
@@ -19,6 +20,21 @@ const SLEEP: &str = "/usr/bin/sleep";
 
 /// Where `prlimit` is expected in the image (util-linux).
 const PRLIMIT: &str = "/usr/bin/prlimit";
+
+/// Where a POSIX shell is expected in the image.
+const SH: &str = "/bin/sh";
+
+/// Prints the `oom_kill` counter of the container's cgroup.
+const READ_OOM_KILL: &str = r#"for f in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.oom_control; do
+  if [ -r "$f" ]; then
+    while read -r k v; do [ "$k" = oom_kill ] && echo "$v"; done < "$f"
+    break
+  fi
+done"#;
+
+/// Timeout of reading the `oom_kill` counter (an `exec` normally takes
+/// about 0.03 s).
+const OOM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Timeout of `start` (detached: returns once the main process runs).
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -61,6 +77,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub struct Session<'r> {
     container: Container<'r>,
+    /// The `oom_kill` counter of the container's cgroup at the last read
+    /// (Podman, [`Session::oom_killed`]).
+    oom_kills_seen: std::sync::Mutex<u64>,
 }
 
 impl<'r> Session<'r> {
@@ -93,7 +112,16 @@ impl<'r> Session<'r> {
         let args: Vec<OsString> = ["start", "--", &id].map(OsString::from).into();
         // On an error `container` is dropped here, which removes it.
         runtime.exec(&args, START_TIMEOUT)?;
-        Ok(Self { container })
+        // What the runtime recorded was checked; now what a process in it
+        // has (Podman records `--cap-drop ALL` capability by capability).
+        if let Err(reason) = check_capabilities(runtime, &id) {
+            let reason = format!("{} {RESTRICTIONS_NOT_APPLIED}: {reason}", runtime.kind());
+            return Err(SandboxError::Refused(reason));
+        }
+        Ok(Self {
+            container,
+            oom_kills_seen: std::sync::Mutex::new(0),
+        })
     }
 
     /// The container's name (unique per texrun process).
@@ -121,11 +149,50 @@ impl<'r> Session<'r> {
     /// Whether the kernel's OOM killer has stopped a process in the
     /// container (`--memory`); `None` if the runtime cannot tell (e.g. the
     /// session was stopped).
+    ///
+    /// Docker records it (`OOMKilled`, for the whole session); rootless
+    /// Podman does not, so with Podman the `oom_kill` counter of the
+    /// container's cgroup is read from inside (`exec`, at most
+    /// [`OOM_READ_TIMEOUT`]) and compared with its value at the previous
+    /// call (0 at the start): `true` only for OOM kills since then. Asked
+    /// after each run that was killed, that is the kills of that run. Like
+    /// the process limit report of a compile, the reading is advisory: it
+    /// comes from a shell in the container. If it cannot be read, the
+    /// runtime's record is returned.
+    ///
+    /// The counter is not read before every run: that would be one more
+    /// `exec` per run (about 0.03 s, per page of a preview).
     pub fn oom_killed(&self) -> Option<bool> {
         if self.is_stopped() {
             return None;
         }
+        if self.container.runtime().kind() == RuntimeKind::Podman
+            && let Some(count) = self.oom_kill_count()
+        {
+            let mut seen = self
+                .oom_kills_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let new = count > *seen;
+            *seen = (*seen).max(count);
+            return Some(new);
+        }
         self.container.oom_killed_now()
+    }
+
+    /// The `oom_kill` counter of the container's cgroup (`memory.events`,
+    /// or `memory.oom_control` with cgroup v1), read with `exec`.
+    fn oom_kill_count(&self) -> Option<u64> {
+        let id = self.container.id()?;
+        let args: Vec<OsString> = ["exec", "--", &id, SH, "-c", READ_OOM_KILL]
+            .map(OsString::from)
+            .into();
+        let out = self
+            .container
+            .runtime()
+            .exec(&args, OOM_READ_TIMEOUT)
+            .ok()?;
+        out.trim().parse().ok()
     }
 
     /// The `exec` arguments for `spec`.
@@ -236,6 +303,21 @@ fn exited_on_its_own(pid: u32) -> bool {
             Ok(None) | Err(_) => return false,
         }
     }
+}
+
+/// Runs the [`capability_report`] shell in the started container `id`
+/// (`exec`, as the runs are) and checks that it has no capability.
+fn check_capabilities(runtime: &Runtime, id: &str) -> Result<(), String> {
+    let (shell, shell_args) = capability_report(None, &[]);
+    let mut args: Vec<OsString> = vec!["exec".into(), "--".into(), id.into(), shell.into()];
+    args.extend(shell_args);
+    let out = runtime
+        .exec(&args, START_TIMEOUT)
+        .map_err(|e| e.to_string())?;
+    let mut stdout = CapturedOutput::default();
+    stdout.bytes = out.into_bytes();
+    stdout.total_bytes = stdout.bytes.len() as u64;
+    take_capability_report(&mut stdout)
 }
 
 /// The `prlimit` option of `resource`.
@@ -354,6 +436,40 @@ mod tests {
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.contains("rm --force -- fake-id"), "{calls}");
         assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
+    }
+
+    #[test]
+    fn a_session_with_capabilities_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = crate::container::tests::fake_runtime(
+            dir.path(),
+            &crate::container::tests::host_config(4096),
+        );
+        std::fs::write(
+            dir.path().join("caps"),
+            "texrun-sandbox-caps CapInh:0000000000000000 CapPrm:0000000000000000 \
+             CapEff:0000000000000000 CapBnd:00000000a80425fb CapAmb:0000000000000000\n",
+        )
+        .unwrap();
+        let err = Session::start(
+            &rt,
+            ContainerSpec::new("texrun-engine:latest", ContainerLimits::new(4096, 64, 2)),
+            Duration::from_secs(60),
+            Rlimits::new()
+                .with(Resource::Core, 0)
+                .with_soft_hard(Resource::Cpu, 70, 75),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Refused(r) if r.contains("CapBnd")),
+            "{err:?}"
+        );
+        // Started, checked from inside, then removed.
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let start = calls.find("start -- fake-id").expect(&calls);
+        let exec = calls.find("exec -- fake-id /bin/sh -c").expect(&calls);
+        let rm = calls.find("rm --force -- fake-id").expect(&calls);
+        assert!(start < exec && exec < rm, "{calls}");
     }
 
     #[test]

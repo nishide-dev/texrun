@@ -438,6 +438,7 @@ echo "$*" >> "$here/calls"
 case "$1" in
   version) echo "29.0.0 linux" ;;
   context) echo "unix:///var/run/docker.sock" ;;
+  info) echo '["name=seccomp,profile=builtin"]' ;;
   ps) echo gone-id; echo left-id ;;
   inspect)
     case "$*" in *gone-id*) echo "No such object" >&2; exit 1 ;; esac

@@ -281,6 +281,84 @@ jobs:
             exit 1
           fi
 
+  # The same container backend tests with rootless Podman (#47,
+  # docs/development.md "container backend test"). Docker is stopped, so
+  # `--container-runtime auto` (and every test) can only use Podman. The
+  # runner's job is not in a systemd user session, so the user manager is
+  # started (linger) with the cgroup v2 controllers that the container
+  # limits need delegated to it; Podman reaches it through
+  # XDG_RUNTIME_DIR. The engine image is built with Podman, without a cache.
+  sandbox-podman:
+    name: sandbox (podman)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TEXRUN_SANDBOX_IMAGE: texrun-engine:ci
+      TEXRUN_REQUIRE_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Stop Docker
+        run: |
+          sudo systemctl stop docker.socket docker.service
+          if docker version >/dev/null 2>&1; then
+            echo "::error::Docker still answers"
+            exit 1
+          fi
+      - name: Start the user manager with delegated cgroup controllers
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
+            | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl restart "user@${uid}.service"
+          echo "XDG_RUNTIME_DIR=/run/user/${uid}" >> "${GITHUB_ENV}"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus" >> "${GITHUB_ENV}"
+          cat "/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers"
+      - name: Tool versions
+        run: |
+          podman version
+          podman info --format 'rootless={{.Host.Security.Rootless}} cgroups={{.Host.CgroupsVersion}} manager={{.Host.CgroupManager}} controllers={{json .Host.CgroupControllers}} oci={{.Host.OCIRuntime.Name}}'
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+      - name: Build engine image
+        run: podman build --tag "${TEXRUN_SANDBOX_IMAGE}" docker/engine
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Like the sandbox job, fail if any test is #[ignore]d.
+      - name: Run container backend tests
+        shell: bash
+        env:
+          TEXRUN_REQUIRE_TEXLIVE: "1"
+          TEXRUN_TEST_BACKEND: container
+        run: |
+          set -o pipefail
+          log="${RUNNER_TEMP}/sandbox.log"
+          cargo test --locked --all-features -p texrun-sandbox 2>&1 | tee "${log}"
+          cargo test --locked --all-features -p texrun-texlive \
+            --test container --test scenarios --test security 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun-preview \
+            --test container --test real_tools 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun --test container 2>&1 | tee -a "${log}"
+          if grep -E 'test result: .* [1-9][0-9]* ignored' "${log}"; then
+            echo "::error::Some tests are #[ignore]d and never run in CI"
+            exit 1
+          fi
+      - name: No containers left behind
+        run: |
+          left="$(podman ps --all --quiet --filter label=org.texrun.sandbox)"
+          if [ -n "${left}" ]; then
+            podman ps --all --filter label=org.texrun.sandbox
+            echo "::error::texrun left containers behind"
+            exit 1
+          fi
+
   deny:
     name: deny
     runs-on: ubuntu-latest
@@ -304,7 +382,7 @@ jobs:
   ci-success:
     name: ci-success
     if: always() && github.event_name != 'schedule'
-    needs: [fmt, check, clippy, test, integration, sandbox, deny]
+    needs: [fmt, check, clippy, test, integration, sandbox, sandbox-podman, deny]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -325,20 +325,27 @@ fn container_limit_exceeded(
     if signal != rustix::process::Signal::KILL.as_raw() {
         return None;
     }
-    for _ in 0..OOM_EVENT_POLLS {
+    // At most OOM_EVENT_WAIT in all, however long each question takes
+    // (with Podman, each is an `exec` into the container).
+    let deadline = std::time::Instant::now() + OOM_EVENT_WAIT;
+    loop {
         if session.oom_killed() == Some(true) {
             return Some(format!(
                 "used more than {TOOL_MEMORY} bytes of memory and was stopped"
             ));
         }
+        if std::time::Instant::now() + OOM_EVENT_INTERVAL >= deadline {
+            return None;
+        }
         std::thread::sleep(OOM_EVENT_INTERVAL);
     }
-    None
 }
 
-/// How often, and how far apart, a container is asked whether a tool that
-/// was killed was killed by the OOM killer (at most 1 s in all).
-const OOM_EVENT_POLLS: usize = 10;
+/// How long, and how far apart, a container is asked whether a tool that
+/// was killed was killed by the OOM killer (the runtime may record it
+/// asynchronously). A question started before the deadline may take
+/// longer (with Podman, at most 2 s).
+const OOM_EVENT_WAIT: Duration = Duration::from_secs(1);
 const OOM_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A short, printable excerpt of tool output for a notice: lossy UTF-8,

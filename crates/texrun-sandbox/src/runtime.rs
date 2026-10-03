@@ -176,6 +176,12 @@ impl Runtime {
                 if let Some(host) = runtime.env.get("DOCKER_HOST") {
                     check_local_endpoint(kind, &host.to_string_lossy())?;
                 }
+                let security = runtime
+                    .query(&["info", "--format", "{{json .SecurityOptions}}"])
+                    .map_err(|e| SandboxError::Unavailable(format!("{kind} is not usable: {e}")))?;
+                if docker_is_rootless(&security)? {
+                    return Err(SandboxError::Unavailable(ROOTLESS_DOCKER.to_owned()));
+                }
             }
             RuntimeKind::Podman => {
                 // `podman version` answers without a usable service (e.g. a
@@ -183,10 +189,15 @@ impl Runtime {
                 // Rootless Podman maps container uids to subordinate ids of
                 // the user; `--userns keep-id` keeps texrun's uid, so that
                 // the container can write the output directory.
-                let rootless = runtime
-                    .query(&["info", "--format", "{{.Host.Security.Rootless}}"])
+                let info = runtime
+                    .query(&[
+                        "info",
+                        "--format",
+                        "{{.Host.Security.Rootless}} {{.Host.CgroupsVersion}} \
+                         {{json .Host.CgroupControllers}}",
+                    ])
                     .map_err(|e| SandboxError::Unavailable(format!("{kind} is not usable: {e}")))?;
-                runtime.rootless = rootless.trim() == "true";
+                runtime.rootless = check_podman_cgroups(&info)?;
             }
         }
         Ok(runtime)
@@ -324,6 +335,17 @@ impl Runtime {
             env: EnvAllowlist::new(),
         }
     }
+
+    /// [`Runtime::for_tests`] as Podman, rootless or not.
+    pub(crate) fn for_tests_podman(rootless: bool) -> Self {
+        Self {
+            kind: RuntimeKind::Podman,
+            program: PathBuf::from("/nonexistent/texrun-test-podman"),
+            version: "4.9.3".to_owned(),
+            rootless,
+            env: EnvAllowlist::new(),
+        }
+    }
 }
 
 /// The environment of the runtime CLI: [`RUNTIME_ENV`] from texrun's own
@@ -340,6 +362,81 @@ fn runtime_env() -> EnvAllowlist {
         }
     }
     env
+}
+
+/// Why rootless Docker is not used (docs/security.md §4).
+const ROOTLESS_DOCKER: &str = "docker runs in rootless mode, which texrun does not support: \
+     its containers map the user texrun passes to a subordinate uid of the host, which cannot \
+     write the output directory (rootless Docker has no `--userns keep-id`). Use rootless Podman \
+     (`--container-runtime podman`) or a Docker daemon that runs as root";
+
+/// Whether `docker info --format '{{json .SecurityOptions}}'` says that the
+/// daemon runs in rootless mode (`name=rootless`). Output that is not a
+/// list of strings is an error: the mode is then unknown.
+fn docker_is_rootless(out: &str) -> Result<bool, SandboxError> {
+    let options: Option<Vec<String>> = serde_json::from_str(out.trim()).map_err(|_| {
+        SandboxError::Unavailable(format!(
+            "unexpected `docker info` output: {:?}",
+            truncate(out.trim(), 256)
+        ))
+    })?;
+    Ok(options
+        .unwrap_or_default()
+        .iter()
+        .any(|o| o.split(',').next() == Some("name=rootless")))
+}
+
+/// The cgroup controllers that the container limits need: `--memory` /
+/// `--memory-swap`, `--pids-limit`, `--cpus`.
+const LIMIT_CONTROLLERS: &[&str] = &["memory", "pids", "cpu"];
+
+/// Checks `podman info --format '{{.Host.Security.Rootless}}
+/// {{.Host.CgroupsVersion}} {{json .Host.CgroupControllers}}'` and returns
+/// whether Podman is rootless.
+///
+/// Rootless Podman can only set the container limits on cgroup v2 with the
+/// [`LIMIT_CONTROLLERS`] delegated to the user (on cgroup v1 it ignores
+/// them). Without them it is unavailable here, with the reason; the
+/// `HostConfig` check of every container would refuse it anyway.
+fn check_podman_cgroups(out: &str) -> Result<bool, SandboxError> {
+    let unexpected = || {
+        SandboxError::Unavailable(format!(
+            "unexpected `podman info` output: {:?}",
+            truncate(out.trim(), 256)
+        ))
+    };
+    let mut fields = out.trim().splitn(3, ' ');
+    let rootless = match fields.next() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return Err(unexpected()),
+    };
+    let version = fields.next().ok_or_else(unexpected)?;
+    let controllers: Option<Vec<String>> =
+        serde_json::from_str(fields.next().ok_or_else(unexpected)?).map_err(|_| unexpected())?;
+    if !rootless {
+        return Ok(false);
+    }
+    let controllers = controllers.unwrap_or_default();
+    let missing: Vec<&str> = LIMIT_CONTROLLERS
+        .iter()
+        .copied()
+        .filter(|c| !controllers.iter().any(|have| have == c))
+        .collect();
+    if version != "v2" || !missing.is_empty() {
+        return Err(SandboxError::Unavailable(format!(
+            "rootless podman cannot limit the containers here: it needs cgroup v2 (this host has \
+             {version}) with the {} controllers delegated to the user (missing: {}); see \
+             docs/security.md §4",
+            LIMIT_CONTROLLERS.join(", "),
+            if missing.is_empty() {
+                "none".to_owned()
+            } else {
+                missing.join(", ")
+            }
+        )));
+    }
+    Ok(true)
 }
 
 /// Refuses a Docker endpoint on another machine (`tcp://`, `ssh://`, ...):
@@ -488,6 +585,56 @@ mod tests {
                     Err(SandboxError::Unavailable(_))
                 ),
                 "{remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn rootless_docker_is_detected() {
+        for (out, rootless) in [
+            (
+                r#"["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"]"#,
+                false,
+            ),
+            (
+                r#"["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]"#,
+                true,
+            ),
+            ("[\"name=rootless,foo=bar\"]\n", true),
+            ("[]", false),
+            ("null", false),
+        ] {
+            assert_eq!(docker_is_rootless(out).unwrap(), rootless, "{out}");
+        }
+        for bad in ["", "rootless", "{}", "[1]"] {
+            assert!(
+                matches!(docker_is_rootless(bad), Err(SandboxError::Unavailable(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(ROOTLESS_DOCKER.contains("podman"));
+    }
+
+    #[test]
+    fn rootless_podman_needs_delegated_cgroup_controllers() {
+        let delegated = "true v2 [\"cpuset\",\"cpu\",\"io\",\"memory\",\"pids\"]\n";
+        assert!(check_podman_cgroups(delegated).unwrap());
+        // Rootful: the HostConfig check decides.
+        assert!(!check_podman_cgroups("false v1 null").unwrap());
+        assert!(!check_podman_cgroups("false v2 []").unwrap());
+        for (out, what) in [
+            ("true v1 null", "has v1"),
+            ("true v2 [\"memory\",\"pids\"]", "missing: cpu"),
+            ("true v2 []", "missing: memory, pids, cpu"),
+            ("true v2 null", "missing: memory"),
+        ] {
+            let err = check_podman_cgroups(out).unwrap_err().to_string();
+            assert!(err.contains(what), "{out}: {err}");
+        }
+        for bad in ["", "yes v2 []", "true", "true v2", "true v2 [1]"] {
+            assert!(
+                matches!(check_podman_cgroups(bad), Err(SandboxError::Unavailable(_))),
+                "{bad:?}"
             );
         }
     }

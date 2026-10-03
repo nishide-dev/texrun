@@ -20,7 +20,7 @@ use texrun_process::{
 };
 use texrun_sandbox::{
     Container, ContainerLimits, ContainerSpec, IMAGE_VERSION_LABEL, LABEL, Mount, Runtime,
-    SandboxError, Session,
+    RuntimeKind, SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -149,7 +149,7 @@ fn the_container_is_isolated_and_unprivileged() {
         r#"
 echo "uid=$(id -u)"
 echo "gid=$(id -g)"
-sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p; s/^Seccomp:\t*/seccomp=/p' /proc/self/status
+sed -n 's/^CapEff:\t*/capeff=/p; s/^CapBnd:\t*/capbnd=/p; s/^NoNewPrivs:\t*/nonewprivs=/p; s/^Seccomp:\t*/seccomp=/p' /proc/self/status
 echo "net=$(ls /sys/class/net | tr '\n' ' ')"
 if touch /usr/texrun-probe 2>/dev/null; then echo root_fs=writable; else echo root_fs=read-only; fi
 if touch /tmp/probe 2>/dev/null; then echo tmp=writable; else echo tmp=read-only; fi
@@ -179,6 +179,8 @@ echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     assert_ne!(get("uid"), "0", "{text}");
     assert_eq!(get("uid"), rustix_uid(), "{text}");
     assert_eq!(get("capeff"), "0000000000000000", "{text}");
+    // Nothing can be gained either.
+    assert_eq!(get("capbnd"), "0000000000000000", "{text}");
     assert_eq!(get("nonewprivs"), "1", "{text}");
     // The runtime's default seccomp profile is in force (filter mode).
     assert_eq!(get("seccomp"), "2", "{text}");
@@ -198,6 +200,34 @@ echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     assert!(!ws.path().join("probe").exists());
     // Removed after the run.
     assert!(containers_named(runtime, container.name()).is_empty());
+}
+
+/// The capability report (as the engine's probe runs it) passes in a real
+/// container, and what is left is the program's own output.
+#[test]
+fn the_capability_report_passes_and_leaves_the_programs_output() {
+    let runtime = require_sandbox!();
+    let container = Container::new(runtime, ContainerSpec::new(image(), limits()));
+    let (program, args) = texrun_sandbox::capability_report(
+        Some(Path::new("/bin/echo")),
+        &["from the program".into()],
+    );
+    let spec = Spec::new(program, Cwd::Path(Path::new("/")))
+        .with_args(args)
+        .with_env(EnvAllowlist::new().with("PATH", "/usr/bin:/bin"));
+    let mut finished = run(
+        &container,
+        &spec,
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    let report = String::from_utf8_lossy(&finished.stdout.bytes).into_owned();
+    assert_eq!(
+        texrun_sandbox::take_capability_report(&mut finished.stdout),
+        Ok(()),
+        "{report}"
+    );
+    assert_eq!(stdout(&finished), "from the program\n");
 }
 
 /// texrun's uid, as the container reports it.
@@ -323,14 +353,37 @@ fn the_deadline_ends_the_container_by_itself() {
 fn an_oom_kill_is_recorded() {
     let runtime = require_sandbox!();
     let limits = ContainerLimits::new(32 * 1024 * 1024, 32, 1);
-    let container = Container::new(runtime, ContainerSpec::new(image(), limits));
     // A shell variable of 128 MiB.
+    let script = "x=$(head -c 134217728 /dev/zero | tr '\\0' a); echo ${#x}";
+    let container = Container::new(runtime, ContainerSpec::new(image(), limits));
     let finished = run(
         &container,
-        &sh("x=$(head -c 134217728 /dev/zero | tr '\\0' a); echo ${#x}"),
+        &sh(script),
         Watch::new().with_timeout(Duration::from_secs(60)),
     );
     assert!(!finished.status.success(), "{finished:?}");
+    // Rootless Podman does not record `OOMKilled` (docs/security.md §4).
+    if runtime.kind() == RuntimeKind::Docker {
+        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    }
+
+    // With the report of the compile containers, both runtimes tell: the
+    // shell reads the cgroup's `oom_kill` counter.
+    let container = Container::new(
+        runtime,
+        ContainerSpec::new(image(), limits).with_report_pids(true),
+    );
+    let mut finished = run(
+        &container,
+        &sh(script),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(!finished.status.success(), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr),
+        Some(false),
+        "{finished:?}"
+    );
     assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
 }
 
@@ -364,7 +417,12 @@ fn containers_carry_the_texrun_label() {
 fn the_image_is_inspected() {
     let runtime = require_sandbox!();
     let found = runtime.image(&image()).unwrap();
-    assert!(found.id.starts_with("sha256:"), "{found:?}");
+    // Docker reports `sha256:<hex>`, Podman the bare hex digits.
+    let hex = found.id.strip_prefix("sha256:").unwrap_or(&found.id);
+    assert!(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{found:?}"
+    );
     assert_eq!(runtime.image_id(&image()).unwrap(), found.id);
 }
 
@@ -553,7 +611,7 @@ fn a_session_runs_programs_one_after_another_in_one_container() {
 
     let script = r#"
 echo "uid=$(id -u)"
-sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
+sed -n 's/^CapEff:\t*/capeff=/p; s/^CapBnd:\t*/capbnd=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
 echo "net=$(ls /sys/class/net | tr '\n' ' ')"
 echo "input=$(cat /texrun/in/input.txt)"
 if touch /texrun/in/probe 2>/dev/null; then echo in=writable; else echo in=read-only; fi
@@ -586,13 +644,16 @@ grep -E '^Max (cpu time|file size|core file size|address space)' /proc/self/limi
     let get = |k: &str| f.get(k).map_or("", String::as_str);
     assert_eq!(get("uid"), rustix_uid(), "{text}");
     assert_eq!(get("capeff"), "0000000000000000", "{text}");
+    assert_eq!(get("capbnd"), "0000000000000000", "{text}");
     assert_eq!(get("nonewprivs"), "1", "{text}");
     assert_eq!(get("net"), "lo", "{text}");
     assert_eq!(get("input"), "input", "{text}");
     assert_eq!(get("in"), "read-only", "{text}");
     assert_eq!(get("work"), "writable", "{text}");
     assert_eq!(get("root_fs"), "read-only", "{text}");
-    // The image's `PATH` and the runtime's `HOSTNAME`, besides the spec's.
+    // The runtime's `HOSTNAME` and the shell's `PWD`, besides the spec's
+    // (`PATH` and `HOME`; Podman gets `--unsetenv-all`, so not the image's
+    // `ENV`).
     assert_eq!(get("env"), "HOME HOSTNAME PATH PWD", "{text}");
     assert_eq!(get("pwd"), "/texrun/work", "{text}");
     assert_eq!(get("pids_max"), "32", "{text}");

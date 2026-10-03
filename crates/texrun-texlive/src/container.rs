@@ -13,7 +13,8 @@ use texrun_core::{
     ProcessExit, TypesetEngine,
 };
 use texrun_sandbox::{
-    Container, ContainerLimits, ContainerSpec, Mount, Runtime, RuntimeKind, SandboxError,
+    Container, ContainerLimits, ContainerSpec, Mount, RESTRICTIONS_NOT_APPLIED, Runtime,
+    RuntimeKind, SandboxError,
 };
 
 use crate::command;
@@ -258,7 +259,9 @@ impl ContainerEngine {
     }
 
     /// Compiles like [`TypesetEngine::compile`] and also returns the
-    /// captured console output (as [`LatexmkEngine::run`]).
+    /// captured console output (as [`LatexmkEngine::run`]). Probes first
+    /// ([`TypesetEngine::probe`], which also checks the capabilities in the
+    /// container) unless a probe has succeeded.
     pub fn run(
         &self,
         ctx: &CompileContext<'_>,
@@ -270,6 +273,17 @@ impl ContainerEngine {
             None => PathMapping::new(DEFAULT_GUEST_ROOT).expect("valid constant"),
         };
         check_guest_root(mapping.guest_root())?;
+        // The capabilities of a process in the container are checked by the
+        // probe (`HostConfig` cannot show them for Podman): probe first if
+        // that has not succeeded yet.
+        let probed = self
+            .version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if !probed {
+            self.probe()?;
+        }
         let runtime = self.runtime()?;
         let image = self.resolve_image_id(&runtime)?;
         let sandbox = SandboxRun {
@@ -302,7 +316,9 @@ impl TypesetEngine for ContainerEngine {
 
     /// Detects the runtime, checks that the image exists and runs
     /// `latexmk -v` in a container of it (with the same restrictions as a
-    /// compile, and nothing mounted).
+    /// compile, and nothing mounted). A process in that container must have
+    /// no capability ([`texrun_sandbox::capability_report`]); otherwise the
+    /// engine is unavailable.
     fn probe(&self) -> Result<EngineInfo, EngineError> {
         let runtime = self.runtime()?;
         let image = runtime.image(&self.config.image).map_err(sandbox_error)?;
@@ -310,9 +326,16 @@ impl TypesetEngine for ContainerEngine {
         *self.image_id.lock().unwrap_or_else(PoisonError::into_inner) = Some(image_id.clone());
         let spec = container_spec(&self.config, &image_id, PROBE_TIMEOUT);
         let container = Container::new(&runtime, spec);
+        // latexmk under a shell that first reports the capability sets of
+        // a process in the container: the `HostConfig` check reads what
+        // the runtime recorded, this what the process has.
+        let (program, args) = texrun_sandbox::capability_report(
+            Some(Path::new(GUEST_LATEXMK)),
+            &["-norc".into(), "-v".into()],
+        );
         let job = Job {
-            program: Path::new(GUEST_LATEXMK),
-            args: vec!["-norc".into(), "-v".into()],
+            program: &program,
+            args,
             cwd: Path::new("/tmp"),
             env: command::child_env(OsStr::new(GUEST_PATH), Path::new("/tmp"), None),
             timeout: Some(PROBE_TIMEOUT),
@@ -322,11 +345,21 @@ impl TypesetEngine for ContainerEngine {
             start: Start::Container(&container),
             cgroups: None,
         };
-        let (finished, _) = finish(&container, process::run(&job))?;
+        let (mut finished, _) = finish(&container, process::run(&job))?;
         drop(container);
+        let capabilities = texrun_sandbox::take_capability_report(&mut finished.stdout);
         let stdout = String::from_utf8_lossy(&finished.stdout.bytes);
         let version = match (finished.stop, engine::parse_version(&stdout)) {
-            (None, Some(v)) if finished.status.success() => v,
+            (None, Some(v)) if finished.status.success() => {
+                // Fail closed, like a restriction missing from `HostConfig`.
+                capabilities.map_err(|reason| {
+                    unavailable(format!(
+                        "{} {RESTRICTIONS_NOT_APPLIED}: {reason}",
+                        runtime.kind()
+                    ))
+                })?;
+                v
+            }
             _ => {
                 let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
                 return Err(unavailable(format!(
