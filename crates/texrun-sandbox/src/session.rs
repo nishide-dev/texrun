@@ -56,8 +56,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// own (timeout, cancellation, a failed check), the whole session is removed
 /// ([`Session::stop`]) and later runs fail. Dropping the session removes
 /// the container too; if texrun is killed, the main process ends after
-/// the lifetime and the stopped container is left (found by its
-/// [label](crate::LABEL)).
+/// the lifetime and the stopped container is left until a later texrun
+/// removes it ([`Runtime::reclaim_left_containers`]).
 #[derive(Debug)]
 pub struct Session<'r> {
     container: Container<'r>,

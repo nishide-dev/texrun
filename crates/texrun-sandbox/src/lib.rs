@@ -75,7 +75,7 @@ mod session;
 
 pub use container::{
     Container, ContainerLimits, ContainerOutcome, ContainerSpec, ContainerUser, Mount,
-    ROOT_FALLBACK_ID,
+    RESTRICTIONS_NOT_APPLIED, ROOT_FALLBACK_ID,
 };
 pub use error::SandboxError;
 pub use owner::Creator;

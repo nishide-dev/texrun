@@ -286,6 +286,19 @@ impl ErrorInfo {
         };
         let info = Self::new(stage, snake_case_name(&kind), category, error_chain(err));
         match err {
+            // The runtime created the container without a limit or
+            // restriction texrun asked for (docs/security.md §2, §4).
+            EngineError::Unavailable { engine, reason }
+                if engine == texrun_texlive::CONTAINER_ENGINE_NAME
+                    && reason.contains(texrun_texlive::RESTRICTIONS_NOT_APPLIED) =>
+            {
+                info.with_hint(
+                    "the container runtime cannot enforce every limit of --backend container on \
+                     this host (e.g. cgroup v1 without swap accounting drops the memory+swap \
+                     limit); use a host with cgroup v2, or enable swap accounting \
+                     (docs/security.md §2)",
+                )
+            }
             EngineError::Unavailable { engine, .. }
                 if engine == texrun_texlive::CONTAINER_ENGINE_NAME =>
             {
@@ -484,6 +497,25 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
         };
         assert_eq!(error_chain(&err), "failed to start `latexmk`: no such file");
+    }
+
+    #[test]
+    fn a_container_without_its_limits_gets_its_own_hint() {
+        let unavailable = |reason: &str| EngineError::Unavailable {
+            engine: texrun_texlive::CONTAINER_ENGINE_NAME.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let refused = ErrorInfo::from_engine(
+            Stage::Probe,
+            &unavailable(&format!(
+                "docker {}: memory+swap limit Some(-1) instead of 4096",
+                texrun_texlive::RESTRICTIONS_NOT_APPLIED
+            )),
+        );
+        let hint = refused.hint.unwrap();
+        assert!(hint.contains("swap accounting"), "{hint}");
+        let missing = ErrorInfo::from_engine(Stage::Probe, &unavailable("no image"));
+        assert!(missing.hint.unwrap().contains("docker build"));
     }
 
     #[test]

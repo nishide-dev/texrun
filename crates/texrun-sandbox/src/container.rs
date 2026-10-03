@@ -89,6 +89,12 @@ const PIDS_MARKER: &[u8] = b"\ntexrun-sandbox-pids ";
 /// exit after `SIGTERM`, before removing it anyway.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Part of [`Container::refusal`] (and of the errors made from it): the
+/// runtime created the container without a restriction texrun asked for,
+/// e.g. on a cgroup v1 host without swap accounting, where the daemon
+/// drops `--memory-swap`.
+pub const RESTRICTIONS_NOT_APPLIED: &str = "did not apply the container restrictions";
+
 /// The uid / gid used when texrun runs as root: the image's `texrun` user,
 /// not an id that other host processes (e.g. `nobody`) share.
 pub const ROOT_FALLBACK_ID: u32 = 10001;
@@ -800,7 +806,7 @@ impl Container<'_> {
             .and_then(|json| check_host_config(&json, self.runtime.kind(), &expected));
         if let Err(reason) = checked {
             let reason = format!(
-                "{} did not apply the container restrictions: {reason}",
+                "{} {RESTRICTIONS_NOT_APPLIED}: {reason}",
                 self.runtime.kind()
             );
             self.lock().refusal = Some(reason.clone());

@@ -345,7 +345,10 @@ fn a_container_left_by_a_killed_run_is_reclaimed_once_it_stopped() {
     let other = project(&[("main.tex", TRIVIAL)]);
     let (code, doc, stderr) = compile(other.path(), &["main.tex"]);
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(containers_of(pid, Some("running")), std::slice::from_ref(&left));
+    assert_eq!(
+        containers_of(pid, Some("running")),
+        std::slice::from_ref(&left)
+    );
 
     // Stopped (as by its deadline): the next run removes it.
     runtime(&["kill", "--", &left]);

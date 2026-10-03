@@ -84,5 +84,9 @@ pub use process::{CapturedOutput, Limits};
 pub use texrun_process::{Cgroups, ExecGate};
 /// The default of [`ContainerConfig::image`] (from `texrun-sandbox`).
 pub use texrun_sandbox::DEFAULT_IMAGE as DEFAULT_CONTAINER_IMAGE;
+/// In the reason of an [`EngineError::Unavailable`](texrun_core::EngineError::Unavailable)
+/// of [`ContainerEngine`]: the runtime did not apply a limit or restriction
+/// (from `texrun-sandbox`).
+pub use texrun_sandbox::RESTRICTIONS_NOT_APPLIED;
 /// For [`ContainerConfig::with_runtime`] (from `texrun-sandbox`).
 pub use texrun_sandbox::RuntimeKind;

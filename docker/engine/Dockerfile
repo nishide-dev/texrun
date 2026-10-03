@@ -14,6 +14,8 @@
 #   even if texrun itself is killed;
 # - /usr/bin/prlimit (util-linux), which sets RLIMIT_AS (the runtimes'
 #   --ulimit does not take it);
+# - /bin/sh (a POSIX shell), which reports whether the compile reached the
+#   container's process limit (#49);
 # - nothing of its own at /workspace or /texrun (texrun mounts there).
 #
 # - /usr/bin/mutool (MuPDF) and /usr/bin/pdfinfo + /usr/bin/pdftoppm
