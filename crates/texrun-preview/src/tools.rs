@@ -72,6 +72,24 @@ impl Toolset {
         }
     }
 
+    /// The tools at `found` (absolute paths, named like the tools), with
+    /// `search_path` as their `PATH`, without looking at this host: the
+    /// tools of a container image.
+    pub(crate) fn at(search_path: &str, found: &[PathBuf]) -> Self {
+        let find = |name: &str| {
+            found
+                .iter()
+                .find(|p| p.is_absolute() && p.file_name().is_some_and(|n| n == name))
+                .cloned()
+        };
+        Self {
+            search_path: Some(search_path.into()),
+            pdftoppm: find(PDFTOPPM),
+            pdfinfo: find(PDFINFO),
+            mutool: find(MUTOOL),
+        }
+    }
+
     /// A toolset without any tool (every run is skipped with
     /// [`NoticeKind::ToolUnavailable`](crate::NoticeKind::ToolUnavailable)).
     pub fn none() -> Self {

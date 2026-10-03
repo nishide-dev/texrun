@@ -24,7 +24,7 @@ use texrun_core::{
     Artifact, CancelToken, CompileContext, CompileOptions, CompileOutcome, CompileRequest,
     CompileResult, DiagnosticKind, EngineError, EngineInfo, Severity, TypesetEngine, WorkspacePath,
 };
-use texrun_preview::{PreviewOptions, PreviewReport, Previewer};
+use texrun_preview::{PreviewContainer, PreviewOptions, PreviewReport, Previewer, Toolset};
 use texrun_texlive::{
     Cgroups, ContainerConfig, ContainerEngine, LatexmkConfig, LatexmkEngine, LatexmkRun,
 };
@@ -202,7 +202,7 @@ fn execute(
 
     // Previews are rendered into the workspace output directory and
     // attached to the result, so that the copy below includes them.
-    let mut preview = render_previews(&ws, &result, preview_options, cgroups, cancel);
+    let mut preview = render_previews(&ws, &result, preview_options, &engine, cgroups, cancel);
     if let Some(preview) = &preview {
         preview.attach_to(&mut result);
     }
@@ -403,6 +403,7 @@ fn render_previews(
     ws: &Workspace,
     result: &CompileResult,
     options: Option<PreviewOptions>,
+    engine: &Engine,
     cgroups: Option<Cgroups>,
     cancel: &CancelToken,
 ) -> Option<PreviewReport> {
@@ -414,6 +415,20 @@ fn render_previews(
     let output_root = ws.output_dir();
     let pdf = output_root.join(pdf.path.as_path());
     // Options were validated up front; `render` cannot fail otherwise.
+    if let Engine::Container(engine) = engine {
+        // In a container of the engine image too, never on the host
+        // (docs/security.md §4 "preview").
+        let previewer = match (engine.runtime(), engine.image_id()) {
+            (Ok(runtime), Ok(image)) => Previewer::in_container(
+                PreviewContainer::new(runtime, image)
+                    .with_oci_runtime(engine.config().oci_runtime.clone()),
+            ),
+            // Not reached after a successful probe and compile; without a
+            // container no tool runs (`tool_unavailable`).
+            _ => Previewer::new(Toolset::none()),
+        };
+        return previewer.render(&pdf, &output_root, &options).ok();
+    }
     let mut previewer = Previewer::detect().with_exec_gate(crate::gate::exec_gate());
     // Only a usable one: that none can be used is already in the result
     // (`resource_limits`), or ended the run (`--cgroup required`).

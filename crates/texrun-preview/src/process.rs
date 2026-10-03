@@ -11,6 +11,11 @@
 //!   [`MIN_FILE_SIZE_LIMIT`]), set by the exec gate before the tool starts
 //!   (or, without a gate, right after it was spawned on Linux);
 //! - a watch on the size of the image being rendered.
+//!
+//! In a container ([`Limits::sandbox`], docs/security.md §4 "preview") the
+//! tool is an `exec` into the preview's [`Session`]: the same spec, with
+//! the paths of the container, and the rlimits set by `prlimit` there
+//! instead of the exec gate.
 
 use std::ffi::OsString;
 use std::io;
@@ -24,6 +29,8 @@ use texrun_process::{
     Capture, CgroupLimits, CgroupOutcome, Cgroups, Cwd, EnvAllowlist, ExecGate, Resource, Rlimits,
     Spec, StartMode, Stop, Watch,
 };
+
+use texrun_sandbox::Session;
 
 use crate::fsops;
 
@@ -88,6 +95,9 @@ pub(crate) struct ToolEnv {
     pub(crate) work: OwnedFd,
     /// A path of [`ToolEnv::work`], for where the descriptor cannot be used.
     pub(crate) work_path: PathBuf,
+    /// [`ToolEnv::work`] as the tool sees it in a container (where
+    /// [`ToolEnv::home`] is a path in the container too).
+    pub(crate) guest_work: Option<PathBuf>,
 }
 
 impl ToolEnv {
@@ -110,6 +120,8 @@ pub(crate) struct Limits<'a> {
     pub(crate) gate: Option<&'a ExecGate>,
     /// Run the tool in a cgroup of its own.
     pub(crate) cgroups: Option<&'a Cgroups>,
+    /// Run the tool in this container (instead of `gate` and `cgroups`).
+    pub(crate) sandbox: Option<&'a Session<'a>>,
     /// `RLIMIT_CPU` soft limit, in seconds ([`cpu_seconds`]).
     pub(crate) cpu_seconds: u64,
     pub(crate) deadline: Instant,
@@ -149,7 +161,7 @@ pub(crate) struct RunOutput {
 }
 
 impl RunOutput {
-    fn empty(end: RunEnd) -> Self {
+    pub(crate) fn empty(end: RunEnd) -> Self {
         Self {
             end,
             stdout: Vec::new(),
@@ -183,9 +195,12 @@ pub(crate) fn run(
         .watch
         .map_or(0, |(_, budget)| budget.saturating_add(1))
         .max(MIN_FILE_SIZE_LIMIT);
-    let cwd = Cwd::Dir {
-        fd: env.work.as_fd(),
-        path: &env.work_path,
+    let cwd = match &env.guest_work {
+        Some(guest) => Cwd::Path(guest),
+        None => Cwd::Dir {
+            fd: env.work.as_fd(),
+            path: &env.work_path,
+        },
     };
     let spec = Spec::new(program, cwd)
         .with_args(args.iter().cloned())
@@ -234,11 +249,20 @@ pub(crate) fn run(
                 .then_some(())
         });
     }
-    match texrun_process::run(&spec, watch) {
+    let finished = match limits.sandbox {
+        Some(session) => texrun_process::run_with(session, &spec, watch),
+        None => texrun_process::run(&spec, watch),
+    };
+    match finished {
         Ok(done) => RunOutput {
             end: match done.stop {
-                None => limit_exceeded(done.status, &done.cgroup, limits.cpu_seconds)
-                    .map_or(RunEnd::Exited(done.status), RunEnd::LimitExceeded),
+                None => match limits.sandbox {
+                    Some(session) => {
+                        container_limit_exceeded(done.status, session, limits.cpu_seconds)
+                    }
+                    None => limit_exceeded(done.status, &done.cgroup, limits.cpu_seconds),
+                }
+                .map_or(RunEnd::Exited(done.status), RunEnd::LimitExceeded),
                 Some(Stop::TimedOut) => RunEnd::TimedOut,
                 Some(Stop::Cancelled) => RunEnd::Cancelled,
                 Some(Stop::Check(())) => RunEnd::OutputTooLarge,
@@ -284,6 +308,38 @@ fn limit_exceeded(status: ExitStatus, cgroup: &CgroupOutcome, cpu_seconds: u64) 
     (status.signal() == Some(rustix::process::Signal::XCPU.as_raw()))
         .then(|| format!("used more than {cpu_seconds} s of CPU time"))
 }
+
+/// The limit a tool in a container reached, if any. The runtime CLI exits
+/// with 128 + the signal that ended the tool: `SIGXCPU`, or `SIGKILL` from
+/// the OOM killer of the container's cgroup (which the runtime records,
+/// asynchronously, as `OOMKilled`).
+fn container_limit_exceeded(
+    status: ExitStatus,
+    session: &Session<'_>,
+    cpu_seconds: u64,
+) -> Option<String> {
+    let signal = status.code()?.checked_sub(128)?;
+    if signal == rustix::process::Signal::XCPU.as_raw() {
+        return Some(format!("used more than {cpu_seconds} s of CPU time"));
+    }
+    if signal != rustix::process::Signal::KILL.as_raw() {
+        return None;
+    }
+    for _ in 0..OOM_EVENT_POLLS {
+        if session.oom_killed() == Some(true) {
+            return Some(format!(
+                "used more than {TOOL_MEMORY} bytes of memory and was stopped"
+            ));
+        }
+        std::thread::sleep(OOM_EVENT_INTERVAL);
+    }
+    None
+}
+
+/// How often, and how far apart, a container is asked whether a tool that
+/// was killed was killed by the OOM killer (at most 1 s in all).
+const OOM_EVENT_POLLS: usize = 10;
+const OOM_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A short, printable excerpt of tool output for a notice: lossy UTF-8,
 /// trimmed, at most `max_chars` characters, control characters (other than

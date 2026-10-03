@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use texrun_core::{Artifact, ArtifactKind, WorkspacePath};
-use texrun_process::{Cgroups, ExecGate};
+use texrun_process::{Cgroups, ExecGate, Resource, Rlimits};
+use texrun_sandbox::{SandboxError, Session};
 
 use crate::backend::Invocation;
 use crate::error::PreviewError;
@@ -19,6 +20,7 @@ use crate::process::{self, Limits, RunEnd, RunOutput, ToolEnv};
 use crate::report::{
     NoticeKind, PageInfo, PagePreview, PdfInfo, PreviewNotice, PreviewReport, PreviewStatus,
 };
+use crate::sandbox::{self, PreviewContainer};
 use crate::tools::{Backend, Toolset};
 
 /// The notice for tools started without the exec gate because of `reason`.
@@ -45,8 +47,13 @@ fn cgroup_notice(reason: &str) -> PreviewNotice {
 
 /// Characters of tool stderr kept in a notice.
 const DETAIL_CHARS: usize = 2000;
-/// File name the tool renders to, inside the private working directory.
-const RENDER_NAME: &str = "page.png";
+/// File name the tool renders page `page` to, inside the private working
+/// directory. A new name for every page: in a container, the runtime's file
+/// sharing (on macOS, with its VM) may still cache a name that texrun has
+/// moved away on the host, so a name is never written twice.
+fn render_name(page: u32) -> String {
+    format!("render-{page:03}.png")
+}
 /// Pixels an image may exceed `max_long_edge_px` by (rounding in the tools).
 const PIXEL_SLACK: u32 = 2;
 
@@ -57,6 +64,7 @@ pub struct Previewer {
     tools: Toolset,
     gate: Option<ExecGate>,
     cgroups: Option<Cgroups>,
+    container: Option<PreviewContainer>,
 }
 
 impl Previewer {
@@ -66,6 +74,31 @@ impl Previewer {
             tools,
             gate: None,
             cgroups: None,
+            container: None,
+        }
+    }
+
+    /// Runs the tools of the image of `container` in a container instead of
+    /// the host's tools (docs/security.md §4 "preview", #46): one container
+    /// per preview run, with no network, nothing of the host but a copy of
+    /// the PDF (read-only) and the tools' scratch directories (writable), and
+    /// the limits of §3.10 (see [`PreviewContainer`]). The images are checked
+    /// and stored through descriptors as on the host.
+    ///
+    /// The tools are looked up in the image (which of `mutool`, `pdfinfo`
+    /// and `pdftoppm` exist in `/usr/bin`) at the start of each run;
+    /// [`Previewer::toolset`] is empty. The exec gate and cgroups
+    /// ([`Previewer::with_exec_gate`], [`Previewer::with_cgroups`]) are not
+    /// used: the runtime applies the limits. If the container cannot be
+    /// started, or the runtime did not apply one of its restrictions (fail
+    /// closed), no tool runs (on the host neither): the status is
+    /// [`PreviewStatus::Skipped`] with a notice.
+    pub fn in_container(container: PreviewContainer) -> Self {
+        Self {
+            tools: Toolset::none(),
+            gate: None,
+            cgroups: None,
+            container: Some(container),
         }
     }
 
@@ -151,6 +184,9 @@ impl Previewer {
         options: &PreviewOptions,
     ) -> Result<PreviewReport, PreviewError> {
         options.validate()?;
+        if let Some(container) = &self.container {
+            return Ok(run_in_container(container, pdf, output_root, options));
+        }
         let mut report = PreviewReport::empty();
         let backend = match self.tools.select(options.backend) {
             Ok(backend) => backend,
@@ -195,6 +231,7 @@ impl Previewer {
             backend,
             gate: self.gate.as_ref(),
             cgroups: self.cgroups.as_ref().filter(|c| c.check().is_ok()),
+            sandbox: None,
             options,
             deadline: Instant::now() + options.timeout,
             report,
@@ -210,6 +247,8 @@ struct Run<'a> {
     backend: Backend<'a>,
     gate: Option<&'a ExecGate>,
     cgroups: Option<&'a Cgroups>,
+    /// The container the tools run in, if any.
+    sandbox: Option<&'a Session<'a>>,
     options: &'a PreviewOptions,
     deadline: Instant,
     report: PreviewReport,
@@ -228,15 +267,8 @@ impl Run<'_> {
         let Some(pdf) = self.check_pdf(pdf) else {
             return;
         };
-        let root_fd = match output_root.map(fsops::open_dir).transpose() {
-            Ok(fd) => fd,
-            Err(e) => {
-                self.notice(PreviewNotice::warning(
-                    NoticeKind::OutputError,
-                    format!("cannot open the output directory: {e}"),
-                ));
-                return;
-            }
+        let Ok(root_fd) = self.open_root(output_root) else {
+            return;
         };
         // Private scratch space: `HOME` for the tools and their working
         // directory. For rendering it lives in the output root so that
@@ -272,9 +304,26 @@ impl Run<'_> {
             home: scratch.path().join("home"),
             work,
             work_path: scratch.path().join("work"),
+            guest_work: None,
         };
+        self.process(&pdf, root_fd, &env);
+    }
 
-        let Some(count) = self.page_count(&pdf, &env) else {
+    /// Opens the output root, if any; an error (with a notice) if that
+    /// fails.
+    fn open_root(&mut self, output_root: Option<&Path>) -> Result<Option<OwnedFd>, ()> {
+        output_root.map(fsops::open_dir).transpose().map_err(|e| {
+            self.notice(PreviewNotice::warning(
+                NoticeKind::OutputError,
+                format!("cannot open the output directory: {e}"),
+            ));
+        })
+    }
+
+    /// Reads the metadata of `pdf` (as the tools see it) and renders the
+    /// selected pages into `root_fd`, if any.
+    fn process(&mut self, pdf: &Path, root_fd: Option<OwnedFd>, env: &ToolEnv) {
+        let Some(count) = self.page_count(pdf, env) else {
             return;
         };
         self.report.pdf = Some(PdfInfo {
@@ -286,7 +335,7 @@ impl Run<'_> {
             self.inspected = root_fd.is_none();
             return;
         };
-        let Some(pages) = self.page_sizes(&pdf, &env, first, last) else {
+        let Some(pages) = self.page_sizes(pdf, env, first, last) else {
             return;
         };
         if let Some(info) = self.report.pdf.as_mut() {
@@ -295,7 +344,7 @@ impl Run<'_> {
         match root_fd {
             Some(root_fd) => {
                 self.selected = last - first + 1;
-                self.render_pages(&pdf, &root_fd, &env, first, last, &pages);
+                self.render_pages(pdf, &root_fd, env, first, last, &pages);
             }
             None => self.inspected = true,
         }
@@ -354,6 +403,7 @@ impl Run<'_> {
             Limits {
                 gate: self.gate,
                 cgroups: self.cgroups,
+                sandbox: self.sandbox,
                 cpu_seconds: process::cpu_seconds(self.options.timeout),
                 deadline: self.deadline,
                 cancel: &self.options.cancel,
@@ -569,18 +619,43 @@ impl Run<'_> {
             return ControlFlow::Continue(());
         };
         let budget = self.options.max_total_bytes.saturating_sub(*total);
-        fsops::remove(&env.work, RENDER_NAME);
-        let inv = self.backend.render(pdf, page, dpi, max_px, RENDER_NAME);
-        let out = self.invoke(&inv, env, Some((RENDER_NAME, budget)));
+        let render_name = render_name(page);
+        let render_name = render_name.as_str();
+        fsops::remove(&env.work, render_name);
+        let inv = self.backend.render(pdf, page, dpi, max_px, render_name);
+        let out = self.invoke(&inv, env, Some((render_name, budget)));
         if self.stopped(&inv, &out, Some(page)) {
-            fsops::remove(&env.work, RENDER_NAME);
+            fsops::remove(&env.work, render_name);
             return ControlFlow::Break(());
         }
-        let size = fsops::regular_file_len(&env.work, RENDER_NAME);
+        // In a container, the working directory stays writable for whatever
+        // the tool left running there: the image is first copied (at most
+        // one byte over the budget) into a file of texrun's own in the
+        // preview directory, and that copy is checked and stored.
+        let output = if self.sandbox.is_some() {
+            let staged = fsops::Staged::copy(&env.work, render_name, dir, budget.saturating_add(1));
+            fsops::remove(&env.work, render_name);
+            match staged {
+                Ok(staged) => Output::Staged(staged),
+                Err(e) => {
+                    self.notice(
+                        PreviewNotice::warning(
+                            NoticeKind::OutputError,
+                            format!("cannot store the image of page {page}: {e}"),
+                        )
+                        .with_page(page),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
+        } else {
+            Output::Work(&env.work, render_name)
+        };
+        let size = output.len();
         // Checked before the exit status: on Linux a tool that reaches
         // `RLIMIT_FSIZE` is killed by `SIGXFSZ`.
         if size.is_some_and(|size| size > budget) {
-            fsops::remove(&env.work, RENDER_NAME);
+            output.discard();
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::SizeLimit,
@@ -594,7 +669,7 @@ impl Run<'_> {
             return ControlFlow::Break(());
         }
         if !out.succeeded() {
-            fsops::remove(&env.work, RENDER_NAME);
+            output.discard();
             self.render_failed(page, &format!("{} failed", program_name(&inv)), &out);
             return ControlFlow::Continue(());
         }
@@ -602,17 +677,15 @@ impl Run<'_> {
             self.render_failed(page, "no image was written", &out);
             return ControlFlow::Continue(());
         };
-        let Some((width_px, height_px)) =
-            fsops::read_header::<24>(&env.work, RENDER_NAME).and_then(|h| png::dimensions(&h))
-        else {
-            fsops::remove(&env.work, RENDER_NAME);
+        let Some((width_px, height_px)) = output.header().and_then(|h| png::dimensions(&h)) else {
+            output.discard();
             self.render_failed(page, "the output is not a PNG image", &out);
             return ControlFlow::Continue(());
         };
         // Last line of defense for the pixel limit, whatever the tool made of
         // the page size (allowing for rounding).
         if width_px.max(height_px) > max_px.saturating_add(PIXEL_SLACK) {
-            fsops::remove(&env.work, RENDER_NAME);
+            output.discard();
             self.render_failed(
                 page,
                 &format!(
@@ -624,7 +697,7 @@ impl Run<'_> {
         }
         let name = WorkspacePath::new(&format!("page-{page:03}.png"))
             .expect("generated file name is a valid path");
-        if let Err(e) = fsops::rename(&env.work, RENDER_NAME, dir, name.as_str()) {
+        if let Err(e) = output.store(dir, name.as_str()) {
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::OutputError,
@@ -658,6 +731,228 @@ impl Run<'_> {
             .with_page(page)
             .with_detail(process::excerpt(&out.stderr, DETAIL_CHARS)),
         );
+    }
+}
+
+/// [`Previewer::render`] / [`Previewer::inspect`] with the tools in a
+/// container (see [`Previewer::in_container`]).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequence of steps, each ending the run with its own notice"
+)]
+fn run_in_container(
+    container: &PreviewContainer,
+    pdf: &Path,
+    output_root: Option<&Path>,
+    options: &PreviewOptions,
+) -> PreviewReport {
+    let mut run = Run {
+        // Replaced once the tools of the image are known.
+        backend: Backend::Mupdf {
+            mutool: Path::new(""),
+        },
+        gate: None,
+        cgroups: None,
+        sandbox: None,
+        options,
+        deadline: Instant::now() + options.timeout,
+        report: PreviewReport::empty(),
+        selected: 0,
+        inspected: false,
+    };
+    // Known before the image is: an explicit choice (Auto depends on the
+    // tools of the image).
+    run.report.backend = match options.backend {
+        crate::BackendChoice::Poppler => Some(crate::BackendKind::Poppler),
+        crate::BackendChoice::Mupdf => Some(crate::BackendKind::Mupdf),
+        _ => None,
+    };
+    let Some(pdf) = run.check_pdf(pdf) else {
+        return run.finish();
+    };
+    let Ok(root_fd) = run.open_root(output_root) else {
+        return run.finish();
+    };
+    // Neither a container nor a scratch directory for a run that is over.
+    let over = if options.cancel.is_cancelled() {
+        Some(RunEnd::Cancelled)
+    } else if Instant::now() >= run.deadline {
+        Some(RunEnd::TimedOut)
+    } else {
+        None
+    };
+    if let Some(end) = over {
+        let inv = Invocation {
+            program: Path::new("/usr/bin/ls"),
+            args: Vec::new(),
+        };
+        run.stopped(&inv, &RunOutput::empty(end), None);
+        return run.finish();
+    }
+    // The scratch directory is private and outside the output root (which
+    // left-over processes of the compile could have written to), because
+    // the runtime resolves the mount sources by their path. `in` holds a
+    // copy of the PDF, readable by everyone (the container user is another
+    // uid when texrun runs as root).
+    let (scratch, work) = match container_scratch(container, &pdf) {
+        Ok(scratch) => scratch,
+        Err(e) => {
+            run.notice(PreviewNotice::warning(
+                NoticeKind::OutputError,
+                format!("cannot prepare a scratch directory for the preview container: {e}"),
+            ));
+            return run.finish();
+        }
+    };
+    let spec = container.spec(
+        &scratch.path().join("in"),
+        &scratch.path().join("work"),
+        &scratch.path().join("home"),
+    );
+    let lifetime = sandbox::lifetime(options.timeout);
+    let ulimits = container_ulimits(options);
+    let session = match Session::start(container.runtime(), spec, lifetime, ulimits) {
+        Ok(session) => session,
+        Err(SandboxError::Refused(reason)) => {
+            run.notice(PreviewNotice::warning(
+                NoticeKind::ResourceLimits,
+                format!("previews were not rendered: {reason}"),
+            ));
+            return run.finish();
+        }
+        Err(e) => {
+            run.notice(PreviewNotice::warning(
+                NoticeKind::ToolUnavailable,
+                format!("cannot start the preview container: {e}"),
+            ));
+            return run.finish();
+        }
+    };
+    for warning in session.warnings() {
+        run.notice(PreviewNotice::info(
+            NoticeKind::ResourceLimits,
+            format!("container: {warning}"),
+        ));
+    }
+    let env = ToolEnv {
+        path: Some(sandbox::GUEST_PATH.into()),
+        home: PathBuf::from(sandbox::GUEST_HOME),
+        work,
+        work_path: scratch.path().join("work"),
+        guest_work: Some(PathBuf::from(sandbox::GUEST_WORK)),
+    };
+
+    // Which tools the image has: those of `guest_tools` that `ls` lists.
+    let candidates = sandbox::guest_tools();
+    let ls = Invocation {
+        program: Path::new("/usr/bin/ls"),
+        args: ["-1", "--"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .chain(candidates.iter().map(|t| t.as_os_str().to_owned()))
+            .collect(),
+    };
+    run.sandbox = Some(&session);
+    let out = run.invoke(&ls, &env, None);
+    if run.stopped(&ls, &out, None) {
+        return run.finish();
+    }
+    let found = sandbox::listed(&String::from_utf8_lossy(&out.stdout), &candidates);
+    let tools = Toolset::at(sandbox::GUEST_PATH, &found);
+    let backend = match tools.select(options.backend) {
+        Ok(backend) => backend,
+        Err(message) => {
+            run.notice(PreviewNotice::warning(
+                NoticeKind::ToolUnavailable,
+                format!("{message} in the container image `{}`", container.image()),
+            ));
+            return run.finish();
+        }
+    };
+    let mut run = Run { backend, ..run };
+    run.report.backend = Some(backend.kind());
+    let guest_pdf = Path::new(sandbox::GUEST_INPUT).join(sandbox::PDF_NAME);
+    run.process(&guest_pdf, root_fd, &env);
+    let report = run.finish();
+    // The container goes before its scratch directory.
+    drop(session);
+    drop(scratch);
+    report
+}
+
+/// The scratch directory of a preview in a container, with a copy of `pdf`
+/// in `in`, and its held `work` directory.
+fn container_scratch(
+    container: &PreviewContainer,
+    pdf: &Path,
+) -> io::Result<(fsops::ScratchDir, OwnedFd)> {
+    let parent = fs::canonicalize(container.scratch_parent())?;
+    let dir = fsops::ScratchDir::create(fsops::open_dir(&parent)?, &parent, "texrun-preview-")?;
+    let input = dir.subdir_with_mode("in", rustix::fs::Mode::from_raw_mode(0o755))?;
+    fsops::copy_in(pdf, &input, sandbox::PDF_NAME)?;
+    dir.subdir("home")?;
+    let work = dir.subdir("work")?;
+    Ok((dir, work))
+}
+
+/// The hard limits of every process in the preview container; each tool
+/// gets its own (lower or equal) values with `prlimit`.
+fn container_ulimits(options: &PreviewOptions) -> Rlimits {
+    let cpu = process::cpu_seconds(options.timeout);
+    Rlimits::new()
+        .with(
+            Resource::FileSize,
+            options
+                .max_total_bytes
+                .saturating_add(1)
+                .max(process::MIN_FILE_SIZE_LIMIT),
+        )
+        .with_soft_hard(
+            Resource::Cpu,
+            cpu,
+            cpu.saturating_add(process::CPU_KILL_GRACE),
+        )
+        .with(Resource::Core, 0)
+}
+
+/// A rendered image, where it is checked: in the tools' working directory
+/// (on the host), or a copy of it (in a container, [`fsops::Staged`]).
+enum Output<'a> {
+    Work(&'a OwnedFd, &'a str),
+    Staged(Option<fsops::Staged>),
+}
+
+impl Output<'_> {
+    /// Its size, if it is a regular file.
+    fn len(&self) -> Option<u64> {
+        match self {
+            Self::Work(dir, name) => fsops::regular_file_len(dir, name),
+            Self::Staged(staged) => staged.as_ref().map(fsops::Staged::len),
+        }
+    }
+
+    /// The PNG header (enough for the dimensions).
+    fn header(&self) -> Option<[u8; 24]> {
+        match self {
+            Self::Work(dir, name) => fsops::read_header::<24>(dir, name),
+            Self::Staged(staged) => staged.as_ref().and_then(fsops::Staged::header::<24>),
+        }
+    }
+
+    /// Removes it.
+    fn discard(self) {
+        if let Self::Work(dir, name) = self {
+            fsops::remove(dir, name);
+        }
+    }
+
+    /// Stores it as `name` in the preview directory `dir`.
+    fn store(self, dir: &OwnedFd, name: &str) -> io::Result<()> {
+        match self {
+            Self::Work(work, from) => fsops::rename(work, from, dir, name),
+            Self::Staged(Some(staged)) => staged.store(name),
+            Self::Staged(None) => Err(io::Error::other("no image")),
+        }
     }
 }
 

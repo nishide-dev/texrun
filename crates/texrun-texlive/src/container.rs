@@ -223,8 +223,14 @@ impl ContainerEngine {
     }
 
     /// The ID of the configured image: the one the last probe saw, or
-    /// looked up now.
-    fn image_id(&self, runtime: &Runtime) -> Result<String, EngineError> {
+    /// looked up now. The page previews (`texrun_preview::PreviewContainer`)
+    /// use the same image.
+    pub fn image_id(&self) -> Result<String, EngineError> {
+        let runtime = self.runtime()?;
+        self.resolve_image_id(&runtime)
+    }
+
+    fn resolve_image_id(&self, runtime: &Runtime) -> Result<String, EngineError> {
         let mut cached = self.image_id.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(id) = cached.as_ref() {
             return Ok(id.clone());
@@ -250,7 +256,7 @@ impl ContainerEngine {
         };
         check_guest_root(mapping.guest_root())?;
         let runtime = self.runtime()?;
-        let image = self.image_id(&runtime)?;
+        let image = self.resolve_image_id(&runtime)?;
         let sandbox = SandboxRun {
             runtime: &runtime,
             config: &self.config,

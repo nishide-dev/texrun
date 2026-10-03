@@ -102,6 +102,107 @@ pub(crate) fn rename(from_dir: &OwnedFd, from: &str, to_dir: &OwnedFd, to: &str)
     Ok(rustix::fs::renameat(from_dir, from, to_dir, to)?)
 }
 
+/// A copy of a file that others can still write (an image in the working
+/// directory of a preview container), made in a directory only texrun
+/// writes. It is inspected through its own descriptor and then renamed into
+/// place ([`Staged::store`]), so what was checked is what is stored, and the
+/// stored file shares no inode with the original. Removed when dropped
+/// unless stored.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    dir: OwnedFd,
+    name: String,
+    file: File,
+    len: u64,
+    stored: bool,
+}
+
+impl Staged {
+    /// Copies at most `limit` bytes of the regular file `from` in
+    /// `from_dir` (opened with `O_NOFOLLOW`) to a new file in `to_dir`.
+    /// `None` if `from` is missing or not a regular file.
+    pub(crate) fn copy(
+        from_dir: &OwnedFd,
+        from: &str,
+        to_dir: &OwnedFd,
+        limit: u64,
+    ) -> io::Result<Option<Self>> {
+        let source = match rustix::fs::openat(from_dir, from, READ_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT | Errno::LOOP | Errno::MLINK) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if FileType::from_raw_mode(rustix::fs::fstat(&source)?.st_mode) != FileType::RegularFile {
+            return Ok(None);
+        }
+        let name = format!(".{:016x}.tmp", random_u64());
+        let mut staged = Self {
+            dir: to_dir.try_clone()?,
+            file: File::from(create_new(to_dir, &name, Mode::from_raw_mode(0o644))?),
+            name,
+            len: 0,
+            stored: false,
+        };
+        staged.len = io::copy(&mut File::from(source).take(limit), &mut staged.file)?;
+        Ok(Some(staged))
+    }
+
+    /// The number of bytes copied.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// The first `N` bytes of the copy.
+    pub(crate) fn header<const N: usize>(&self) -> Option<[u8; N]> {
+        use std::os::unix::fs::FileExt;
+        let mut header = [0u8; N];
+        self.file.read_exact_at(&mut header, 0).ok()?;
+        Some(header)
+    }
+
+    /// Renames the copy to `to` in its directory, replacing a file (or
+    /// symlink) of that name.
+    pub(crate) fn store(mut self, to: &str) -> io::Result<()> {
+        rustix::fs::renameat(&self.dir, self.name.as_str(), &self.dir, to)?;
+        self.stored = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.stored {
+            remove(&self.dir, &self.name);
+        }
+    }
+}
+
+/// Creates the new file `name` in `dir` (`O_EXCL`, never through a
+/// symlink) with permissions `mode` (not reduced by the umask).
+fn create_new(dir: &OwnedFd, name: &str, mode: Mode) -> io::Result<OwnedFd> {
+    let flags = OFlags::RDWR
+        .union(OFlags::CREATE)
+        .union(OFlags::EXCL)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    let fd = rustix::fs::openat(dir, name, flags, mode)?;
+    rustix::fs::fchmod(&fd, mode)?;
+    Ok(fd)
+}
+
+/// Copies the regular file `source` (the PDF, a path the caller checked) to
+/// the new file `name` in `dir`, readable by everyone (mode 0644: the
+/// container user may be another uid). Its last component is not followed
+/// if it is a symlink. Returns the number of bytes copied.
+pub(crate) fn copy_in(source: &Path, dir: &OwnedFd, name: &str) -> io::Result<u64> {
+    let fd = rustix::fs::open(source, READ_FLAGS, Mode::empty()).map_err(map)?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let target = create_new(dir, name, Mode::from_raw_mode(0o644))?;
+    io::copy(&mut File::from(fd), &mut File::from(target))
+}
+
 /// Deepest directory level [`remove_tree`] descends to. The tools only
 /// create a few levels of caches in their `HOME`.
 const MAX_REMOVE_DEPTH: usize = 32;
@@ -154,8 +255,16 @@ impl ScratchDir {
 
     /// Creates the subdirectory `name` and opens it (`O_NOFOLLOW`).
     pub(crate) fn subdir(&self, name: &str) -> io::Result<OwnedFd> {
-        rustix::fs::mkdirat(&self.dir, name, Mode::from_raw_mode(0o700))?;
-        rustix::fs::openat(&self.dir, name, DIR_FLAGS, Mode::empty()).map_err(map)
+        self.subdir_with_mode(name, Mode::from_raw_mode(0o700))
+    }
+
+    /// [`ScratchDir::subdir`] with permissions `mode` (not reduced by the
+    /// umask).
+    pub(crate) fn subdir_with_mode(&self, name: &str, mode: Mode) -> io::Result<OwnedFd> {
+        rustix::fs::mkdirat(&self.dir, name, mode)?;
+        let fd = rustix::fs::openat(&self.dir, name, DIR_FLAGS, Mode::empty()).map_err(map)?;
+        rustix::fs::fchmod(&fd, mode)?;
+        Ok(fd)
     }
 }
 
@@ -290,6 +399,105 @@ mod tests {
         drop(b);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn copies_go_through_descriptors_and_never_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_fd = open_dir(dst.path()).unwrap();
+        fs::write(src.path().join("doc.pdf"), b"%PDF").unwrap();
+        assert_eq!(
+            copy_in(&src.path().join("doc.pdf"), &dst_fd, "in.pdf").unwrap(),
+            4
+        );
+        let mode = fs::metadata(dst.path().join("in.pdf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+        // Never over an existing name (or through a symlink there).
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x"), dst.path().join("link")).unwrap();
+        assert!(copy_in(&src.path().join("doc.pdf"), &dst_fd, "link").is_err());
+        assert!(copy_in(&src.path().join("doc.pdf"), &dst_fd, "in.pdf").is_err());
+        assert!(!outside.path().join("x").exists());
+        assert!(
+            copy_in(src.path(), &dst_fd, "dir.pdf").is_err(),
+            "a directory"
+        );
+
+        // Never through a symlink as the source either.
+        std::os::unix::fs::symlink(src.path().join("doc.pdf"), src.path().join("link.pdf"))
+            .unwrap();
+        assert!(copy_in(&src.path().join("link.pdf"), &dst_fd, "l.pdf").is_err());
+    }
+
+    #[test]
+    fn a_staged_copy_is_what_is_stored() {
+        use std::os::unix::fs::MetadataExt;
+
+        let work = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let work_fd = open_dir(work.path()).unwrap();
+        let out_fd = open_dir(out.path()).unwrap();
+        fs::write(work.path().join("render.png"), b"0123456789").unwrap();
+
+        let staged = Staged::copy(&work_fd, "render.png", &out_fd, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.len(), 10);
+        assert_eq!(staged.header::<4>(), Some(*b"0123"));
+        // Whatever happens to the original after the copy (also through a
+        // descriptor someone kept open) does not reach the copy.
+        let mut original = fs::OpenOptions::new()
+            .write(true)
+            .open(work.path().join("render.png"))
+            .unwrap();
+        std::io::Write::write_all(&mut original, b"XXXX").unwrap();
+        assert_eq!(staged.header::<4>(), Some(*b"0123"));
+        // Stored over a symlink: the link is replaced, its target untouched.
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("y"), out.path().join("page-001.png"))
+            .unwrap();
+        staged.store("page-001.png").unwrap();
+        let stored = out.path().join("page-001.png");
+        assert_eq!(fs::read(&stored).unwrap(), b"0123456789");
+        assert!(!outside.path().join("y").exists());
+        let (a, b) = (
+            fs::metadata(&stored).unwrap(),
+            fs::metadata(work.path().join("render.png")).unwrap(),
+        );
+        assert_ne!((a.dev(), a.ino()), (b.dev(), b.ino()), "a separate inode");
+        std::io::Write::write_all(&mut original, b"YYYY").unwrap();
+        assert_eq!(fs::read(&stored).unwrap(), b"0123456789");
+
+        // At most `limit` bytes; dropped copies are removed.
+        let short = Staged::copy(&work_fd, "render.png", &out_fd, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(short.len(), 3);
+        drop(short);
+        // A missing file or a symlink is no image.
+        assert!(
+            Staged::copy(&work_fd, "missing.png", &out_fd, 100)
+                .unwrap()
+                .is_none()
+        );
+        std::os::unix::fs::symlink(work.path().join("render.png"), work.path().join("l.png"))
+            .unwrap();
+        assert!(
+            Staged::copy(&work_fd, "l.png", &out_fd, 100)
+                .unwrap()
+                .is_none()
+        );
+        let names: Vec<_> = fs::read_dir(out.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["page-001.png"]);
     }
 
     #[test]

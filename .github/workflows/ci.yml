@@ -207,7 +207,8 @@ jobs:
   # the engine image (docker/engine/Dockerfile) is built and the tests run
   # on the runner against its Docker, as `texrun --backend container`
   # would. TEXRUN_TEST_BACKEND=container runs the #10 fixtures (scenarios /
-  # security) in the container; TEXRUN_REQUIRE_SANDBOX / _TEXLIVE turn a
+  # security) and the preview tests (real_tools, #46) in the container;
+  # TEXRUN_REQUIRE_SANDBOX / _TEXLIVE turn a
   # missing runtime, image or TeX Live into a failure instead of a skip.
   sandbox:
     name: sandbox
@@ -253,6 +254,8 @@ jobs:
           cargo test --locked --all-features -p texrun-sandbox 2>&1 | tee "${log}"
           cargo test --locked --all-features -p texrun-texlive \
             --test container --test scenarios --test security 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun-preview \
+            --test container --test real_tools 2>&1 | tee -a "${log}"
           cargo test --locked --all-features -p texrun --test container 2>&1 | tee -a "${log}"
           if grep -E 'test result: .* [1-9][0-9]* ignored' "${log}"; then
             echo "::error::Some tests are #[ignore]d and never run in CI"
