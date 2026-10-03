@@ -51,7 +51,7 @@ use texrun_core::{Artifact, CompileOutcome, CompileResult, EngineError, Severity
 use texrun_preview::PreviewReport;
 use texrun_workspace::{ExclusionReason, MaterializeReport, WorkspaceError};
 
-/// Exit codes of `texrun` (documented in the help and README).
+/// Exit codes of `texrun` (documented in the help and docs/cli.md).
 pub mod exit {
     /// The document compiled and a PDF was produced.
     pub const SUCCESS: u8 = 0;
@@ -68,7 +68,7 @@ pub mod exit {
 }
 
 /// Error kinds produced by the CLI itself (the other kinds come from
-/// `EngineErrorKind` and `WorkspaceErrorKind`). Listed in the README.
+/// `EngineErrorKind` and `WorkspaceErrorKind`). Listed in docs/cli.md.
 pub mod kind {
     /// Invalid command line (clap).
     pub const USAGE: &str = "usage";
@@ -423,8 +423,8 @@ mod tests {
     }
 
     #[test]
-    fn readme_lists_the_cli_error_kinds() {
-        let readme = include_str!("../../../README.md");
+    fn cli_docs_list_the_cli_error_kinds() {
+        let docs = include_str!("../../../docs/cli.md");
         for code in [
             kind::USAGE,
             kind::INVALID_PREVIEW_OPTIONS,
@@ -438,8 +438,8 @@ mod tests {
             "output_contains_entrypoint",
         ] {
             assert!(
-                readme.contains(&format!("`{code}`")),
-                "{code} is not in the README"
+                docs.contains(&format!("`{code}`")),
+                "{code} is not in docs/cli.md"
             );
         }
     }

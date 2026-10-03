@@ -1,6 +1,6 @@
 //! Command-line entry point for texrun.
 //!
-//! See `texrun --help` and the README for the commands, the JSON document
+//! See `texrun --help` and docs/cli.md for the commands, the JSON document
 //! and the exit codes.
 
 mod cli;
