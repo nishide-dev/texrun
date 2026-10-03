@@ -223,7 +223,10 @@ impl Runtime {
     /// one).
     pub fn image(&self, image: &str) -> Result<Image, SandboxError> {
         check_image(image)?;
-        let format = "{{.Id}} {{json .Config.Labels}}";
+        // Not `{{json .Config.Labels}}`: Docker 29 leaves `Labels` out of
+        // the config of an image without labels (e.g. a local
+        // `docker build docker/engine`), and the template then fails.
+        let format = "{{.Id}} {{json .Config}}";
         match self.query(&["image", "inspect", "--format", format, "--", image]) {
             Ok(out) => parse_image(&out).ok_or_else(|| {
                 SandboxError::Unavailable(format!(
@@ -382,22 +385,35 @@ pub struct Image {
     pub version: Option<String>,
 }
 
-/// Parses `{{.Id}} {{json .Config.Labels}}`.
+/// Parses `{{.Id}} {{json .Config}}`. For an image without labels, the
+/// config's `Labels` is missing (Docker 29), `null` (older Docker, Podman)
+/// or `{}`.
 fn parse_image(out: &str) -> Option<Image> {
-    let (id, labels) = out.trim().split_once(' ')?;
+    use serde_json::Value;
+    let (id, config) = out.trim().split_once(' ')?;
     if id.is_empty() {
         return None;
     }
-    let labels: Option<std::collections::BTreeMap<String, String>> =
-        serde_json::from_str(labels).ok()?;
+    let labels = match serde_json::from_str(config).ok()? {
+        Value::Object(mut config) => config.remove("Labels").unwrap_or(Value::Null),
+        Value::Null => Value::Null,
+        _ => return None,
+    };
+    let labels = match labels {
+        Value::Object(labels) => labels,
+        Value::Null => serde_json::Map::new(),
+        _ => return None,
+    };
     let version = labels
-        .and_then(|mut l| l.remove(crate::IMAGE_VERSION_LABEL))
+        .get(crate::IMAGE_VERSION_LABEL)
+        .and_then(Value::as_str)
         .filter(|v| {
             !v.is_empty()
                 && v.len() <= 64
                 && v.chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
-        });
+        })
+        .map(str::to_owned);
     Some(Image {
         id: id.to_owned(),
         version,
@@ -477,7 +493,7 @@ mod tests {
     #[test]
     fn image_inspect_output_is_parsed() {
         let labelled = format!(
-            "sha256:0123 {{\"{}\":\"0.1.0\",\"other\":\"x\"}}\n",
+            "sha256:0123 {{\"Env\":[\"PATH=/bin\"],\"Labels\":{{\"{}\":\"0.1.0\",\"other\":\"x\"}}}}\n",
             crate::IMAGE_VERSION_LABEL
         );
         assert_eq!(
@@ -488,9 +504,15 @@ mod tests {
             })
         );
         for unlabelled in [
-            "sha256:0123 null",
+            // Docker 29: no `Labels` key.
+            "sha256:0123 {\"Env\":[\"PATH=/bin\"],\"Cmd\":[\"bash\"]}",
             "sha256:0123 {}",
-            "sha256:0123 {\"a\":\"b\"}",
+            // Older Docker and Podman: `null` or `{}`.
+            "sha256:0123 {\"Labels\":null}",
+            "sha256:0123 {\"Labels\":{}}",
+            "sha256:0123 {\"Labels\":{\"a\":\"b\"}}",
+            // An image without a config at all.
+            "sha256:0123 null",
         ] {
             assert_eq!(
                 parse_image(unlabelled),
@@ -503,11 +525,24 @@ mod tests {
         }
         // Only a plain version string is reported.
         let odd = format!(
-            "sha256:0123 {{\"{}\":\"1.0 \\u001b[31m\"}}",
+            "sha256:0123 {{\"Labels\":{{\"{}\":\"1.0 \\u001b[31m\"}}}}",
             crate::IMAGE_VERSION_LABEL
         );
         assert_eq!(parse_image(&odd).unwrap().version, None);
-        for bad in ["", "sha256:0123", " {}", "sha256:0123 {", "sha256:0123 []"] {
+        let not_a_string = format!(
+            "sha256:0123 {{\"Labels\":{{\"{}\":1}}}}",
+            crate::IMAGE_VERSION_LABEL
+        );
+        assert_eq!(parse_image(&not_a_string).unwrap().version, None);
+        for bad in [
+            "",
+            "sha256:0123",
+            " {}",
+            "sha256:0123 {",
+            "sha256:0123 []",
+            "sha256:0123 {\"Labels\":[]}",
+            "sha256:0123 {\"Labels\":\"x\"}",
+        ] {
             assert_eq!(parse_image(bad), None, "{bad:?}");
         }
     }

@@ -19,7 +19,8 @@ use texrun_process::{
     Cwd, EnvAllowlist, Finished, Launcher, Resource, Rlimits, Spec, Stop, Watch, run_with,
 };
 use texrun_sandbox::{
-    Container, ContainerLimits, ContainerSpec, LABEL, Mount, Runtime, SandboxError, Session,
+    Container, ContainerLimits, ContainerSpec, IMAGE_VERSION_LABEL, LABEL, Mount, Runtime,
+    SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -365,6 +366,61 @@ fn the_image_is_inspected() {
     let found = runtime.image(&image()).unwrap();
     assert!(found.id.starts_with("sha256:"), "{found:?}");
     assert_eq!(runtime.image_id(&image()).unwrap(), found.id);
+}
+
+/// Imports an empty file system as the image `tag`, with the Dockerfile
+/// `changes` (`LABEL ...`), and removes it when dropped.
+struct ImportedImage<'a> {
+    runtime: &'a Runtime,
+    tag: String,
+}
+
+impl<'a> ImportedImage<'a> {
+    fn new(runtime: &'a Runtime, name: &str, changes: &[&str]) -> Self {
+        let tag = format!("texrun-test-{name}-{}:0", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("empty.tar");
+        // An empty tar archive: two zero blocks.
+        std::fs::write(&tar, [0u8; 1024]).unwrap();
+        let mut import = Command::new(runtime.program());
+        import.arg("import");
+        for change in changes {
+            import.args(["--change", change]);
+        }
+        let out = import.arg(&tar).arg(&tag).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        Self { runtime, tag }
+    }
+}
+
+impl Drop for ImportedImage<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new(self.runtime.program())
+            .args(["image", "rm", "--", &self.tag])
+            .output();
+    }
+}
+
+/// #54: Docker 29 has no `Labels` in the config of an image without
+/// labels (e.g. a local `docker build docker/engine`).
+#[test]
+fn an_image_without_labels_is_inspected() {
+    let runtime = require_sandbox!();
+    let image = ImportedImage::new(runtime, "unlabelled", &[]);
+    let found = runtime.image(&image.tag).unwrap();
+    assert!(!found.id.is_empty(), "{found:?}");
+    assert_eq!(found.version, None, "{found:?}");
+
+    let other = ImportedImage::new(runtime, "other-label", &["LABEL a=b"]);
+    assert_eq!(runtime.image(&other.tag).unwrap().version, None);
+
+    let labelled = ImportedImage::new(
+        runtime,
+        "labelled",
+        &[&format!("LABEL {IMAGE_VERSION_LABEL}=9.8.7")],
+    );
+    let found = runtime.image(&labelled.tag).unwrap();
+    assert_eq!(found.version.as_deref(), Some("9.8.7"), "{found:?}");
 }
 
 #[test]
