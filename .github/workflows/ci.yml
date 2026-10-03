@@ -242,6 +242,16 @@ jobs:
         run: |
           docker version --format 'docker {{.Server.Version}} ({{.Server.Os}}/{{.Server.Arch}})'
           docker run --rm --network none --entrypoint /usr/bin/latexmk "${TEXRUN_SANDBOX_IMAGE}" -v | head -n 2
+      # The image is built like a local `docker build docker/engine`,
+      # without labels (#54): the tests cover an image without a version
+      # label. The labelled case is a unit test and an imported image.
+      - name: Engine image has no labels
+        run: |
+          labels="$(docker image inspect --format '{{json .Config}}' "${TEXRUN_SANDBOX_IMAGE}" | jq -c '.Labels // {}')"
+          if [ "${labels}" != "{}" ]; then
+            echo "::error::the engine image of the sandbox job has labels: ${labels}"
+            exit 1
+          fi
       # Like the integration job, fail if any test is #[ignore]d.
       - name: Run container backend tests
         shell: bash
