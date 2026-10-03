@@ -399,7 +399,7 @@ mod tests {
         let names: Vec<_> = fs::read_dir(dst.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| n.ends_with(".tmp"))
+            .filter(|n| Path::new(n).extension().is_some_and(|e| e == "tmp"))
             .collect();
         assert!(names.is_empty(), "{names:?}");
     }

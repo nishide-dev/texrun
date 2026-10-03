@@ -267,7 +267,7 @@ impl Run<'_> {
         let Some(pdf) = self.check_pdf(pdf) else {
             return;
         };
-        let Some(root_fd) = self.open_root(output_root) else {
+        let Ok(root_fd) = self.open_root(output_root) else {
             return;
         };
         // Private scratch space: `HOME` for the tools and their working
@@ -309,18 +309,15 @@ impl Run<'_> {
         self.process(&pdf, root_fd, &env);
     }
 
-    /// Opens the output root, if any: `None` (with a notice) if that fails.
-    fn open_root(&mut self, output_root: Option<&Path>) -> Option<Option<OwnedFd>> {
-        match output_root.map(fsops::open_dir).transpose() {
-            Ok(fd) => Some(fd),
-            Err(e) => {
-                self.notice(PreviewNotice::warning(
-                    NoticeKind::OutputError,
-                    format!("cannot open the output directory: {e}"),
-                ));
-                None
-            }
-        }
+    /// Opens the output root, if any; an error (with a notice) if that
+    /// fails.
+    fn open_root(&mut self, output_root: Option<&Path>) -> Result<Option<OwnedFd>, ()> {
+        output_root.map(fsops::open_dir).transpose().map_err(|e| {
+            self.notice(PreviewNotice::warning(
+                NoticeKind::OutputError,
+                format!("cannot open the output directory: {e}"),
+            ));
+        })
     }
 
     /// Reads the metadata of `pdf` (as the tools see it) and renders the
@@ -718,6 +715,10 @@ impl Run<'_> {
 
 /// [`Previewer::render`] / [`Previewer::inspect`] with the tools in a
 /// container (see [`Previewer::in_container`]).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequence of steps, each ending the run with its own notice"
+)]
 fn run_in_container(
     container: &PreviewContainer,
     pdf: &Path,
@@ -748,7 +749,7 @@ fn run_in_container(
     let Some(pdf) = run.check_pdf(pdf) else {
         return run.finish();
     };
-    let Some(root_fd) = run.open_root(output_root) else {
+    let Ok(root_fd) = run.open_root(output_root) else {
         return run.finish();
     };
     // Neither a container nor a scratch directory for a run that is over.
@@ -772,16 +773,7 @@ fn run_in_container(
     // the runtime resolves the mount sources by their path. `in` holds a
     // copy of the PDF, readable by everyone (the container user is another
     // uid when texrun runs as root).
-    let scratch = (|| -> io::Result<_> {
-        let parent = fs::canonicalize(container.scratch_parent())?;
-        let dir = fsops::ScratchDir::create(fsops::open_dir(&parent)?, &parent, "texrun-preview-")?;
-        let input = dir.subdir_with_mode("in", rustix::fs::Mode::from_raw_mode(0o755))?;
-        fsops::copy_in(&pdf, &input, sandbox::PDF_NAME)?;
-        dir.subdir("home")?;
-        let work = dir.subdir("work")?;
-        Ok((dir, work))
-    })();
-    let (scratch, work) = match scratch {
+    let (scratch, work) = match container_scratch(container, &pdf) {
         Ok(scratch) => scratch,
         Err(e) => {
             run.notice(PreviewNotice::warning(
@@ -796,24 +788,8 @@ fn run_in_container(
         &scratch.path().join("work"),
         &scratch.path().join("home"),
     );
-    // The hard limits of every process in the container; each tool gets
-    // its own (lower or equal) values with `prlimit`.
-    let cpu = process::cpu_seconds(options.timeout);
-    let ulimits = Rlimits::new()
-        .with(
-            Resource::FileSize,
-            options
-                .max_total_bytes
-                .saturating_add(1)
-                .max(process::MIN_FILE_SIZE_LIMIT),
-        )
-        .with_soft_hard(
-            Resource::Cpu,
-            cpu,
-            cpu.saturating_add(process::CPU_KILL_GRACE),
-        )
-        .with(Resource::Core, 0);
     let lifetime = sandbox::lifetime(options.timeout);
+    let ulimits = container_ulimits(options);
     let session = match Session::start(container.runtime(), spec, lifetime, ulimits) {
         Ok(session) => session,
         Err(SandboxError::Refused(reason)) => {
@@ -881,6 +857,41 @@ fn run_in_container(
     drop(session);
     drop(scratch);
     report
+}
+
+/// The scratch directory of a preview in a container, with a copy of `pdf`
+/// in `in`, and its held `work` directory.
+fn container_scratch(
+    container: &PreviewContainer,
+    pdf: &Path,
+) -> io::Result<(fsops::ScratchDir, OwnedFd)> {
+    let parent = fs::canonicalize(container.scratch_parent())?;
+    let dir = fsops::ScratchDir::create(fsops::open_dir(&parent)?, &parent, "texrun-preview-")?;
+    let input = dir.subdir_with_mode("in", rustix::fs::Mode::from_raw_mode(0o755))?;
+    fsops::copy_in(pdf, &input, sandbox::PDF_NAME)?;
+    dir.subdir("home")?;
+    let work = dir.subdir("work")?;
+    Ok((dir, work))
+}
+
+/// The hard limits of every process in the preview container; each tool
+/// gets its own (lower or equal) values with `prlimit`.
+fn container_ulimits(options: &PreviewOptions) -> Rlimits {
+    let cpu = process::cpu_seconds(options.timeout);
+    Rlimits::new()
+        .with(
+            Resource::FileSize,
+            options
+                .max_total_bytes
+                .saturating_add(1)
+                .max(process::MIN_FILE_SIZE_LIMIT),
+        )
+        .with_soft_hard(
+            Resource::Cpu,
+            cpu,
+            cpu.saturating_add(process::CPU_KILL_GRACE),
+        )
+        .with(Resource::Core, 0)
 }
 
 fn program_name(inv: &Invocation<'_>) -> String {

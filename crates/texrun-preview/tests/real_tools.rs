@@ -38,10 +38,10 @@ const IMAGE_ENV: &str = "TEXRUN_SANDBOX_IMAGE";
 /// `Err(())` if that is asked for but cannot be used (skipped).
 fn container() -> Result<Option<PreviewContainer>, ()> {
     use std::sync::OnceLock;
+    static CONTAINER: OnceLock<Result<PreviewContainer, String>> = OnceLock::new();
     if std::env::var_os(BACKEND_ENV).is_none_or(|v| v != "container") {
         return Ok(None);
     }
-    static CONTAINER: OnceLock<Result<PreviewContainer, String>> = OnceLock::new();
     let container = CONTAINER.get_or_init(|| {
         let image = std::env::var(IMAGE_ENV)
             .ok()

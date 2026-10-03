@@ -129,7 +129,7 @@ impl<'r> Session<'r> {
     }
 
     /// The `exec` arguments for `spec`.
-    pub(crate) fn exec_args(&self, spec: &Spec<'_>, id: &str) -> Result<Vec<OsString>, RunError> {
+    pub(crate) fn exec_args(spec: &Spec<'_>, id: &str) -> Result<Vec<OsString>, RunError> {
         let invalid = |message: String| RunError::InvalidSpec(message);
         let Cwd::Path(workdir) = spec.cwd else {
             return Err(invalid(
@@ -197,7 +197,7 @@ impl Launcher for Session<'_> {
             return Err(stopped());
         }
         let id = self.container.id().ok_or_else(stopped)?;
-        let args = self.exec_args(spec, &id)?;
+        let args = Self::exec_args(spec, &id)?;
         let mut cmd = Command::new(runtime.program());
         cmd.args(args)
             .env_clear()
@@ -232,9 +232,8 @@ fn exited_on_its_own(pid: u32) -> bool {
     loop {
         match waitid(WaitId::Pid(pid), options) {
             Ok(Some(status)) => return status.exited(),
-            Ok(None) => return false,
             Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return false,
+            Ok(None) | Err(_) => return false,
         }
     }
 }
@@ -280,13 +279,6 @@ mod tests {
 
     #[test]
     fn exec_args_set_every_limit_before_the_program() {
-        let rt = Runtime::for_tests();
-        let session = Session {
-            container: Container::new(
-                &rt,
-                ContainerSpec::new("x", ContainerLimits::new(4096, 32, 2)),
-            ),
-        };
         let run = Spec::new("/usr/bin/mutool", Cwd::Path(Path::new("/texrun/work")))
             .with_args(["draw", "-o", "page.png"])
             .with_env(EnvAllowlist::new().with("HOME", "/texrun/home"))
@@ -297,7 +289,7 @@ mod tests {
                     .with_soft_hard(Resource::Cpu, 40, 45)
                     .with(Resource::Core, 0),
             );
-        let args = strings(&session.exec_args(&run, "the-id").unwrap());
+        let args = strings(&Session::exec_args(&run, "the-id").unwrap());
         let joined = args.join(" ");
         assert!(
             joined.starts_with("exec --workdir /texrun/work --env HOME=/texrun/home -- the-id "),
@@ -322,7 +314,7 @@ mod tests {
             Spec::new("/bin/x", Cwd::Path(Path::new("/w")))
                 .with_env(EnvAllowlist::new().with("A=B", "c")),
         ] {
-            assert!(session.exec_args(&bad, "id").is_err(), "{bad:?}");
+            assert!(Session::exec_args(&bad, "id").is_err(), "{bad:?}");
         }
     }
 
