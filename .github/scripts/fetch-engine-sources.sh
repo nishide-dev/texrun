@@ -18,6 +18,13 @@
 # and SHA256SUMS. Each package is taken from the archive (deb-src) if it
 # still has that version, else from snapshot.debian.org; the script fails if
 # any package cannot be fetched at exactly its version.
+#
+# Integrity: from the archive, apt checks the signed Release / Sources
+# indexes. From snapshot.debian.org, each file is checked against its SHA-1
+# (the address it is served under) and every package against the checksums
+# of its .dsc, but the .dsc's own signature is not verified (that would need
+# the keys of every past uploader; the keyring drops expired ones), so
+# those packages rely on HTTPS to snapshot.debian.org.
 set -eu
 
 packages="$1"
@@ -43,8 +50,10 @@ for entry in $(sort -u "${packages}" | tr ' ' '='); do
     info="https://snapshot.debian.org/mr/package/${name}/${version}/srcfiles?fileinfo=1"
     if files="$(curl -fsSL --retry 3 "${info}" | jq -r '.fileinfo | to_entries[] | "\(.key) \(.value[0].name)"')" \
         && [ -n "${files}" ]; then
+        # snapshot.debian.org addresses files by their SHA-1: check it.
         echo "${files}" | while read -r digest file; do
             curl -fsSL --retry 3 -o "${file}" "https://snapshot.debian.org/file/${digest}"
+            echo "${digest}  ${file}" | sha1sum --check --quiet --strict -
         done
         echo "${name} ${version}: snapshot.debian.org"
     else

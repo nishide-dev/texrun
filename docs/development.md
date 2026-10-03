@@ -224,7 +224,15 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
 4. workflow の summary に出る digest で `docker pull`・`gh attestation verify` を確かめる。
 
-公開した版の tag は上書きしない（workflow も拒否する）。やり直す場合は、GHCR から該当の版（tag の付いていない digest だけのものも）を消してから、`workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。release に sources の asset が既にあれば、先に消す。PR と、`publish` が off の手動実行は、push と release の作成以外（両 platform の test、push しない multi-arch の build、source の取得）を行う。
+公開した版の tag は上書きしない（workflow も拒否する）。失敗した場合:
+
+- `release` だけが失敗した場合（image は公開済み）: `gh run rerun <run-id> --failed` で、同じ run の artifact（`engine-sources`）を使って `release` だけを再実行する。artifact の保持は 7 日なので、それまでに行う。release に sources の asset が既にあれば、先に消す。
+- `publish` の tag を付ける前（layer の比較、attestation など）で失敗した場合: 版の tag はまだ無い。GHCR に digest だけの image が残っていれば消し、`gh run rerun <run-id> --failed` または `workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。
+- 版の tag が付いた後にやり直す場合: GHCR から該当の版を消してから、`workflow_dispatch` で再実行する。
+- 最初の公開では、`Refuse to overwrite a published version` step の出力を確かめる。まだ無い package に対して GHCR が `not found` / `manifest unknown` / `name unknown` 以外（`denied` など）を返すと、その run は止まる（fail-closed）。その場合は、この step の正規表現を GHCR の実際の文言に合わせる。
+- `Check the layers against verify` で arm64（または amd64）が一致しない場合、`publish` の build が `verify` の layer の cache に hit しなかったことがまず疑われる（cache の evict、または QEMU と native の build で cache key がずれた）。tag は付いていないので、digest だけの image を消してから再実行する。繰り返す場合は、arm64 を native の runner で push して manifest を合成する形への変更を検討する。
+
+PR と、`publish` が off の手動実行は、push と release の作成以外（両 platform の test、push しない multi-arch の build、source の取得）を行う。
 
 ## 注意事項
 

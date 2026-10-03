@@ -22,11 +22,13 @@ name: Engine image
 #   and Debian packages.
 # - build (dry run, when not publishing): the multi-arch build of publish,
 #   with SBOM and provenance, written to an archive instead of a registry.
-# - publish: pushes the multi-arch image by digest, checks that each
-#   platform has exactly the layers verify tested, then tags and attests it.
 # - sources: downloads the Debian source packages of the image at the
 #   installed versions (the corresponding source of its GPL / AGPL
-#   programs); release: attaches them to the GitHub release of the tag.
+#   programs).
+# - publish (after verify and sources): pushes the multi-arch image by
+#   digest, checks that each platform has exactly the layers verify tested,
+#   then attests and tags it.
+# - release: attaches the sources to the GitHub release of the tag.
 #
 # Triggers: a `v*` tag push publishes. Pull requests (engine image, this
 # workflow or its script changed) and workflow_dispatch with `publish` off
@@ -180,17 +182,10 @@ jobs:
           path: ${{ runner.temp }}/verify
           retention-days: 7
           if-no-files-found: error
+      # rustup comes with both runner images (as in ci.yml); no installer is
+      # downloaded here. The toolchain is the one rust-toolchain.toml pins.
       - name: Install Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v rustup >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --default-toolchain none --profile minimal
-            echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
-            export PATH="${HOME}/.cargo/bin:${PATH}"
-          fi
-          rustup toolchain install && rustup show
+        run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: false
@@ -288,9 +283,11 @@ jobs:
           done
           du -h "${archive}"
 
+  # Waits for sources too: a version whose source cannot be fetched and
+  # checked is not published.
   publish:
     name: publish
-    needs: [version, verify]
+    needs: [version, verify, sources]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -391,6 +388,18 @@ jobs:
             fi
             echo "linux/${arch}: ${pushed}"
           done
+      # Before the tag: an attestation belongs to the digest, and if it
+      # fails, nothing is published under the version yet, so the run can
+      # simply be retried.
+      - name: Attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          # Storage records are only available to organization-owned
+          # repositories.
+          create-storage-record: false
       - name: Tag
         shell: bash
         env:
@@ -404,15 +413,6 @@ jobs:
             echo "::error::${IMAGE}:${VERSION} is ${tagged}, not the pushed ${DIGEST}"
             exit 1
           fi
-      - name: Attest
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-          # Storage records are only available to organization-owned
-          # repositories.
-          create-storage-record: false
       - name: Summary
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
