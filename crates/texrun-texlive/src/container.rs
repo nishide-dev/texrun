@@ -259,7 +259,9 @@ impl ContainerEngine {
     }
 
     /// Compiles like [`TypesetEngine::compile`] and also returns the
-    /// captured console output (as [`LatexmkEngine::run`]).
+    /// captured console output (as [`LatexmkEngine::run`]). Probes first
+    /// ([`TypesetEngine::probe`], which also checks the capabilities in the
+    /// container) unless a probe has succeeded.
     pub fn run(
         &self,
         ctx: &CompileContext<'_>,
@@ -271,6 +273,17 @@ impl ContainerEngine {
             None => PathMapping::new(DEFAULT_GUEST_ROOT).expect("valid constant"),
         };
         check_guest_root(mapping.guest_root())?;
+        // The capabilities of a process in the container are checked by the
+        // probe (`HostConfig` cannot show them for Podman): probe first if
+        // that has not succeeded yet.
+        let probed = self
+            .version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if !probed {
+            self.probe()?;
+        }
         let runtime = self.runtime()?;
         let image = self.resolve_image_id(&runtime)?;
         let sandbox = SandboxRun {

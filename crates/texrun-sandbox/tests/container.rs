@@ -611,7 +611,7 @@ fn a_session_runs_programs_one_after_another_in_one_container() {
 
     let script = r#"
 echo "uid=$(id -u)"
-sed -n 's/^CapEff:\t*/capeff=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
+sed -n 's/^CapEff:\t*/capeff=/p; s/^CapBnd:\t*/capbnd=/p; s/^NoNewPrivs:\t*/nonewprivs=/p' /proc/self/status
 echo "net=$(ls /sys/class/net | tr '\n' ' ')"
 echo "input=$(cat /texrun/in/input.txt)"
 if touch /texrun/in/probe 2>/dev/null; then echo in=writable; else echo in=read-only; fi
@@ -644,13 +644,16 @@ grep -E '^Max (cpu time|file size|core file size|address space)' /proc/self/limi
     let get = |k: &str| f.get(k).map_or("", String::as_str);
     assert_eq!(get("uid"), rustix_uid(), "{text}");
     assert_eq!(get("capeff"), "0000000000000000", "{text}");
+    assert_eq!(get("capbnd"), "0000000000000000", "{text}");
     assert_eq!(get("nonewprivs"), "1", "{text}");
     assert_eq!(get("net"), "lo", "{text}");
     assert_eq!(get("input"), "input", "{text}");
     assert_eq!(get("in"), "read-only", "{text}");
     assert_eq!(get("work"), "writable", "{text}");
     assert_eq!(get("root_fs"), "read-only", "{text}");
-    // The image's `PATH` and the runtime's `HOSTNAME`, besides the spec's.
+    // The runtime's `HOSTNAME` and the shell's `PWD`, besides the spec's
+    // (`PATH` and `HOME`; Podman gets `--unsetenv-all`, so not the image's
+    // `ENV`).
     assert_eq!(get("env"), "HOME HOSTNAME PATH PWD", "{text}");
     assert_eq!(get("pwd"), "/texrun/work", "{text}");
     assert_eq!(get("pids_max"), "32", "{text}");

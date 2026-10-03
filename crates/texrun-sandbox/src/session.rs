@@ -32,8 +32,9 @@ const READ_OOM_KILL: &str = r#"for f in /sys/fs/cgroup/memory.events /sys/fs/cgr
   fi
 done"#;
 
-/// Timeout of reading the `oom_kill` counter.
-const OOM_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout of reading the `oom_kill` counter (an `exec` normally takes
+/// about 0.03 s).
+const OOM_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Timeout of `start` (detached: returns once the main process runs).
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -76,6 +77,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug)]
 pub struct Session<'r> {
     container: Container<'r>,
+    /// The `oom_kill` counter of the container's cgroup at the last read
+    /// (Podman, [`Session::oom_killed`]).
+    oom_kills_seen: std::sync::Mutex<u64>,
 }
 
 impl<'r> Session<'r> {
@@ -114,7 +118,10 @@ impl<'r> Session<'r> {
             let reason = format!("{} {RESTRICTIONS_NOT_APPLIED}: {reason}", runtime.kind());
             return Err(SandboxError::Refused(reason));
         }
-        Ok(Self { container })
+        Ok(Self {
+            container,
+            oom_kills_seen: std::sync::Mutex::new(0),
+        })
     }
 
     /// The container's name (unique per texrun process).
@@ -143,19 +150,34 @@ impl<'r> Session<'r> {
     /// container (`--memory`); `None` if the runtime cannot tell (e.g. the
     /// session was stopped).
     ///
-    /// Docker records it (`OOMKilled`); rootless Podman does not, so with
-    /// Podman the `oom_kill` counter of the container's cgroup is also read
-    /// from inside (`exec`). Like the process limit report of a compile,
-    /// that reading is advisory: it comes from a shell in the container.
+    /// Docker records it (`OOMKilled`, for the whole session); rootless
+    /// Podman does not, so with Podman the `oom_kill` counter of the
+    /// container's cgroup is read from inside (`exec`, at most
+    /// [`OOM_READ_TIMEOUT`]) and compared with its value at the previous
+    /// call (0 at the start): `true` only for OOM kills since then. Asked
+    /// after each run that was killed, that is the kills of that run. Like
+    /// the process limit report of a compile, the reading is advisory: it
+    /// comes from a shell in the container. If it cannot be read, the
+    /// runtime's record is returned.
+    ///
+    /// The counter is not read before every run: that would be one more
+    /// `exec` per run (about 0.03 s, per page of a preview).
     pub fn oom_killed(&self) -> Option<bool> {
         if self.is_stopped() {
             return None;
         }
-        let recorded = self.container.oom_killed_now();
-        if recorded == Some(true) || self.container.runtime().kind() != RuntimeKind::Podman {
-            return recorded;
+        if self.container.runtime().kind() == RuntimeKind::Podman
+            && let Some(count) = self.oom_kill_count()
+        {
+            let mut seen = self
+                .oom_kills_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let new = count > *seen;
+            *seen = (*seen).max(count);
+            return Some(new);
         }
-        self.oom_kill_count().map(|n| n > 0).or(recorded)
+        self.container.oom_killed_now()
     }
 
     /// The `oom_kill` counter of the container's cgroup (`memory.events`,
