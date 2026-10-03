@@ -226,13 +226,17 @@ impl Runtime {
         // Not `{{json .Config.Labels}}`: Docker 29 leaves `Labels` out of
         // the config of an image without labels (e.g. a local
         // `docker build docker/engine`), and the template then fails.
+        // `{{index .Config "Labels"}}` does not work with Podman, whose
+        // `.Config` is a struct. The config (env, command, labels, ...) of
+        // an image is far below `MAX_OUTPUT`; a longer one fails to parse
+        // and the image is unavailable.
         let format = "{{.Id}} {{json .Config}}";
         match self.query(&["image", "inspect", "--format", format, "--", image]) {
             Ok(out) => parse_image(&out).ok_or_else(|| {
                 SandboxError::Unavailable(format!(
                     "unexpected `{} image inspect` output for `{image}`: {:?}",
                     self.kind,
-                    out.trim()
+                    truncate(out.trim(), 256)
                 ))
             }),
             Err(e) => Err(SandboxError::Unavailable(format!(
@@ -383,6 +387,19 @@ pub struct Image {
     /// image has no such label (e.g. a local build), or one that is not a
     /// plain version string.
     pub version: Option<String>,
+}
+
+/// The first `max` bytes of `s` (at a character boundary), with `...` if
+/// it is longer, for an error message.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let end = (0..=max)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}...", &s[..end])
 }
 
 /// Parses `{{.Id}} {{json .Config}}`. For an image without labels, the
@@ -545,6 +562,15 @@ mod tests {
         ] {
             assert_eq!(parse_image(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn long_output_is_truncated_in_messages() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abcd", 3), "abc...");
+        // Not inside a character.
+        assert_eq!(truncate("aé", 2), "a...");
+        assert_eq!(truncate(&"x".repeat(70_000), 256).len(), 259);
     }
 
     #[test]
