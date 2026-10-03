@@ -128,9 +128,8 @@ pub struct CompileArgs {
     /// TeX's own restrictions and resource limits; container runs it in a
     /// container of the engine image (Docker or Podman) that sees only the
     /// workspace, with no network, a read-only filesystem and no privileges
-    /// (docs/security.md §2, §4). Use container for documents you do not
-    /// trust, together with --no-preview: page previews are still rendered on
-    /// the host with either backend.
+    /// (docs/security.md §2, §4); the page previews are then rendered in such
+    /// a container too. Use container for documents you do not trust.
     #[arg(long, value_enum, value_name = "BACKEND", default_value = "host")]
     pub backend: EngineBackend,
 

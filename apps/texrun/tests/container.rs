@@ -170,3 +170,56 @@ fn container_options_need_the_container_backend() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
     }
 }
+
+/// The directory of the first `docker` (or `podman`) on `PATH`.
+fn runtime_dir() -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .find(|dir| dir.join("docker").is_file() || dir.join("podman").is_file())
+        .expect("a container runtime on PATH")
+}
+
+#[test]
+fn previews_are_rendered_in_the_container() {
+    common::require_sandbox!();
+    let dir = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\nOne.\\newpage Two.\n\\end{document}\n",
+    )]);
+    // Only the runtime CLI on `PATH`: no preview tool of the host can be
+    // found, so the images come from the container.
+    let bin = tempfile::tempdir().unwrap();
+    let source = runtime_dir();
+    for name in ["docker", "podman"] {
+        if source.join(name).is_file() {
+            std::os::unix::fs::symlink(source.join(name), bin.path().join(name)).unwrap();
+        }
+    }
+    let image = common::sandbox_image();
+    let out = Command::new(env!("CARGO_BIN_EXE_texrun"))
+        .args([
+            "compile",
+            "--json",
+            "--backend",
+            "container",
+            "--container-image",
+            &image,
+            "main.tex",
+        ])
+        .env("PATH", bin.path())
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    assert_eq!(out.status.code(), Some(0), "{doc:#}");
+    assert_eq!(doc["preview"]["status"], "rendered", "{doc:#}");
+    assert_eq!(
+        doc["preview"]["pages"].as_array().unwrap().len(),
+        2,
+        "{doc:#}"
+    );
+    for page in ["page-001.png", "page-002.png"] {
+        let png = fs::read(dir.path().join("texrun-out/preview").join(page)).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{page}");
+    }
+}
