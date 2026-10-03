@@ -472,6 +472,7 @@ dependencies = [
  "tempfile",
  "texrun-core",
  "texrun-process",
+ "texrun-sandbox",
  "thiserror",
 ]
 

@@ -98,8 +98,62 @@ pub(crate) fn remove(dir: &OwnedFd, name: &str) {
 
 /// Moves `from_dir/from` to `to_dir/to`, replacing a file (or symlink) of
 /// that name; the target of a replaced symlink is not touched.
+///
+/// Across file systems (`EXDEV`: the scratch directory of a preview in a
+/// container is outside the output root), the regular file `from` is copied
+/// through the descriptors instead (opened with `O_NOFOLLOW`, written to a
+/// new file in `to_dir` that is then renamed to `to`) and removed.
 pub(crate) fn rename(from_dir: &OwnedFd, from: &str, to_dir: &OwnedFd, to: &str) -> io::Result<()> {
-    Ok(rustix::fs::renameat(from_dir, from, to_dir, to)?)
+    match rustix::fs::renameat(from_dir, from, to_dir, to) {
+        Err(Errno::XDEV) => copy_across(from_dir, from, to_dir, to),
+        other => Ok(other?),
+    }
+}
+
+/// The copy of [`rename`] across file systems.
+fn copy_across(from_dir: &OwnedFd, from: &str, to_dir: &OwnedFd, to: &str) -> io::Result<()> {
+    let source = rustix::fs::openat(from_dir, from, READ_FLAGS, Mode::empty()).map_err(map)?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&source)?.st_mode) != FileType::RegularFile {
+        return Err(unsafe_entry());
+    }
+    let temp = format!(".{to}.{:016x}.tmp", random_u64());
+    let copied = create_new(to_dir, &temp, Mode::from_raw_mode(0o644)).and_then(|target| {
+        io::copy(&mut File::from(source), &mut File::from(target))?;
+        Ok(rustix::fs::renameat(to_dir, temp.as_str(), to_dir, to)?)
+    });
+    if copied.is_err() {
+        remove(to_dir, &temp);
+    }
+    copied?;
+    remove(from_dir, from);
+    Ok(())
+}
+
+/// Creates the new file `name` in `dir` (`O_EXCL`, never through a
+/// symlink) with permissions `mode` (not reduced by the umask).
+fn create_new(dir: &OwnedFd, name: &str, mode: Mode) -> io::Result<OwnedFd> {
+    let flags = OFlags::WRONLY
+        .union(OFlags::CREATE)
+        .union(OFlags::EXCL)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    let fd = rustix::fs::openat(dir, name, flags, mode)?;
+    rustix::fs::fchmod(&fd, mode)?;
+    Ok(fd)
+}
+
+/// Copies the regular file `source` (a path chosen by the caller, like the
+/// PDF the host tools would open) to the new file `name` in `dir`, readable
+/// by everyone (mode 0644: the container user may be another uid). Returns
+/// the number of bytes copied.
+pub(crate) fn copy_in(source: &Path, dir: &OwnedFd, name: &str) -> io::Result<u64> {
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let fd = rustix::fs::open(source, flags, Mode::empty())?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let target = create_new(dir, name, Mode::from_raw_mode(0o644))?;
+    io::copy(&mut File::from(fd), &mut File::from(target))
 }
 
 /// Deepest directory level [`remove_tree`] descends to. The tools only
@@ -154,8 +208,16 @@ impl ScratchDir {
 
     /// Creates the subdirectory `name` and opens it (`O_NOFOLLOW`).
     pub(crate) fn subdir(&self, name: &str) -> io::Result<OwnedFd> {
-        rustix::fs::mkdirat(&self.dir, name, Mode::from_raw_mode(0o700))?;
-        rustix::fs::openat(&self.dir, name, DIR_FLAGS, Mode::empty()).map_err(map)
+        self.subdir_with_mode(name, Mode::from_raw_mode(0o700))
+    }
+
+    /// [`ScratchDir::subdir`] with permissions `mode` (not reduced by the
+    /// umask).
+    pub(crate) fn subdir_with_mode(&self, name: &str, mode: Mode) -> io::Result<OwnedFd> {
+        rustix::fs::mkdirat(&self.dir, name, mode)?;
+        let fd = rustix::fs::openat(&self.dir, name, DIR_FLAGS, Mode::empty()).map_err(map)?;
+        rustix::fs::fchmod(&fd, mode)?;
+        Ok(fd)
     }
 }
 
@@ -290,6 +352,56 @@ mod tests {
         drop(b);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn copies_go_through_descriptors_and_never_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let src_fd = open_dir(src.path()).unwrap();
+        let dst_fd = open_dir(dst.path()).unwrap();
+        fs::write(src.path().join("doc.pdf"), b"%PDF").unwrap();
+        assert_eq!(
+            copy_in(&src.path().join("doc.pdf"), &dst_fd, "in.pdf").unwrap(),
+            4
+        );
+        let mode = fs::metadata(dst.path().join("in.pdf"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644);
+        // Never over an existing name (or through a symlink there).
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x"), dst.path().join("link")).unwrap();
+        assert!(copy_in(&src.path().join("doc.pdf"), &dst_fd, "link").is_err());
+        assert!(copy_in(&src.path().join("doc.pdf"), &dst_fd, "in.pdf").is_err());
+        assert!(!outside.path().join("x").exists());
+        assert!(
+            copy_in(src.path(), &dst_fd, "dir.pdf").is_err(),
+            "a directory"
+        );
+
+        // The copy that `rename` falls back to across file systems.
+        fs::write(src.path().join("page.png"), b"png").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("y"), dst.path().join("page-001.png"))
+            .unwrap();
+        copy_across(&src_fd, "page.png", &dst_fd, "page-001.png").unwrap();
+        assert_eq!(fs::read(dst.path().join("page-001.png")).unwrap(), b"png");
+        assert!(!src.path().join("page.png").exists());
+        assert!(
+            !outside.path().join("y").exists(),
+            "the symlink was replaced"
+        );
+        std::os::unix::fs::symlink(outside.path().join("z"), src.path().join("l")).unwrap();
+        assert!(copy_across(&src_fd, "l", &dst_fd, "page-002.png").is_err());
+        let names: Vec<_> = fs::read_dir(dst.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]

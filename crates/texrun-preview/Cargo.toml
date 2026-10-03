@@ -14,6 +14,8 @@ texrun-core.workspace = true
 thiserror.workspace = true
 # Supervised tool processes (Unix only).
 texrun-process.workspace = true
+# Running the tools in a container of the engine image (#46).
+texrun-sandbox.workspace = true
 # Unix only: descriptor-based file operations.
 rustix = { workspace = true, features = ["fs", "process"] }
 

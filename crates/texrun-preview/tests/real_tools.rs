@@ -11,6 +11,12 @@
 //!     cargo test -p texrun-preview
 //! ```
 //!
+//! With `TEXRUN_TEST_BACKEND=container` (CI's `sandbox` job) the same tests
+//! run the tools of the engine image in a container instead
+//! ([`Previewer::in_container`]; the image is `TEXRUN_SANDBOX_IMAGE`, or
+//! `texrun-engine:latest`). A missing runtime or image is skipped unless
+//! `TEXRUN_REQUIRE_SANDBOX=1`.
+//!
 //! Fixtures are built by `tests/fixtures/regenerate.sh`.
 
 use std::fs;
@@ -19,11 +25,47 @@ use std::time::Duration;
 
 use texrun_core::{ArtifactKind, Severity};
 use texrun_preview::{
-    BackendChoice, BackendKind, NoticeKind, PageRange, PreviewOptions, PreviewReport,
-    PreviewStatus, Previewer, Toolset,
+    BackendChoice, BackendKind, NoticeKind, PageRange, PreviewContainer, PreviewOptions,
+    PreviewReport, PreviewStatus, Previewer, Toolset,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_PREVIEW_TOOLS";
+const BACKEND_ENV: &str = "TEXRUN_TEST_BACKEND";
+const REQUIRE_SANDBOX_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
+const IMAGE_ENV: &str = "TEXRUN_SANDBOX_IMAGE";
+
+/// The container to run the tools in, with `TEXRUN_TEST_BACKEND=container`.
+/// `Err(())` if that is asked for but cannot be used (skipped).
+fn container() -> Result<Option<PreviewContainer>, ()> {
+    use std::sync::OnceLock;
+    if std::env::var_os(BACKEND_ENV).is_none_or(|v| v != "container") {
+        return Ok(None);
+    }
+    static CONTAINER: OnceLock<Result<PreviewContainer, String>> = OnceLock::new();
+    let container = CONTAINER.get_or_init(|| {
+        let image = std::env::var(IMAGE_ENV)
+            .ok()
+            .filter(|i| !i.is_empty())
+            .unwrap_or_else(|| texrun_sandbox::DEFAULT_IMAGE.to_owned());
+        let runtime = texrun_sandbox::Runtime::detect(None).map_err(|e| e.to_string())?;
+        let id = runtime.image_id(&image).map_err(|e| e.to_string())?;
+        Ok(PreviewContainer::new(runtime, id))
+    });
+    match container {
+        Ok(container) => Ok(Some(container.clone())),
+        Err(e) if std::env::var_os(REQUIRE_SANDBOX_ENV).is_some_and(|v| v == "1") => {
+            panic!("the container is required ({REQUIRE_SANDBOX_ENV}=1) but not usable: {e}")
+        }
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "texrun-preview real_tools: SKIPPED in the container ({e})"
+            );
+            Err(())
+        }
+    }
+}
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33,6 +75,22 @@ fn fixture(name: &str) -> PathBuf {
 
 /// The installed backends, each with options that select it.
 fn backends() -> Vec<(Previewer, PreviewOptions)> {
+    match container() {
+        Ok(Some(container)) => {
+            // The engine image has both.
+            return [BackendChoice::Poppler, BackendChoice::Mupdf]
+                .into_iter()
+                .map(|choice| {
+                    (
+                        Previewer::in_container(container.clone()),
+                        PreviewOptions::default().with_backend(choice),
+                    )
+                })
+                .collect();
+        }
+        Ok(None) => {}
+        Err(()) => return Vec::new(),
+    }
     let tools = Toolset::detect();
     let mut found = Vec::new();
     for (kind, choice) in [
@@ -128,7 +186,12 @@ fn renders_every_page_to_png() {
             .render(&fixture("sizes.pdf"), out.path(), &options)
             .unwrap();
         let name = report.backend.unwrap().name();
-        assert_eq!(report.status, PreviewStatus::Rendered, "{name}");
+        assert_eq!(
+            report.status,
+            PreviewStatus::Rendered,
+            "{name}: {:?}",
+            report.notices
+        );
         assert!(report.notices.is_empty(), "{name}: {:?}", report.notices);
         assert_eq!(pages(&report), vec![1, 2, 3], "{name}");
 
@@ -361,6 +424,22 @@ fn metadata_in_the_pdf_cannot_spoof_page_count_or_size() {
 
 #[test]
 fn auto_prefers_mupdf() {
+    match container() {
+        Ok(Some(container)) => {
+            let out = tempfile::tempdir().unwrap();
+            let report = Previewer::in_container(container)
+                .render(
+                    &fixture("sizes.pdf"),
+                    out.path(),
+                    &PreviewOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(report.backend, Some(BackendKind::Mupdf), "{report:?}");
+            return;
+        }
+        Ok(None) => {}
+        Err(()) => return,
+    }
     let tools = Toolset::detect();
     let out = tempfile::tempdir().unwrap();
     let report = Previewer::new(tools.clone())

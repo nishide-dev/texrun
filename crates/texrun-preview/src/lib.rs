@@ -95,6 +95,7 @@ mod png;
 mod process;
 mod render;
 mod report;
+mod sandbox;
 mod tools;
 
 pub use error::PreviewError;
@@ -108,6 +109,7 @@ pub use report::{
     BackendKind, ImageFormat, NoticeKind, PageInfo, PagePreview, PdfInfo, PreviewNotice,
     PreviewReport, PreviewStatus,
 };
+pub use sandbox::PreviewContainer;
 /// The exec gate for [`Previewer::with_exec_gate`] and the cgroups for
 /// [`Previewer::with_cgroups`] (from `texrun-process`).
 pub use texrun_process::{Cgroups, ExecGate};
