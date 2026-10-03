@@ -317,7 +317,8 @@ under their own licenses:
 
 | Packages | License |
 | --- | --- |
-| TeX Live (`texlive-base`, `texlive-latex-base`, `texlive-latex-recommended`, their dependencies) | free software licenses, mostly the LaTeX Project Public License and the GPL (pdfTeX, BibTeX and other programs) |
+| TeX Live macro packages (`texlive-base`, `texlive-latex-base`, `texlive-latex-recommended`, their dependencies) | free software licenses, mostly the LaTeX Project Public License |
+| TeX Live programs (`texlive-binaries`: pdfTeX, BibTeX, makeindex, kpathsea, ...) | GPL and other free software licenses |
 | `latexmk` | GPL-2.0-or-later |
 | `coreutils` (`timeout`), `util-linux` (`prlimit`), the Debian base system | GPL and other free software licenses |
 | `mupdf-tools` (MuPDF), for page previews | AGPL-3.0-or-later |
@@ -326,10 +327,13 @@ under their own licenses:
 - The license of every package is kept in the image, at
   `/usr/share/doc/<package>/copyright`; the SBOM lists every package and its
   version.
-- The corresponding source of those exact versions is available from the
-  Debian archive (`apt-get source <package>=<version>`, or
-  [snapshot.debian.org](https://snapshot.debian.org/)); if you cannot get
-  it there, open an issue.
+- The complete corresponding source accompanies every published image: the
+  GitHub release of the same tag has `texrun-engine-<version>-sources.tar`,
+  the Debian source packages (`.dsc`, `.orig.tar.*`, `.debian.tar.*`) of
+  every package in the image, for both platforms, at exactly the installed
+  versions (`packages.txt` and `SHA256SUMS` are inside). The release
+  workflow fetches it when it publishes the image; `dpkg-source -x
+  <package>.dsc` unpacks one.
 - texrun starts these tools as separate processes and does not link them.
   MuPDF is shipped unmodified, so the AGPL's network clause (for modified
   versions) does not add anything beyond its source requirement.

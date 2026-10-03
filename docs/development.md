@@ -219,12 +219,12 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 `.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。release の手順:
 
-1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にした commit を main に入れる。
-2. その commit に `v<version>` の tag を push する（または、その tag で GitHub release を作る）。workflow が版の一致と container backend の test を確かめ、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。
+1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、README の例（`docker pull ghcr.io/nishide-dev/texrun-engine:<version>`、`cargo install ... --tag v<version>`、`gh attestation verify` など）の版も同じにした commit を main に入れる。
+2. その commit に `v<version>` の tag を push する（または、その tag で GitHub release を作る）。workflow が、版の一致と tag が main の祖先であることを確かめ、両 platform の image を test してから、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。image の Debian source package は `texrun-engine-<version>-sources.tar` として、tag の GitHub release に付く（release が無ければ workflow が作る）。
 3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
 4. workflow の summary に出る digest で `docker pull`・`gh attestation verify` を確かめる。
 
-公開した版の tag は上書きしない（workflow も拒否する）。やり直す場合は、GHCR から該当の版を消してから、`workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。PR と、`publish` が off の手動実行は、push しない multi-arch の build だけを行う。
+公開した版の tag は上書きしない（workflow も拒否する）。やり直す場合は、GHCR から該当の版（tag の付いていない digest だけのものも）を消してから、`workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。release に sources の asset が既にあれば、先に消す。PR と、`publish` が off の手動実行は、push と release の作成以外（両 platform の test、push しない multi-arch の build、source の取得）を行う。
 
 ## 注意事項
 

@@ -85,7 +85,9 @@ pub const IMAGE_REPOSITORY: &str = "ghcr.io/nishide-dev/texrun-engine";
 
 /// The version of texrun that this build is, which is also the tag of its
 /// engine image in [`IMAGE_REPOSITORY`] and the value of
-/// [`IMAGE_VERSION_LABEL`] in that image.
+/// [`IMAGE_VERSION_LABEL`] in that image. Strictly the version of this
+/// crate, which is the workspace version (`workspace.package.version`)
+/// shared by all texrun crates, so the same as texrun's.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Image used when none is configured: the engine image published for this
