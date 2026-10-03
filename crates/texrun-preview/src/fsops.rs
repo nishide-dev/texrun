@@ -301,7 +301,7 @@ impl Drop for ScratchDir {
 ///   effective uid of this process, with no permissions for others (mode
 ///   0700, as created);
 /// - its creator is gone ([`Creator::is_gone`]: same host (or, on macOS,
-///   same machine), and no process with its PID and start time; or, #56,
+///   same machine and boot), and no process with its PID and start time; or, #56,
 ///   same machine in another boot, and the directory was last changed
 ///   (its `ctime`) before this boot).
 ///
@@ -627,12 +627,12 @@ mod tests {
         child.wait().unwrap();
         let gone = Creator::new(pid, None, me.host()).tag();
         let elsewhere = Creator::new(pid, None, me.host() ^ 1).tag();
-        // #56: this machine with another host. On macOS (a machine and no
-        // boot) a renamed host: the PID is compared. Elsewhere unknown.
+        // #56: this machine and boot with another host. On macOS a renamed
+        // host: the PID is compared. On Linux unknown.
         let renamed = Creator::new(pid, None, me.host() ^ 1)
-            .with_machine(me.machine(), None)
+            .with_machine(me.machine(), me.boot())
             .tag();
-        let renamed_is_gone = me.machine().is_some() && me.boot().is_none();
+        let renamed_is_gone = cfg!(target_os = "macos") && me.machine().is_some();
         // This machine in another boot: only what was changed before this
         // boot, which the directory below was not.
         let other_boot = Creator::new(pid, None, me.host() ^ 1)

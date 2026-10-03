@@ -809,6 +809,23 @@ fn create_labelled(runtime: &Runtime, name: &str, labels: &[String], state: &str
     }
 }
 
+/// Removes the named containers with `rm --force` when dropped, so that a
+/// failed assertion does not leave containers with forged labels behind.
+struct RemoveOnDrop<'a> {
+    runtime: &'a Runtime,
+    names: Vec<String>,
+}
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        for name in &self.names {
+            let _ = Command::new(self.runtime.program())
+                .args(["rm", "--force", "--", name])
+                .output();
+        }
+    }
+}
+
 /// Containers that killed texrun processes left behind are removed by a
 /// later one only if they are stopped, and only if they are this user's,
 /// on this host, of a texrun process that is gone.
@@ -854,6 +871,14 @@ fn only_stopped_containers_of_gone_texrun_processes_are_reclaimed() {
         // Only the texrun label.
         (name(dead, 8), vec![format!("{LABEL}=1")], "exited"),
     ];
+    let _cleanup = RemoveOnDrop {
+        runtime,
+        names: reclaimed
+            .iter()
+            .chain(&kept)
+            .map(|(name, _, _)| name.clone())
+            .collect(),
+    };
     for (name, labels, state) in reclaimed.iter().chain(&kept) {
         create_labelled(runtime, name, labels, state);
     }
@@ -872,16 +897,14 @@ fn only_stopped_containers_of_gone_texrun_processes_are_reclaimed() {
             1,
             "{name} was removed"
         );
-        let _ = Command::new(runtime.program())
-            .args(["rm", "--force", "--", name])
-            .output();
     }
 }
 
 /// #56: containers labelled with this machine but another host. Another
 /// boot of this machine counts only for a container created before this
-/// boot, which none created now is; on macOS (no boots recorded) the PID
-/// is compared. Labels of another machine, or malformed ones, keep it.
+/// boot, which none created now is; on macOS the same machine and boot
+/// with another host name is judged by the PID. Labels of another machine,
+/// or malformed ones, keep it.
 #[test]
 fn containers_of_this_machine_are_judged_by_boot_and_creation() {
     use texrun_sandbox::{Creator, LABEL_BOOT, LABEL_HOST, LABEL_MACHINE, LABEL_PID, LABEL_UID};
@@ -909,13 +932,13 @@ fn containers_of_this_machine_are_judged_by_boot_and_creation() {
     let ours = std::process::id();
     let name = |n: u32| format!("texrun-{dead}-{ours}{n}-0");
 
-    // On macOS: this machine, another host name.
+    // This machine and boot, another host: a renamed host on macOS.
     let renamed = (
         name(1),
         labels(Some(hex(machine)), me.boot().map(hex)),
         "exited",
     );
-    let renamed_is_reclaimed = me.machine().is_some() && me.boot().is_none();
+    let renamed_is_reclaimed = cfg!(target_os = "macos") && me.machine().is_some();
     let kept = [
         // This machine, another boot, but created now.
         (
@@ -944,6 +967,13 @@ fn containers_of_this_machine_are_judged_by_boot_and_creation() {
         // No machine (#49) with another host.
         (name(7), labels(None, None), "exited"),
     ];
+    let _cleanup = RemoveOnDrop {
+        runtime,
+        names: std::iter::once(&renamed)
+            .chain(&kept)
+            .map(|(name, _, _)| name.clone())
+            .collect(),
+    };
     for (name, labels, state) in std::iter::once(&renamed).chain(&kept) {
         create_labelled(runtime, name, labels, state);
     }
@@ -955,17 +985,11 @@ fn containers_of_this_machine_are_judged_by_boot_and_creation() {
         "{}",
         renamed.0
     );
-    let _ = Command::new(runtime.program())
-        .args(["rm", "--force", "--", &renamed.0])
-        .output();
     for (name, _, _) in &kept {
         assert_eq!(
             containers_named(runtime, name).len(),
             1,
             "{name} was removed"
         );
-        let _ = Command::new(runtime.program())
-            .args(["rm", "--force", "--", name])
-            .output();
     }
 }

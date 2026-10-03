@@ -13,10 +13,10 @@
 //! - its name is the one texrun gives a container of that PID
 //!   (`texrun-<pid>-...`);
 //! - its creator is gone ([`Creator::is_gone`]): on the same host (or, on
-//!   macOS, the same machine), no process has the PID any more, or one
-//!   with another start time (the PID was reused); or (#56, Linux) it ran
+//!   macOS, the same machine and boot), no process has the PID any more,
+//!   or one with another start time (the PID was reused); or (#56) it ran
 //!   on this machine in another boot and the container was created before
-//!   this boot;
+//!   this boot started;
 //! - it is not running: exited (or dead), or created but never started.
 //!
 //! It is removed with `rm` without `--force`, so a container that started
