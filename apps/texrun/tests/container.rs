@@ -377,16 +377,19 @@ fn a_preview_left_by_a_killed_run_is_reclaimed() {
     )]);
     let mut killed = spawn_compile(many.path(), tmp.path(), &["--pages", "1-200"]);
     let pid = killed.id();
+    // Kill it once its preview container runs (its scratch directory is
+    // made before the container); the compile's container is gone by then.
     let scratch = wait_for("the preview scratch directory", || {
         scratch_dirs(tmp.path()).first().cloned()
     });
-    std::thread::sleep(Duration::from_millis(300));
+    let session = wait_for("the preview container", || {
+        let running = containers_of(pid, Some("running"));
+        (running.len() == 1).then(|| running[0].clone())
+    });
     killed.kill().unwrap();
     killed.wait().unwrap();
     assert!(tmp.path().join(&scratch).is_dir(), "{scratch}");
-    let session = wait_for("the preview container", || {
-        containers_of(pid, None).first().cloned()
-    });
+    assert_eq!(containers_of(pid, None), std::slice::from_ref(&session));
 
     // The session container stops after its lifetime; stop it now.
     runtime(&["kill", "--", &session]);

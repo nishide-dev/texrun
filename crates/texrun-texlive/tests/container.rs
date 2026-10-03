@@ -317,6 +317,8 @@ fn the_process_limit_is_reported_from_the_container() {
         "{}",
         describe(&run)
     );
+    // The report line is not counted as output either.
+    assert!(!run.stderr.is_truncated(), "{}", describe(&run));
 }
 
 #[test]

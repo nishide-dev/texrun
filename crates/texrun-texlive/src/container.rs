@@ -44,6 +44,12 @@ const GUEST_RC_DIR: &str = "/texrun/rc";
 /// `/etc`, ...) or texrun's rc, or collide with the runtime's mounts.
 pub const GUEST_ROOT_PARENTS: &[&str] = &["/srv", "/mnt"];
 
+/// What a custom image (`--container-image`) must provide, for the error of
+/// a probe that failed in it (docs/security.md §4 "engine image").
+const IMAGE_REQUIREMENTS: &str = "the image must provide /usr/bin/latexmk with pdflatex, bibtex \
+     and makeindex in /usr/bin, /usr/bin/timeout, /usr/bin/prlimit and /bin/sh; see \
+     docs/security.md §4";
+
 /// Timeout of `latexmk -v` in a container: includes starting the
 /// container (and, on macOS, possibly the runtime's VM).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -324,7 +330,8 @@ impl TypesetEngine for ContainerEngine {
             _ => {
                 let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
                 return Err(unavailable(format!(
-                    "`latexmk -v` in the image `{}` did not report a version (exit: {:?}): {}",
+                    "`latexmk -v` in the image `{}` did not report a version (exit: {:?}): {} \
+                     ({IMAGE_REQUIREMENTS})",
                     self.config.image,
                     ProcessExit::from(finished.status),
                     stderr.trim()

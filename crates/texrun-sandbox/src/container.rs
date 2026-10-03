@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use texrun_process::{Cwd, Launcher, Resource, RunError, Spec};
+use texrun_process::{CapturedOutput, Cwd, Launcher, Resource, RunError, Spec};
 
 use crate::error::SandboxError;
 use crate::owner::Creator;
@@ -85,8 +85,9 @@ const PIDS_NOT_REACHED_EXIT: &str = "91";
 /// Start of the last stderr line of a [`REPORT_PIDS`] container.
 const PIDS_MARKER: &[u8] = b"\ntexrun-sandbox-pids ";
 
-/// How long texrun waits for a [`REPORT_PIDS`] container to report and
-/// exit after `SIGTERM`, before removing it anyway.
+/// How long texrun waits, in all (`kill` and `wait` together), for a
+/// [`REPORT_PIDS`] container to report and exit after `SIGTERM`, before
+/// removing it anyway.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Part of [`Container::refusal`] (and of the errors made from it): the
@@ -397,20 +398,31 @@ impl<'r> Container<'r> {
     /// refused a new process. `None` without the line (e.g. the output was
     /// truncated, or the cgroup's `pids.events` cannot be read in the
     /// container). Advisory, see [`ContainerOutcome::pids_limit_reached`].
-    pub fn take_pids_report(&self, stderr: &mut Vec<u8>) -> Option<bool> {
-        if !self.spec.report_pids {
+    ///
+    /// The removed bytes are also taken off
+    /// [`CapturedOutput::total_bytes`], so that it stays what the command
+    /// itself wrote. When the capture was truncated, the line was not kept
+    /// (or only part of it): then nothing is removed and the result is
+    /// `None`.
+    pub fn take_pids_report(&self, stderr: &mut CapturedOutput) -> Option<bool> {
+        if !self.spec.report_pids || stderr.is_truncated() {
             return None;
         }
-        let start = stderr
+        let bytes = &mut stderr.bytes;
+        let start = bytes
             .windows(PIDS_MARKER.len())
             .rposition(|w| w == PIDS_MARKER)?;
-        let line = std::str::from_utf8(&stderr[start + PIDS_MARKER.len()..]).ok()?;
+        let line = std::str::from_utf8(&bytes[start + PIDS_MARKER.len()..]).ok()?;
         let (nonce, max) = line.strip_suffix('\n')?.split_once(' ')?;
         if nonce != self.nonce || max.is_empty() || !max.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         let reached = max.bytes().any(|b| b != b'0');
-        stderr.truncate(start);
+        let removed = bytes.len() - start;
+        bytes.truncate(start);
+        stderr.total_bytes = stderr
+            .total_bytes
+            .saturating_sub(u64::try_from(removed).unwrap_or(u64::MAX));
         Some(reached)
     }
 
@@ -658,13 +670,16 @@ impl<'r> Container<'r> {
                 .map(OsString::from)
                 .collect()
         };
+        // One deadline for both commands: at most REPORT_TIMEOUT in all.
+        let deadline = std::time::Instant::now() + REPORT_TIMEOUT;
         self.runtime
             .exec(&args(&["kill", "--signal", "TERM", "--"]), REPORT_TIMEOUT)
             .ok()?;
-        let status = self
-            .runtime
-            .exec(&args(&["wait", "--"]), REPORT_TIMEOUT)
-            .ok()?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let status = self.runtime.exec(&args(&["wait", "--"]), left).ok()?;
         match status.trim() {
             PIDS_REACHED_EXIT => Some(true),
             PIDS_NOT_REACHED_EXIT => Some(false),
@@ -1233,9 +1248,12 @@ pub(crate) mod tests {
         let container = Container::new(&rt, spec("x").with_report_pids(true));
         let nonce = container.nonce.clone();
         let report = |text: &str| -> (Option<bool>, String) {
-            let mut bytes = text.as_bytes().to_vec();
-            let reached = container.take_pids_report(&mut bytes);
-            (reached, String::from_utf8(bytes).unwrap())
+            let mut out = captured(text);
+            let reached = container.take_pids_report(&mut out);
+            // `total_bytes` stays what the command wrote.
+            assert!(!out.is_truncated(), "{text:?}");
+            assert_eq!(out.total_bytes, out.bytes.len() as u64, "{text:?}");
+            (reached, String::from_utf8(out.bytes).unwrap())
         };
         assert_eq!(
             report(&format!("out\n\ntexrun-sandbox-pids {nonce} 0\n")),
@@ -1263,8 +1281,21 @@ pub(crate) mod tests {
         }
         // Only for a container that reports.
         let plain = Container::new(&rt, spec("x"));
-        let mut bytes = format!("\ntexrun-sandbox-pids {} 1\n", plain.nonce).into_bytes();
-        assert_eq!(plain.take_pids_report(&mut bytes), None);
+        let mut out = captured(&format!("\ntexrun-sandbox-pids {} 1\n", plain.nonce));
+        assert_eq!(plain.take_pids_report(&mut out), None);
+        // A truncated capture: the line is not trusted, nothing is removed.
+        let line = format!("\ntexrun-sandbox-pids {nonce} 1\n");
+        let mut out = captured(&line);
+        out.total_bytes += 100;
+        assert_eq!(container.take_pids_report(&mut out), None);
+        assert_eq!(out.bytes, line.as_bytes());
+    }
+
+    fn captured(text: &str) -> CapturedOutput {
+        let mut out = CapturedOutput::default();
+        out.bytes = text.as_bytes().to_vec();
+        out.total_bytes = out.bytes.len() as u64;
+        out
     }
 
     #[test]

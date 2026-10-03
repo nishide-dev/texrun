@@ -348,7 +348,7 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
             // Stopped by texrun: the container told when it was stopped;
             // ended on its own: in the last line of its stderr, which is
             // removed from the output either way.
-            let reported = container.take_pids_report(&mut finished.stderr.bytes);
+            let reported = container.take_pids_report(&mut finished.stderr);
             let pids = outcome
                 .and_then(|o| o.pids_limit_reached)
                 .or(reported)

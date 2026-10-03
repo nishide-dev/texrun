@@ -208,6 +208,13 @@ pub(crate) fn copy_in(source: &Path, dir: &OwnedFd, name: &str) -> io::Result<u6
 /// create a few levels of caches in their `HOME`.
 const MAX_REMOVE_DEPTH: usize = 32;
 
+/// Most entries [`remove_tree`] visits in one tree. A scratch directory
+/// holds a few files per page; a tool that was compromised could have
+/// filled it with many more, and removing them must not hold up a preview
+/// (or texrun's exit) for long. What is left is removed by a later run
+/// ([`reclaim_scratch_dirs`]).
+const MAX_REMOVE_ENTRIES: usize = 100_000;
+
 /// A private directory created below a held parent directory with `mkdirat`
 /// and opened with `O_NOFOLLOW`, removed (through the descriptors) when
 /// dropped.
@@ -277,7 +284,7 @@ impl ScratchDir {
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         if let Ok(name) = std::ffi::CString::new(self.name.as_str()) {
-            remove_tree(&self.parent, &name, 0);
+            remove_tree(&self.parent, &name);
         }
     }
 }
@@ -296,10 +303,11 @@ impl Drop for ScratchDir {
 /// - its creator is gone ([`Creator::is_gone`]: same host, and no process
 ///   with its PID and start time).
 ///
-/// It is removed with everything in it, however much that is (a copy of
-/// the PDF and the tools' partial output: nothing that is kept elsewhere),
-/// through descriptors: `unlinkat` / `openat(O_NOFOLLOW)` below the held
-/// `parent`, never following a symlink.
+/// It is removed with everything in it (a copy of the PDF and the tools'
+/// partial output: nothing that is kept elsewhere), up to
+/// [`MAX_REMOVE_ENTRIES`] entries per directory (the rest is left for a
+/// later run), through descriptors: `unlinkat` / `openat(O_NOFOLLOW)`
+/// below the held `parent`, never following a symlink.
 pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
     let euid = rustix::process::geteuid().as_raw();
     let Ok(mut entries) = rustix::fs::Dir::read_from(parent) else {
@@ -335,7 +343,7 @@ pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
         if !private_dir || !creator.is_gone() {
             continue;
         }
-        remove_tree(parent, &name, 0);
+        remove_tree(parent, &name);
         if rustix::fs::statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW).is_err() {
             removed += 1;
         }
@@ -355,9 +363,21 @@ fn random_u64() -> u64 {
 }
 
 /// Removes `name` in `dir` and, if it is a directory, everything below it,
-/// best effort. Symlinks are removed, never followed; directories are
-/// opened with `O_NOFOLLOW` below the held descriptor.
-fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize) {
+/// best effort, visiting at most [`MAX_REMOVE_ENTRIES`] entries (a larger
+/// tree is left partly removed, for a later run). Symlinks are removed,
+/// never followed; directories are opened with `O_NOFOLLOW` below the held
+/// descriptor.
+fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr) {
+    let mut budget = MAX_REMOVE_ENTRIES;
+    remove_tree_within(dir, name, 0, &mut budget);
+}
+
+/// [`remove_tree`] at `depth`, with `budget` entries left to visit.
+fn remove_tree_within(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
     if rustix::fs::unlinkat(dir, name, AtFlags::empty()).is_ok() {
         return;
     }
@@ -367,13 +387,16 @@ fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize) {
     {
         let mut names = Vec::new();
         while let Some(Ok(entry)) = entries.read() {
+            if names.len() >= *budget {
+                break;
+            }
             let entry_name = entry.file_name();
             if !matches!(entry_name.to_bytes(), b"." | b"..") {
                 names.push(entry_name.to_owned());
             }
         }
         for n in names {
-            remove_tree(&sub, &n, depth + 1);
+            remove_tree_within(&sub, &n, depth + 1, budget);
         }
     }
     let _ = rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR);
@@ -645,6 +668,28 @@ mod tests {
         );
         assert!(file.is_file());
         assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn removal_visits_a_bounded_number_of_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("t");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        for i in 0..10 {
+            fs::write(tree.join(format!("f{i}")), b"").unwrap();
+            fs::write(tree.join(format!("sub/g{i}")), b"").unwrap();
+        }
+        let fd = open_dir(root.path()).unwrap();
+        let name = std::ffi::CString::new("t").unwrap();
+        let mut budget = 5;
+        remove_tree_within(&fd, &name, 0, &mut budget);
+        assert_eq!(budget, 0);
+        // Partly removed, the rest left for later.
+        assert!(tree.is_dir());
+        let left = fs::read_dir(&tree).unwrap().count();
+        assert!((1..=11).contains(&left), "{left}");
+        remove_tree(&fd, &name);
+        assert!(!tree.exists());
     }
 
     #[test]

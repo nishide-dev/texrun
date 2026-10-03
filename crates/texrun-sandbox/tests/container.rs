@@ -732,12 +732,10 @@ fn a_reached_process_limit_is_reported_when_the_command_ends() {
         Watch::new().with_timeout(Duration::from_secs(60)),
     );
     assert_eq!(finished.status.code(), Some(7), "{finished:?}");
-    assert_eq!(
-        container.take_pids_report(&mut finished.stderr.bytes),
-        Some(true)
-    );
+    assert_eq!(container.take_pids_report(&mut finished.stderr), Some(true));
     // Only the command's own output is left.
     assert_eq!(String::from_utf8_lossy(&finished.stderr.bytes), "refused\n");
+    assert!(!finished.stderr.is_truncated());
 
     let container = Container::new(runtime, spec);
     let mut finished = run(
@@ -747,10 +745,11 @@ fn a_reached_process_limit_is_reported_when_the_command_ends() {
     );
     assert_eq!(finished.status.code(), Some(3), "{finished:?}");
     assert_eq!(
-        container.take_pids_report(&mut finished.stderr.bytes),
+        container.take_pids_report(&mut finished.stderr),
         Some(false)
     );
     assert_eq!(String::from_utf8_lossy(&finished.stderr.bytes), "err\n");
+    assert!(!finished.stderr.is_truncated());
     assert_eq!(stdout(&finished), "out\n");
     assert_eq!(container.outcome().unwrap().pids_limit_reached, None);
 }
