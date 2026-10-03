@@ -118,10 +118,10 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
    - TeX Live の texmf ツリーは engine image のもので、root filesystem ごと read-only である。host の TeX Live、host のユーザーの設定・秘密情報、入力プロジェクトそのものは container の中に存在しない。
    - これは読み込み経路によらない。paranoid mode の検査が及ばない font 関連の読み込みや、PDF object にファイルを直接埋め込む pdfTeX の primitive でも、workspace と image の外は読めない。
    - workspace の入力ファイルも書き換えられない（書き込めるのは output dir と `HOME` だけ）。
-2. **network は無い**（`--network none`。loopback だけ）。compile と preview は network 無しで行われる（#24）。container の中から外部の address への接続は、TCP / UDP、IPv4 / IPv6 とも `Network is unreachable` で即座に失敗し、名前解決もできないことを test で確認している。
+2. **network は無い**（`--network none`。loopback だけ）。compile と preview は network 無しで行われる（#24）。container の中から外部の address への接続は、TCP / UDP、IPv4 / IPv6 とも `Network is unreachable` で即座に失敗し、名前解決もできないことを test で確認している（対照として、同じ probe で container 内の loopback には接続できることも確かめる）。
 3. **engine は権限を持たない。** non-root user（texrun を起動したユーザーの uid / gid。texrun が root の場合は image の専用 user の 10001）で動き、capability は全て落とし（`--cap-drop ALL`）、`no-new-privileges` で setuid などによる権限の獲得もできない。root filesystem は read-only で、書き込めるのは `/tmp`（`noexec` の小さい tmpfs）と上の mount だけである。
 4. **process tree 全体の memory・プロセス数・CPU を常に制限する**（container の cgroup。§3.10 の値。preview の container は preview tool の値）。委譲された cgroup の有無（in-process 実行の `--cgroup`）に関係なく、macOS でも（runtime の VM の中で）効く。runtime が上限や制限を黙って捨てた場合（kernel が対応していない場合など）は、container を起動せずに `EngineError::Unavailable` で失敗する（fail-closed。`create` の後に runtime の記録を確かめる、§4）。
-5. **timeout / cancel で container を残さない。** container は texrun が名前と label を付けて作り、停止のたびに `rm --force` で消す。texrun 自身が強制終了（`SIGKILL` など）された場合は、container の中の `timeout` が compile の timeout + 45 秒で engine を止める（中の CPU 時間の上限が先に効くこともある）が、**停止した container と runtime の CLI のプロセスは残りうる**。label で見つけて消す（`docker ps -a --filter label=org.texrun.sandbox`、自動の回収は #49）。
+5. **timeout / cancel で container を残さない。** container は texrun が名前と label を付けて作り、停止のたびに `rm --force` で消す。texrun 自身が強制終了（`SIGKILL` など）された場合は、container の中の `timeout` が compile の timeout + 45 秒で engine を止める（中の CPU 時間の上限が先に効くこともある）が、**停止した container と runtime の CLI のプロセスは残りうる**。label で見つけて消す（`docker ps -a --filter label=org.texrun.sandbox`、自動の回収は #49）。preview の最中だった場合は、temp dir の下の scratch directory（`texrun-preview-*`、mode 0700。PDF のコピーと描画途中の画像を含む）も残る（workspace の `texrun-ws-*` と同じ。#49 の回収の対象）。
 6. **engine（pdfTeX と、それが使う画像ライブラリ）と preview tool（MuPDF / Poppler）の脆弱性の影響は、container の中に閉じる**（1〜3 の範囲。container runtime と kernel の境界を信頼する）。preview tool は engine が作った PDF を解析するので、その PDF は攻撃者の管理下にあるとみなす。preview tool は engine とは別の container（PDF のコピーだけが見える）で動き、host の preview tool は使わない（§4「preview」、#46）。
 
 検証は次の test で行い、CI の `sandbox` job で毎回実行する（[development.md](development.md#container-backend-test)）。#10 の fixture（`scenarios.rs`、`security.rs`）も、`TEXRUN_TEST_BACKEND=container` で sandbox backend を使って全て実行する（host の TeX Live を直接使う 2 件を除く）。
@@ -137,6 +137,7 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 | diagnostics の path が、mount 先（既定の `/workspace`、任意の path）によらず workspace 相対になる | 同: `diagnostics_are_workspace_relative_with_any_mount_point`、`apps/texrun/tests/container.rs` |
 | container の中から network に出られない（`NetworkMode=none`、外部への TCP / UDP 接続が `Network is unreachable`、名前解決の失敗。compile の container と preview の container） | `crates/texrun-sandbox/tests/container.rs`: `a_container_cannot_reach_the_network`、`a_session_runs_programs_one_after_another_in_one_container` |
 | preview の container: 制限と上限（rlimit は tool ごとに `prlimit`）、PDF のコピーが read-only、kill された run で container ごと消える、OOM kill の記録、container の寿命 | 同: `a_session_*`、`a_killed_run_stops_the_session`、`an_oom_kill_in_a_session_is_recorded` |
+| preview の画像は container から見えないコピーを検査して保存し、保存後に元のファイルを書き換えても成果物は変わらない（別の inode） | `crates/texrun-preview/src/fsops.rs` の unit test: `a_staged_copy_is_what_is_stored` |
 | preview tool を container で動かしても結果が host と同じ。出力先の symlink をたどらない、container と scratch を残さない、container が使えなければ host の tool に fallback しない | `crates/texrun-preview/tests/real_tools.rs`（`TEXRUN_TEST_BACKEND=container`）、`crates/texrun-preview/tests/container.rs`、`apps/texrun/tests/container.rs`: `previews_are_rendered_in_the_container` |
 
 ### 保証しない（MVP の in-process 実行の限界）
@@ -167,7 +168,8 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 - **TeX / latexmk / kpathsea 自体のバグ** によって境界が破れる場合。sandbox backend では、破れても上の 1〜4 の範囲に留まる。
 - **sandbox backend でも保証しないもの:**
   - container runtime・OCI runtime（runc など）・Linux kernel の脆弱性による container からの脱出。より強い隔離（gVisor の `runsc`、microVM）は §4 の比較に留める。
-  - preview の container の中での、tool の run 同士の分離。preview の tool は 1 つの container の中で順に動くので、侵害された tool が残したプロセスやファイルは、同じ preview の後のページの描画に影響しうる（PDF は同じ攻撃者の管理下にあるので、新たに得るものは無い）。preview が終われば container ごと消える。
+  - preview の container の中での、tool の run 同士の分離。preview の tool は 1 つの container の中で順に動く。侵害された tool が残したプロセスは、preview が終わって container ごと消えるまで動き続け、tool の作業ディレクトリ（`work`）の中身をいつでも書き換えうる。そのため texrun は、`work` の画像を検査も保存もしない: 画像を、container から見えない preview ディレクトリの texrun 専用のファイルに（残りのサイズ予算 + 1 byte を上限に）コピーし、**コピーの方を** その descriptor で検査して（PNG・寸法・サイズ）`renameat` する（§4「preview」）。保存した画像は container と inode を共有しないので、検査した内容がそのまま成果物になり、検査の後の書き換えは届かない。影響は、後のページの描画結果（画像の中身）に留まる（PDF は同じ攻撃者の管理下にあるので、新たに得るものは無い）。
+    - tool の run ごとに残ったプロセスを止める（`exec` のたびに container の中のプロセスを kill する）ことも検討したが、行っていない。container の main process（`sleep`）も tool と同じ uid で動くので、texrun が中から uid 単位で kill すると container ごと止まり、区別して kill するには run ごとにもう 1 回 `exec` が要る（1 ページあたり約 0.03 秒の追加）。上のコピーで host 側の保証は成り立つので、残ったプロセスは preview の終了時に container ごと消すことにした。
   - workspace と output dir の中身は container から読める・書ける（in-process 実行と同じ。入力は read-only だが、書き込める場所は §3.2 のサイズ上限だけで、ファイル数は制限しない）。
   - プロセス数の上限（`pids.max`）に達したことの判定。container の cgroup の event を texrun は読まないので、fork の失敗を perl が再試行し続けた場合は timeout として報告される（memory の上限は OOM kill の記録で判定する。#49）。
   - rootless mode の Docker（`dockerd-rootless`）は想定していない（#47）。container の uid が host の subordinate uid に写るので、output dir に書けずに compile が失敗する（安全側には倒れる）。
@@ -248,7 +250,7 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
     - library として gate を指定せずに `Previewer` を使った場合は、`Immediate` になる。
   - library として使う場合、gate の実行ファイルは呼び出し側が明示する（`ExecGate::new`。自分の binary の隠しサブコマンドで `texrun_process::run_gate` を呼ぶか、`texrun-process` の `texrun-exec-gate` binary を使う）。環境変数や `PATH` からは探さない。
   - latexmk も同じ exec gate で起動する（#25、上記の「latexmk の rlimit の設定方法」）。engine には `LatexmkConfig::with_exec_gate` で gate を渡す。
-- preview 画像は output root 内の private な scratch dir に描画する。検査の後、`preview/` へ移す。
+- preview 画像は private な scratch dir に描画する。検査の後、`preview/` へ移す。scratch dir は、host の preview tool では output root の中に、container の preview tool（`--backend container`）では output root の外（temp dir）に作り、container では画像をコピーしてから検査する（§4「preview」）。以下は host の場合である。
   - scratch dir（`.texrun-preview-*`、mode 0700）とその下の `home/`・`work/` は、output root の fd から `mkdirat` で作り、`openat(O_NOFOLLOW)` で開く。後片付けも、開いた fd から `unlinkat` で行い、symlink は辿らない。
   - tool の cwd は、開いた `work/` の fd を使う（Linux では `/proc/self/fd` 経由で、子プロセスがその fd 自体に `chdir` する）。`/proc` が無い環境（macOS）では、path が同じ directory（dev / inode）を指すことを確認してから path で起動する。この確認と `chdir` の間は atomic ではない。
   - tool は `work/` 内の相対名に書き出し、texrun はそれを `work/` の fd から検査・移動する。`HOME` だけは環境変数なので path で渡す（cache の置き場で、texrun は中身を読まない）。
@@ -451,7 +453,7 @@ latexmk と preview tool は、どちらも `crates/texrun-process` の supervis
 
 - compile と preview は、network を必要としない前提で設計する。package の自動インストール（`tlmgr`、MiKTeX の on-the-fly install 相当）は行わない。
 - sandbox backend（`--backend container`、#26）の compile と preview（#46）は、常に network 無し（`--network none`）で動く。option で有効にする手段は設けない。runtime が network mode を `none` 以外で記録した container は起動しない（§4 の `HostConfig` の照合）。test は §2 の表。
-- **in-process 実行（`--backend host`）では network を遮断しない**（#24 で判断した）。network が要る場合は `--backend container` を使う。理由:
+- **in-process 実行（`--backend host`）では network を遮断しない**（#24 で判断した）。network を遮断したい場合（信頼できない文書）は `--backend container` を使う。理由:
   - **環境によって使えたり使えなかったりする。** Linux で権限なしに network を切る手段は、unprivileged user namespace の中に network namespace を作ることだけである。しかし、これを禁止・制限している環境が多い。Docker の既定の seccomp profile は `unshare` での user namespace の作成を拒否する（dev コンテナや多くの CI の container がこれに当たる）。Ubuntu 23.10 以降は AppArmor で unprivileged user namespace を制限し、Debian の古い kernel や一部のディストリビューションは sysctl で無効にしている。macOS には同等の手段が無い（`sandbox-exec` は非推奨）。使えない環境で fail-closed にすると texrun がほとんどの環境で動かなくなり、fail-open にすると「遮断されているか」が環境次第になって、保証として書けない。
   - **効果が限られる。** shell escape を無効にした TeX には network に接続する手段が無い（§3.5）。network が問題になるのは、engine や preview tool がメモリ安全性の脆弱性で侵害された場合である。in-process 実行ではその時点でユーザーの権限で filesystem 全体を読み書きできる（§2「保証しない」）ので、network だけを切っても、秘密情報の読み取りや、後でユーザーが実行するファイル（shell の設定など）の書き換えは防げない。境界として意味を持たせるには、filesystem と権限の隔離も同時に要り、それは sandbox backend で行っている。
   - **攻撃面が増える。** user namespace は kernel の権限昇格の脆弱性の主要な入り口の一つで、それを避けるために上のように制限されている。texrun のために有効にすることを利用者に求めない。
@@ -648,14 +650,14 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
   | container 1 つ（`create`・`inspect`・`start`、最初の 1 回だけ） | 約 0.21 秒 |
   | その中で tool を `exec`（描画を含む） | 約 0.035 秒 |
 
-  ページごとの container では、200 ページで起動だけで約 46 秒掛かり、preview の timeout（30 秒）を超える。container 1 つの方式では、CLI の `--pages 1-200` で 200 ページ（MuPDF）の preview が約 12 秒（既定の 20 ページは約 1.6 秒）だった。
+  ページごとの container では、200 ページで起動だけで約 46 秒掛かり、preview の timeout（30 秒）を超える。container 1 つの方式では、CLI の `--pages 1-200` で 200 ページの preview が MuPDF で約 12 秒、Poppler で約 16 秒（compile を除く。既定の 20 ページは MuPDF で約 1.6 秒）だった。Poppler では preview の timeout（30 秒）に対する余裕が 2 倍弱なので、遅い host では上限（200 ページ）に近いページ数で timeout しうる（その場合も描画済みのページは残り、`timed_out` の notice が付く）。
 - **container の設定** は compile の container と同じ（`--network none`、`--read-only`、`--cap-drop ALL`、`no-new-privileges`、`--ipc none`、非 root、`--init`、`--pull never`、label）で、`create` の後の `HostConfig` の照合も同じく行う（照合が通らなければ起動せずに消し、preview は `resource_limits` の notice で skip、fail-closed）。上限は §3.10 の preview tool の値である:
   - cgroup: `--memory` = `--memory-swap` 2 GiB、`--pids-limit 32`、`--cpus 2`（tool は順に動くので、実質 tool 1 回ごとの上限）
   - rlimit: tool ごとに `prlimit` で `RLIMIT_AS` 2 GiB、`RLIMIT_FSIZE`（残りの画像の予算、最低 16 MiB）、`RLIMIT_CPU`（preview の timeout + 10 秒、hard はその 5 秒後）、`RLIMIT_CORE` 0 を掛けてから tool を起動する。container 全体の `--ulimit` はこれらの最大値で、`prlimit` はそれより上げられない
   - CPU 時間・memory の上限に達した tool は、終了コード（`128 + SIGXCPU`）と runtime の `OOMKilled` で `limit_exceeded` にする
 - **mount** は、texrun が preview ごとに作る scratch directory（既定は system の temp dir の下。output root の外）の 3 つだけである。`in`（PDF のコピー、read-only、`/texrun/preview/in`）、`work`（tool の作業ディレクトリ、書き込み可）、`home`（tool の `HOME`、書き込み可）。runtime は mount 元を path で解決するので、compile の残りのプロセスが書き込みえた output root の中には置かない。scratch directory は `mkdirat` で作って descriptor で保持し、PDF は descriptor 経由でコピーする。
-- **画像の保存は host と同じく descriptor で行う**（§3.2）。tool は `work` に書き、texrun は保持した `work` の descriptor で通常ファイル・PNG の header・サイズ・画素数を確かめてから、`renameat`（別の filesystem なら `O_NOFOLLOW` で開いて新しいファイルにコピーしてから rename）で preview ディレクトリ（`openat(O_NOFOLLOW)` で開いたもの）に移す。symlink はたどらない。描画先のファイル名はページごとに変える（macOS の runtime の file sharing が、host で移動した名前を container 側でしばらく保持するため）。
-- **停止。** timeout・cancel・出力サイズの上限で tool の `exec` を kill した場合、runtime の CLI を kill しても container の中の tool は止まらないので、container ごと `rm --force` で消す（その preview は止まる）。preview の終了時（正常終了を含む）にも container を消し、その後に scratch directory を消す。texrun が強制終了された場合は、`sleep` が preview の timeout + 45 秒で終わり、停止した container が残る（label で見つけて消す、#49）。
+- **画像の保存は descriptor で行い、コピーを検査する**（§3.2、§2「sandbox backend でも保証しないもの」）。tool は `work` に書く。`work` は container から書き込めるので、texrun はそこで検査も rename もしない。保持した `work` の descriptor から画像を `O_NOFOLLOW` で開き（通常ファイルに限る）、preview ディレクトリ（`openat(O_NOFOLLOW)` で開いたもの。container からは見えない）に `O_EXCL` で作った texrun 専用のファイルへ、残りのサイズ予算 + 1 byte を上限にコピーする。サイズ・PNG の header・画素数はコピーの descriptor で確かめ、通ったものだけを `renameat` で `page-NNN.png` にする。保存した画像は container 側と inode を共有しない（filesystem が同じでも別のファイル）。symlink はたどらない。描画先のファイル名はページごとに変える（macOS の runtime の file sharing が、host で移動した名前を container 側でしばらく保持するため）。
+- **停止。** timeout・cancel・出力サイズの上限で tool の `exec` を kill した場合、runtime の CLI を kill しても container の中の tool は止まらないので、container ごと `rm --force` で消す（その preview は止まる）。preview の終了時（正常終了を含む）にも container を消し、その後に scratch directory を消す。texrun が強制終了された場合は、`sleep` が preview の timeout + 45 秒で終わり、停止した container と scratch directory（`texrun-preview-*`）が残る（label で見つけて消す、#49）。
 
 ### CLI
 

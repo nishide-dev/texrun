@@ -71,8 +71,11 @@ impl PreviewContainer {
 
     /// Directory in which the scratch directory of each preview run is
     /// created. `None`: the system temporary directory. It must be visible
-    /// to the runtime (on macOS: shared with its VM), and must not be
-    /// writable by others.
+    /// to the runtime (on macOS: shared with its VM), and either not
+    /// writable by others or sticky (like `/tmp`): the scratch directory is
+    /// created in it with a random name and mode 0700, and it must not be
+    /// possible for others to rename or remove it while the runtime mounts
+    /// it by path.
     #[must_use]
     pub fn with_scratch_parent(mut self, dir: impl Into<PathBuf>) -> Self {
         self.scratch_parent = Some(dir.into());

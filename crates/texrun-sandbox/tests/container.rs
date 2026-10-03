@@ -385,14 +385,23 @@ fn network_mode(runtime: &Runtime, name: &str) -> String {
 
 /// A perl script (perl is in the image for latexmk) that tries to reach
 /// public addresses over IPv4 and IPv6 (TCP, and a UDP `connect`) and to
-/// resolve a name, printing `<probe>=<error>` or `<probe>=connected`.
+/// resolve a name, printing `<probe>=<error>` or `<probe>=connected`. As a
+/// control, the same `connect` to a listener on the container's own
+/// loopback must succeed (`lo4`): the probe can tell a connection from a
+/// refused one.
 const NETWORK_PROBE: &str = r#"
 use strict; use warnings;
-use Socket qw(:addrinfo AF_INET AF_INET6 SOCK_STREAM SOCK_DGRAM inet_pton pack_sockaddr_in pack_sockaddr_in6);
+use Socket qw(:addrinfo AF_INET AF_INET6 SOCK_STREAM SOCK_DGRAM SOL_SOCKET SO_REUSEADDR INADDR_LOOPBACK inet_pton pack_sockaddr_in pack_sockaddr_in6);
+socket(my $l, AF_INET, SOCK_STREAM, 0) or die "listen socket: $!";
+bind($l, pack_sockaddr_in(0, INADDR_LOOPBACK)) or die "bind: $!";
+listen($l, 1) or die "listen: $!";
+my $lo = getsockname($l);
 my @probes = (
+  ["lo4", AF_INET, SOCK_STREAM, $lo],
   ["tcp4", AF_INET, SOCK_STREAM, pack_sockaddr_in(443, inet_pton(AF_INET, "1.1.1.1"))],
   ["udp4", AF_INET, SOCK_DGRAM, pack_sockaddr_in(53, inet_pton(AF_INET, "8.8.8.8"))],
   ["tcp6", AF_INET6, SOCK_STREAM, pack_sockaddr_in6(443, inet_pton(AF_INET6, "2606:4700:4700::1111"))],
+  ["udp6", AF_INET6, SOCK_DGRAM, pack_sockaddr_in6(53, inet_pton(AF_INET6, "2001:4860:4860::8888"))],
 );
 for my $p (@probes) {
   my ($name, $family, $type, $addr) = @$p;
@@ -415,8 +424,14 @@ fn perl(script: &str) -> Spec<'static> {
 /// is neither a firewall nor a timeout), and names do not resolve (#24).
 fn assert_no_network(text: &str) {
     let f = fields(text);
-    for probe in ["tcp4", "udp4", "tcp6"] {
-        let result = f.get(probe).map_or("", String::as_str);
+    let get = |probe: &str| f.get(probe).map_or("", String::as_str);
+    assert_eq!(get("lo4"), "connected", "the control: {text}");
+    for probe in ["tcp4", "udp4"] {
+        assert_eq!(get(probe), "Network is unreachable", "{probe}: {text}");
+    }
+    // A kernel without IPv6 cannot even create the socket.
+    for probe in ["tcp6", "udp6"] {
+        let result = get(probe);
         assert!(
             result == "Network is unreachable" || result.starts_with("socket: "),
             "{probe}: {text}"

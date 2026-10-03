@@ -628,11 +628,34 @@ impl Run<'_> {
             fsops::remove(&env.work, render_name);
             return ControlFlow::Break(());
         }
-        let size = fsops::regular_file_len(&env.work, render_name);
+        // In a container, the working directory stays writable for whatever
+        // the tool left running there: the image is first copied (at most
+        // one byte over the budget) into a file of texrun's own in the
+        // preview directory, and that copy is checked and stored.
+        let output = if self.sandbox.is_some() {
+            let staged = fsops::Staged::copy(&env.work, render_name, dir, budget.saturating_add(1));
+            fsops::remove(&env.work, render_name);
+            match staged {
+                Ok(staged) => Output::Staged(staged),
+                Err(e) => {
+                    self.notice(
+                        PreviewNotice::warning(
+                            NoticeKind::OutputError,
+                            format!("cannot store the image of page {page}: {e}"),
+                        )
+                        .with_page(page),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
+        } else {
+            Output::Work(&env.work, render_name)
+        };
+        let size = output.len();
         // Checked before the exit status: on Linux a tool that reaches
         // `RLIMIT_FSIZE` is killed by `SIGXFSZ`.
         if size.is_some_and(|size| size > budget) {
-            fsops::remove(&env.work, render_name);
+            output.discard();
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::SizeLimit,
@@ -646,7 +669,7 @@ impl Run<'_> {
             return ControlFlow::Break(());
         }
         if !out.succeeded() {
-            fsops::remove(&env.work, render_name);
+            output.discard();
             self.render_failed(page, &format!("{} failed", program_name(&inv)), &out);
             return ControlFlow::Continue(());
         }
@@ -654,17 +677,15 @@ impl Run<'_> {
             self.render_failed(page, "no image was written", &out);
             return ControlFlow::Continue(());
         };
-        let Some((width_px, height_px)) =
-            fsops::read_header::<24>(&env.work, render_name).and_then(|h| png::dimensions(&h))
-        else {
-            fsops::remove(&env.work, render_name);
+        let Some((width_px, height_px)) = output.header().and_then(|h| png::dimensions(&h)) else {
+            output.discard();
             self.render_failed(page, "the output is not a PNG image", &out);
             return ControlFlow::Continue(());
         };
         // Last line of defense for the pixel limit, whatever the tool made of
         // the page size (allowing for rounding).
         if width_px.max(height_px) > max_px.saturating_add(PIXEL_SLACK) {
-            fsops::remove(&env.work, render_name);
+            output.discard();
             self.render_failed(
                 page,
                 &format!(
@@ -676,7 +697,7 @@ impl Run<'_> {
         }
         let name = WorkspacePath::new(&format!("page-{page:03}.png"))
             .expect("generated file name is a valid path");
-        if let Err(e) = fsops::rename(&env.work, render_name, dir, name.as_str()) {
+        if let Err(e) = output.store(dir, name.as_str()) {
             self.notice(
                 PreviewNotice::warning(
                     NoticeKind::OutputError,
@@ -892,6 +913,47 @@ fn container_ulimits(options: &PreviewOptions) -> Rlimits {
             cpu.saturating_add(process::CPU_KILL_GRACE),
         )
         .with(Resource::Core, 0)
+}
+
+/// A rendered image, where it is checked: in the tools' working directory
+/// (on the host), or a copy of it (in a container, [`fsops::Staged`]).
+enum Output<'a> {
+    Work(&'a OwnedFd, &'a str),
+    Staged(Option<fsops::Staged>),
+}
+
+impl Output<'_> {
+    /// Its size, if it is a regular file.
+    fn len(&self) -> Option<u64> {
+        match self {
+            Self::Work(dir, name) => fsops::regular_file_len(dir, name),
+            Self::Staged(staged) => staged.as_ref().map(fsops::Staged::len),
+        }
+    }
+
+    /// The PNG header (enough for the dimensions).
+    fn header(&self) -> Option<[u8; 24]> {
+        match self {
+            Self::Work(dir, name) => fsops::read_header::<24>(dir, name),
+            Self::Staged(staged) => staged.as_ref().and_then(fsops::Staged::header::<24>),
+        }
+    }
+
+    /// Removes it.
+    fn discard(self) {
+        if let Self::Work(dir, name) = self {
+            fsops::remove(dir, name);
+        }
+    }
+
+    /// Stores it as `name` in the preview directory `dir`.
+    fn store(self, dir: &OwnedFd, name: &str) -> io::Result<()> {
+        match self {
+            Self::Work(work, from) => fsops::rename(work, from, dir, name),
+            Self::Staged(Some(staged)) => staged.store(name),
+            Self::Staged(None) => Err(io::Error::other("no image")),
+        }
+    }
 }
 
 fn program_name(inv: &Invocation<'_>) -> String {
