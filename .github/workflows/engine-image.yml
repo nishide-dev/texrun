@@ -201,6 +201,8 @@ jobs:
           cargo test --locked --all-features -p texrun-sandbox 2>&1 | tee "${log}"
           cargo test --locked --all-features -p texrun-texlive \
             --test container --test scenarios --test security 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun-preview \
+            --test container --test real_tools 2>&1 | tee -a "${log}"
           cargo test --locked --all-features -p texrun --test container 2>&1 | tee -a "${log}"
           if grep -E 'test result: .* [1-9][0-9]* ignored' "${log}"; then
             echo "::error::Some tests are #[ignore]d and never run in CI"
@@ -215,10 +217,10 @@ jobs:
           docker tag "${TEXRUN_SANDBOX_IMAGE}" "${IMAGE}:${VERSION}"
           dir="$(mktemp -d)"
           printf '%s\n' '\documentclass{article}' '\begin{document}' 'x' '\end{document}' > "${dir}/main.tex"
-          cargo run --locked -q -p texrun -- compile --json --no-preview --backend container "${dir}/main.tex" > "${dir}/result.json"
+          cargo run --locked -q -p texrun -- compile --json --backend container "${dir}/main.tex" > "${dir}/result.json"
           jq -r '.engine.version' "${dir}/result.json"
-          jq -e --arg v "image version ${VERSION})" '.texrun_exit_code == 0 and (.engine.version | endswith($v))' "${dir}/result.json" >/dev/null \
-            || { cat "${dir}/result.json"; echo "::error::engine.version does not report image version ${VERSION}"; exit 1; }
+          jq -e --arg v "image version ${VERSION})" '.texrun_exit_code == 0 and .preview.status == "rendered" and (.engine.version | endswith($v))' "${dir}/result.json" >/dev/null \
+            || { cat "${dir}/result.json"; echo "::error::the compile did not succeed with previews, or engine.version does not report image version ${VERSION}"; exit 1; }
       - name: No containers left behind
         run: |
           left="$(docker ps --all --quiet --filter label=org.texrun.sandbox)"

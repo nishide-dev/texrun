@@ -364,9 +364,10 @@ under their own licenses:
     (`--preview-backend poppler`, or `BackendChoice::Poppler` in the library) or do not install
     `mutool`.
   - The development Docker image below and the engine image
-    (`docker/engine`) contain `mupdf-tools` and `poppler-utils`. If that image is ever distributed, the AGPL / GPL terms
-    for distributing those packages apply to the image and must be checked
-    separately.
+    (`docker/engine`) contain `mupdf-tools` and `poppler-utils`. The
+    published engine image is distributed under those packages' terms, with
+    their source (see [Engine image](#engine-image)); the development image
+    is not published.
 
 ## Local development
 
