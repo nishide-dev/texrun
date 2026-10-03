@@ -244,12 +244,14 @@ mod tests {
         }
         // Another user, another host.
         assert_eq!(candidate(&ok, &me(), 502), None);
-        assert_eq!(
-            candidate(&ok, &Creator::new(100, None, 0xabd), 501),
-            None
-        );
+        assert_eq!(candidate(&ok, &Creator::new(100, None, 0xabd), 501), None);
         // A name that is not texrun's for that PID.
-        for name in ["/texrun-43-0-1", "/other", "/texrun-420-0-1", "/xtexrun-42-0"] {
+        for name in [
+            "/texrun-43-0-1",
+            "/other",
+            "/texrun-420-0-1",
+            "/xtexrun-42-0",
+        ] {
             let l = listed(name, "exited", &with(&labels));
             assert_eq!(candidate(&l, &me(), 501), None, "{name}");
         }

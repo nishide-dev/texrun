@@ -214,12 +214,19 @@ impl ContainerEngine {
     }
 
     /// The runtime, detected now if it was not yet.
+    ///
+    /// Right after detecting it, the containers that killed texrun
+    /// processes of this user left behind are removed
+    /// ([`Runtime::reclaim_left_containers`], best effort): those of the
+    /// compile and of the page previews, once they have stopped.
     pub fn runtime(&self) -> Result<Runtime, EngineError> {
         let mut runtime = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(runtime) = runtime.as_ref() {
             return Ok(runtime.clone());
         }
         let detected = Runtime::detect(self.config.runtime).map_err(sandbox_error)?;
+        // A runtime that cannot list its containers fails the probe anyway.
+        let _ = detected.reclaim_left_containers();
         *runtime = Some(detected.clone());
         Ok(detected)
     }
@@ -456,6 +463,9 @@ fn container_spec(config: &ContainerConfig, image: &str, timeout: Duration) -> C
     )
     .with_oci_runtime(config.oci_runtime.clone())
     .with_deadline(deadline)
+    // `pids.events`: a process limit that refused latexmk's `fork` is a
+    // `resource_limit` diagnostic (perl retries it until the timeout).
+    .with_report_pids(true)
 }
 
 /// The rc as latexmk sees it in the container.
@@ -521,6 +531,7 @@ mod tests {
         assert_eq!(spec.limits, ContainerLimits::new(4 << 30, 64, 2));
         assert_eq!(container_spec(&config, "x", Duration::MAX).deadline, None);
         assert!(spec.mounts.is_empty());
+        assert!(spec.report_pids);
     }
 
     #[test]

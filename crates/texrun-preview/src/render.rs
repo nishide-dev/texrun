@@ -47,6 +47,10 @@ fn cgroup_notice(reason: &str) -> PreviewNotice {
 
 /// Characters of tool stderr kept in a notice.
 const DETAIL_CHARS: usize = 2000;
+/// Name prefix of the scratch directories outside the output root (in the
+/// temporary directory, or [`PreviewContainer::with_scratch_parent`]),
+/// which killed texrun processes may leave behind (#49).
+pub(crate) const SCRATCH_PREFIX: &str = "texrun-preview-";
 /// File name the tool renders page `page` to, inside the private working
 /// directory. A new name for every page: in a container, the runtime's file
 /// sharing (on macOS, with its VM) may still cache a name that texrun has
@@ -281,8 +285,10 @@ impl Run<'_> {
                 .and_then(|fd| fsops::ScratchDir::create(fd, root, ".texrun-preview-"))
         } else {
             let tmp = std::env::temp_dir();
-            fsops::open_dir(&tmp)
-                .and_then(|fd| fsops::ScratchDir::create(fd, &tmp, "texrun-preview-"))
+            fsops::open_dir(&tmp).and_then(|fd| {
+                fsops::reclaim_scratch_dirs(&fd, SCRATCH_PREFIX);
+                fsops::ScratchDir::create(fd, &tmp, SCRATCH_PREFIX)
+            })
         };
         let scratch = match scratch.and_then(|dir| {
             dir.subdir("home")?;
@@ -887,7 +893,10 @@ fn container_scratch(
     pdf: &Path,
 ) -> io::Result<(fsops::ScratchDir, OwnedFd)> {
     let parent = fs::canonicalize(container.scratch_parent())?;
-    let dir = fsops::ScratchDir::create(fsops::open_dir(&parent)?, &parent, "texrun-preview-")?;
+    let parent_fd = fsops::open_dir(&parent)?;
+    // Those of killed texrun processes first (#49).
+    fsops::reclaim_scratch_dirs(&parent_fd, SCRATCH_PREFIX);
+    let dir = fsops::ScratchDir::create(parent_fd, &parent, SCRATCH_PREFIX)?;
     let input = dir.subdir_with_mode("in", rustix::fs::Mode::from_raw_mode(0o755))?;
     fsops::copy_in(pdf, &input, sandbox::PDF_NAME)?;
     dir.subdir("home")?;

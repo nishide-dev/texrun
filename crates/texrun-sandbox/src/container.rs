@@ -53,7 +53,9 @@ const SH: &str = "/bin/sh";
 ///   instead, which texrun reads with `wait` before removing the container.
 ///
 /// The command runs in the background (`&` / `wait`) so that the shell
-/// handles `SIGTERM` while it runs.
+/// handles `SIGTERM` while it runs, with the original stderr; the shell's
+/// own stderr is `/dev/null`, so that its job messages (e.g. for a command
+/// ended by `SIGXCPU`) do not add to the command's output.
 const REPORT_PIDS: &str = r#"n=$1; shift; h=
 r() {
   kill -s KILL -1 2>/dev/null
@@ -65,11 +67,12 @@ r() {
   done
 }
 trap 'r; case "$h" in 0) exit 91 ;; [1-9]*) exit 90 ;; esac; exit 143' TERM
-"$@" &
+exec 3>&2 2>/dev/null
+"$@" 2>&3 3>&- &
 wait $!
 s=$?
 r
-[ -n "$h" ] && printf '\ntexrun-sandbox-pids %s %s\n' "$n" "$h" >&2
+[ -n "$h" ] && printf '\ntexrun-sandbox-pids %s %s\n' "$n" "$h" >&3
 exit $s
 "#;
 
@@ -1164,6 +1167,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn create_args_name_the_creator() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("x"));
+        let run = Spec::new("/bin/x", Cwd::Path(Path::new("/w")));
+        let joined = strings(&container.create_args(&run, (1, 1)).unwrap()).join(" ");
+        let pid = std::process::id();
+        for label in [
+            format!("--label {}=1", crate::LABEL),
+            format!("--label {}={pid}", crate::LABEL_PID),
+            format!(
+                "--label {}={}",
+                crate::LABEL_UID,
+                rustix::process::geteuid().as_raw()
+            ),
+            format!(
+                "--label {}={:016x}",
+                crate::LABEL_HOST,
+                Creator::current().unwrap().host()
+            ),
+        ] {
+            assert!(joined.contains(&label), "missing `{label}` in {joined}");
+        }
+        assert!(container.name().starts_with(&format!("texrun-{pid}-")));
+    }
+
+    #[test]
+    fn a_pids_report_runs_the_command_under_the_shell() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("img").with_report_pids(true));
+        let run = Spec::new("/usr/bin/latexmk", Cwd::Path(Path::new("/w"))).with_args(["-v"]);
+        let args = strings(&container.create_args(&run, (1, 1)).unwrap());
+        let image = args.iter().position(|a| a == "img").unwrap();
+        assert_eq!(args[image - 3..image], ["--entrypoint", SH, "--"]);
+        assert_eq!(
+            args[image + 1..image + 4],
+            ["-c".to_owned(), REPORT_PIDS.to_owned(), "sh".to_owned()]
+        );
+        assert_eq!(args[image + 4], container.nonce);
+        assert_eq!(
+            args[image + 5..],
+            [
+                "/usr/bin/timeout",
+                "--signal=KILL",
+                "90s",
+                "/usr/bin/latexmk",
+                "-v"
+            ]
+        );
+        // Without it, no shell.
+        let plain = Container::new(&rt, spec("img"));
+        let args = strings(&plain.create_args(&run, (1, 1)).unwrap());
+        assert!(!args.iter().any(|a| a == SH), "{args:?}");
+    }
+
+    #[test]
+    fn the_pids_report_is_taken_from_the_end_of_stderr() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("x").with_report_pids(true));
+        let nonce = container.nonce.clone();
+        let report = |text: &str| -> (Option<bool>, String) {
+            let mut bytes = text.as_bytes().to_vec();
+            let reached = container.take_pids_report(&mut bytes);
+            (reached, String::from_utf8(bytes).unwrap())
+        };
+        assert_eq!(
+            report(&format!("out\n\ntexrun-sandbox-pids {nonce} 0\n")),
+            (Some(false), "out\n".to_owned())
+        );
+        assert_eq!(
+            report(&format!("out\ntexrun-sandbox-pids {nonce} 15\n")),
+            (Some(true), "out".to_owned())
+        );
+        assert_eq!(
+            report(&format!("\ntexrun-sandbox-pids {nonce} 2\n")),
+            (Some(true), String::new())
+        );
+        // Another nonce, a line that is not the last, a malformed count:
+        // left as they are.
+        for text in [
+            "x\ntexrun-sandbox-pids 0000000000000000 1\n".to_owned(),
+            format!("\ntexrun-sandbox-pids {nonce} 1\nmore\n"),
+            format!("\ntexrun-sandbox-pids {nonce} -1\n"),
+            format!("\ntexrun-sandbox-pids {nonce} \n"),
+            format!("\ntexrun-sandbox-pids {nonce} 1"),
+            "no report".to_owned(),
+        ] {
+            assert_eq!(report(&text), (None, text.clone()), "{text:?}");
+        }
+        // Only for a container that reports.
+        let plain = Container::new(&rt, spec("x"));
+        let mut bytes = format!("\ntexrun-sandbox-pids {} 1\n", plain.nonce).into_bytes();
+        assert_eq!(plain.take_pids_report(&mut bytes), None);
+    }
+
+    #[test]
     fn names_are_unique() {
         let rt = runtime();
         let a = Container::new(&rt, spec("x"));
@@ -1294,7 +1392,9 @@ case "$1" in
     if [ -e "$here/create-fails" ]; then exit 1; fi
     echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
   inspect)
-    if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json"; else echo "false false 0"; fi ;;
+    if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json";
+    elif [ -e "$here/running" ]; then echo "false true 0"; else echo "false false 0"; fi ;;
+  wait) cat "$here/wait-status" ;;
 esac
 "#,
         )
@@ -1376,5 +1476,37 @@ esac
             calls.contains(&format!("rm --force -- {}", container.name())),
             "{calls}"
         );
+    }
+
+    #[test]
+    fn a_reporting_container_stopped_by_texrun_says_whether_its_pids_limit_was_reached() {
+        for (status, expected) in [("90\n", Some(true)), ("91\n", Some(false)), ("143\n", None)] {
+            let dir = tempfile::tempdir().unwrap();
+            let rt = fake_runtime(dir.path(), &host_config(4096));
+            let container = Container::new(&rt, unmounted().with_report_pids(true));
+            container.command(&limited_run()).unwrap();
+            // Still running when the supervisor kills the run.
+            std::fs::write(dir.path().join("running"), "").unwrap();
+            std::fs::write(dir.path().join("wait-status"), status).unwrap();
+            container.on_kill(1);
+            let outcome = container.outcome().unwrap();
+            assert_eq!(outcome.pids_limit_reached, expected, "{status}");
+            let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+            let kill = calls.find("kill --signal TERM -- fake-id").expect(&calls);
+            let wait = calls.find("wait -- fake-id").expect(&calls);
+            let rm = calls.find("rm --force -- fake-id").expect(&calls);
+            assert!(kill < wait && wait < rm, "{calls}");
+        }
+
+        // A container that ended on its own is not signalled.
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fake_runtime(dir.path(), &host_config(4096));
+        let container = Container::new(&rt, unmounted().with_report_pids(true));
+        container.command(&limited_run()).unwrap();
+        container.on_reaped(1);
+        assert_eq!(container.outcome().unwrap().pids_limit_reached, None);
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(!calls.contains("kill --signal"), "{calls}");
+        assert!(calls.contains("rm --force -- fake-id"), "{calls}");
     }
 }
