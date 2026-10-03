@@ -16,7 +16,9 @@
 //!   TeX Live tree), plus a small `tmpfs` at `/tmp` (`noexec,nosuid,nodev`);
 //! - only the [`Mount`]s given, each read-only unless marked writable:
 //!   nothing else of the host filesystem is visible;
-//! - `--cap-drop ALL`, `--security-opt no-new-privileges`, `--ipc none`;
+//! - `--cap-drop ALL`, `--security-opt no-new-privileges`, `--ipc none`
+//!   (that no process in the container has a capability is also checked
+//!   from inside, [`capability_report`]);
 //! - a non-root user: the uid / gid of texrun (or [`ROOT_FALLBACK_ID`], the
 //!   image's own user, when texrun runs as root);
 //! - `--pids-limit`, `--memory` (= `--memory-swap`, no swap) and `--cpus`
@@ -66,6 +68,7 @@
 #[cfg(not(unix))]
 compile_error!("texrun-sandbox supports Unix hosts only");
 
+mod caps;
 mod container;
 mod error;
 mod owner;
@@ -73,6 +76,7 @@ mod reclaim;
 mod runtime;
 mod session;
 
+pub use caps::{capability_report, take_capability_report};
 pub use container::{
     Container, ContainerLimits, ContainerOutcome, ContainerSpec, ContainerUser, Mount,
     RESTRICTIONS_NOT_APPLIED, ROOT_FALLBACK_ID,

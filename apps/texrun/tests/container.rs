@@ -231,16 +231,26 @@ fn previews_are_rendered_in_the_container() {
     }
 }
 
+/// The runtime CLI that texrun picks by default: `docker` if it answers,
+/// otherwise `podman` (CI's `sandbox-podman` job stops Docker).
+fn runtime_program() -> &'static Path {
+    static PROGRAM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        let dir = runtime_dir();
+        let docker = dir.join("docker");
+        let answers = docker.is_file()
+            && Command::new(&docker)
+                .args(["version", "--format", "{{.Server.Version}}"])
+                .output()
+                .is_ok_and(|out| out.status.success());
+        if answers { docker } else { dir.join("podman") }
+    })
+}
+
 /// Runs the container runtime CLI with `args` and returns its stdout
 /// (empty if it fails).
 fn runtime(args: &[&str]) -> String {
-    let dir = runtime_dir();
-    let program = if dir.join("docker").is_file() {
-        dir.join("docker")
-    } else {
-        dir.join("podman")
-    };
-    let out = Command::new(program).args(args).output().unwrap();
+    let out = Command::new(runtime_program()).args(args).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 

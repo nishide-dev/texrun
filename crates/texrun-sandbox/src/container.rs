@@ -1425,6 +1425,7 @@ echo "$*" >> "$here/calls"
 case "$1" in
   version) echo "29.0.0 linux" ;;
   context) echo "unix:///var/run/docker.sock" ;;
+  info) echo '["name=seccomp,profile=builtin"]' ;;
   create)
     if [ -e "$here/create-fails" ]; then exit 1; fi
     echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
@@ -1432,6 +1433,9 @@ case "$1" in
     if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json";
     elif [ -e "$here/running" ]; then echo "false true 0"; else echo "false false 0"; fi ;;
   wait) cat "$here/wait-status" ;;
+  exec)
+    if [ -e "$here/caps" ]; then cat "$here/caps"; else
+    echo "texrun-sandbox-caps CapInh:0000000000000000 CapPrm:0000000000000000 CapEff:0000000000000000 CapBnd:0000000000000000 CapAmb:0000000000000000"; fi ;;
 esac
 "#,
         )

@@ -7,9 +7,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use texrun_process::{Cwd, Launcher, Resource, Rlimits, RunError, Spec};
+use texrun_process::{CapturedOutput, Cwd, Launcher, Resource, Rlimits, RunError, Spec};
 
-use crate::container::{Container, ContainerSpec};
+use crate::caps::{capability_report, take_capability_report};
+use crate::container::{Container, ContainerSpec, RESTRICTIONS_NOT_APPLIED};
 use crate::error::SandboxError;
 use crate::runtime::Runtime;
 
@@ -93,6 +94,12 @@ impl<'r> Session<'r> {
         let args: Vec<OsString> = ["start", "--", &id].map(OsString::from).into();
         // On an error `container` is dropped here, which removes it.
         runtime.exec(&args, START_TIMEOUT)?;
+        // What the runtime recorded was checked; now what a process in it
+        // has (Podman records `--cap-drop ALL` capability by capability).
+        if let Err(reason) = check_capabilities(runtime, &id) {
+            let reason = format!("{} {RESTRICTIONS_NOT_APPLIED}: {reason}", runtime.kind());
+            return Err(SandboxError::Refused(reason));
+        }
         Ok(Self { container })
     }
 
@@ -238,6 +245,21 @@ fn exited_on_its_own(pid: u32) -> bool {
     }
 }
 
+/// Runs the [`capability_report`] shell in the started container `id`
+/// (`exec`, as the runs are) and checks that it has no capability.
+fn check_capabilities(runtime: &Runtime, id: &str) -> Result<(), String> {
+    let (shell, shell_args) = capability_report(None, &[]);
+    let mut args: Vec<OsString> = vec!["exec".into(), "--".into(), id.into(), shell.into()];
+    args.extend(shell_args);
+    let out = runtime
+        .exec(&args, START_TIMEOUT)
+        .map_err(|e| e.to_string())?;
+    let mut stdout = CapturedOutput::default();
+    stdout.bytes = out.into_bytes();
+    stdout.total_bytes = stdout.bytes.len() as u64;
+    take_capability_report(&mut stdout)
+}
+
 /// The `prlimit` option of `resource`.
 fn prlimit_name(resource: Resource) -> Option<&'static str> {
     match resource {
@@ -354,6 +376,40 @@ mod tests {
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.contains("rm --force -- fake-id"), "{calls}");
         assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
+    }
+
+    #[test]
+    fn a_session_with_capabilities_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = crate::container::tests::fake_runtime(
+            dir.path(),
+            &crate::container::tests::host_config(4096),
+        );
+        std::fs::write(
+            dir.path().join("caps"),
+            "texrun-sandbox-caps CapInh:0000000000000000 CapPrm:0000000000000000 \
+             CapEff:0000000000000000 CapBnd:00000000a80425fb CapAmb:0000000000000000\n",
+        )
+        .unwrap();
+        let err = Session::start(
+            &rt,
+            ContainerSpec::new("texrun-engine:latest", ContainerLimits::new(4096, 64, 2)),
+            Duration::from_secs(60),
+            Rlimits::new()
+                .with(Resource::Core, 0)
+                .with_soft_hard(Resource::Cpu, 70, 75),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Refused(r) if r.contains("CapBnd")),
+            "{err:?}"
+        );
+        // Started, checked from inside, then removed.
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let start = calls.find("start -- fake-id").expect(&calls);
+        let exec = calls.find("exec -- fake-id /bin/sh -c").expect(&calls);
+        let rm = calls.find("rm --force -- fake-id").expect(&calls);
+        assert!(start < exec && exec < rm, "{calls}");
     }
 
     #[test]
