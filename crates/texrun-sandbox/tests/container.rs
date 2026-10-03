@@ -703,3 +703,178 @@ fn a_session_ends_by_itself_after_its_lifetime() {
     .unwrap();
     assert!(!finished.status.success(), "{finished:?}");
 }
+
+/// Starts as many processes as the limit allows (each sleeping), then
+/// exits (`exit`) or keeps retrying refused `fork`s (`retry`), like perl
+/// in latexmk.
+fn fork_until_refused(retry: bool) -> Spec<'static> {
+    let on_refused = if retry {
+        "select(undef, undef, undef, 0.01); next"
+    } else {
+        "print STDERR \"refused\\n\"; exit 7"
+    };
+    perl(&format!(
+        "$| = 1; while (1) {{ my $p = fork(); if (!defined $p) {{ {on_refused} }} \
+         if ($p == 0) {{ sleep 100; exit 0 }} }}"
+    ))
+}
+
+#[test]
+fn a_reached_process_limit_is_reported_when_the_command_ends() {
+    let runtime = require_sandbox!();
+    let limits = ContainerLimits::new(512 * 1024 * 1024, 8, 1);
+    let spec = ContainerSpec::new(image(), limits).with_report_pids(true);
+
+    let container = Container::new(runtime, spec.clone());
+    let mut finished = run(
+        &container,
+        &fork_until_refused(false),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert_eq!(finished.status.code(), Some(7), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr.bytes),
+        Some(true)
+    );
+    // Only the command's own output is left.
+    assert_eq!(String::from_utf8_lossy(&finished.stderr.bytes), "refused\n");
+
+    let container = Container::new(runtime, spec);
+    let mut finished = run(
+        &container,
+        &sh("echo out; echo err >&2; exit 3"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert_eq!(finished.status.code(), Some(3), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr.bytes),
+        Some(false)
+    );
+    assert_eq!(String::from_utf8_lossy(&finished.stderr.bytes), "err\n");
+    assert_eq!(stdout(&finished), "out\n");
+    assert_eq!(container.outcome().unwrap().pids_limit_reached, None);
+}
+
+#[test]
+fn a_reached_process_limit_is_reported_when_texrun_stops_the_container() {
+    let runtime = require_sandbox!();
+    let limits = ContainerLimits::new(512 * 1024 * 1024, 8, 1);
+    for (retry, reached) in [(true, true), (false, false)] {
+        let spec = ContainerSpec::new(image(), limits).with_report_pids(true);
+        let container = Container::new(runtime, spec);
+        let program = if retry {
+            fork_until_refused(true)
+        } else {
+            sh("sleep 120")
+        };
+        let finished = run(
+            &container,
+            &program,
+            Watch::new().with_timeout(Duration::from_secs(3)),
+        );
+        assert_eq!(finished.stop, Some(Stop::TimedOut), "{finished:?}");
+        let outcome = container.outcome().unwrap();
+        assert_eq!(outcome.pids_limit_reached, Some(reached), "{finished:?}");
+        assert!(containers_named(runtime, container.name()).is_empty());
+    }
+}
+
+/// Creates a container named `name` with `labels` outside texrun, and
+/// leaves it `created`, `running` or `exited`.
+fn create_labelled(runtime: &Runtime, name: &str, labels: &[String], state: &str) {
+    let docker = |args: &[&str]| {
+        let out = Command::new(runtime.program()).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    let seconds = if state == "exited" { "0" } else { "120" };
+    let image = image();
+    let mut args = vec![
+        "create",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--name",
+        name,
+    ];
+    for label in labels {
+        args.extend(["--label", label]);
+    }
+    args.extend(["--entrypoint", "/usr/bin/sleep", "--", &image, seconds]);
+    docker(&args);
+    if state != "created" {
+        docker(&["start", "--", name]);
+    }
+    if state == "exited" {
+        docker(&["wait", "--", name]);
+    }
+}
+
+/// Containers that killed texrun processes left behind are removed by a
+/// later one only if they are stopped, and only if they are this user's,
+/// on this host, of a texrun process that is gone.
+#[test]
+fn only_stopped_containers_of_gone_texrun_processes_are_reclaimed() {
+    use texrun_sandbox::{Creator, LABEL_HOST, LABEL_PID, LABEL_UID};
+
+    let runtime = require_sandbox!();
+    let me = Creator::current().unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let labels = |pid: u32, uid: u32, host: u64| {
+        vec![
+            format!("{LABEL}=1"),
+            format!("{LABEL_PID}={pid}"),
+            format!("{LABEL_UID}={uid}"),
+            format!("{LABEL_HOST}={host:016x}"),
+        ]
+    };
+    let ours = std::process::id();
+    let name = |pid: u32, n: u32| format!("texrun-{pid}-{ours}{n}-0");
+
+    let reclaimed = [
+        (name(dead, 1), labels(dead, uid, me.host()), "exited"),
+        (name(dead, 2), labels(dead, uid, me.host()), "created"),
+    ];
+    let kept = [
+        // Running.
+        (name(dead, 3), labels(dead, uid, me.host()), "running"),
+        // Its texrun is alive.
+        (name(ours, 4), labels(ours, uid, me.host()), "exited"),
+        // Another user's, another host's.
+        (name(dead, 5), labels(dead, uid + 1, me.host()), "exited"),
+        (name(dead, 6), labels(dead, uid, me.host() ^ 1), "exited"),
+        // Not named like texrun's container of that PID.
+        (
+            format!("other-{dead}-{ours}7"),
+            labels(dead, uid, me.host()),
+            "exited",
+        ),
+        // Only the texrun label.
+        (name(dead, 8), vec![format!("{LABEL}=1")], "exited"),
+    ];
+    for (name, labels, state) in reclaimed.iter().chain(&kept) {
+        create_labelled(runtime, name, labels, state);
+    }
+
+    let removed = runtime.reclaim_left_containers().unwrap();
+    assert!(removed >= reclaimed.len(), "{removed}");
+    for (name, _, _) in &reclaimed {
+        assert!(
+            containers_named(runtime, name).is_empty(),
+            "{name} was kept"
+        );
+    }
+    for (name, _, _) in &kept {
+        assert_eq!(
+            containers_named(runtime, name).len(),
+            1,
+            "{name} was removed"
+        );
+        let _ = Command::new(runtime.program())
+            .args(["rm", "--force", "--", name])
+            .output();
+    }
+}

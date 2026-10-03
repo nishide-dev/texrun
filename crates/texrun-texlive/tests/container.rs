@@ -260,6 +260,65 @@ fn the_cpu_time_limit_applies_in_the_container() {
     assert!(d.message.contains("CPU time"), "{d:#?}");
 }
 
+/// latexmk cannot start pdflatex within the container's process limit
+/// (`--pids-limit`): the processes of the container are the init process,
+/// the reporting shell, `timeout` and latexmk. perl retries the refused
+/// `fork`, so the timeout usually ends the compile; either way the result
+/// says that the limit was reached (read from the container's
+/// `pids.events`).
+#[test]
+fn the_process_limit_is_reported_from_the_container() {
+    require_sandbox!();
+    let _serial = serial();
+    let limits = Limits::default().with_max_processes(4);
+    let (run, _ws) = Compile::fixture("minimal", "main.tex")
+        .engine(container_engine(
+            ContainerConfig::default().with_limits(limits),
+        ))
+        .timeout(Duration::from_secs(8))
+        .run();
+    assert!(
+        matches!(
+            run.result.outcome,
+            CompileOutcome::TimedOut | CompileOutcome::Failed
+        ),
+        "{}",
+        describe(&run)
+    );
+    let d = find(&run, DiagnosticKind::ResourceLimit);
+    assert!(
+        d.message.contains("more than 4 processes"),
+        "{}",
+        describe(&run)
+    );
+    // The report is not part of latexmk's output.
+    assert!(
+        !String::from_utf8_lossy(&run.stderr.bytes).contains("texrun-sandbox-pids"),
+        "{}",
+        describe(&run)
+    );
+    assert!(containers_of_this_process().is_empty());
+
+    // With the default limit, no such diagnostic.
+    let (run, _ws) = Compile::fixture("minimal", "main.tex")
+        .engine(engine())
+        .run();
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    assert!(
+        !run.result
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ResourceLimit),
+        "{}",
+        describe(&run)
+    );
+    assert!(
+        !String::from_utf8_lossy(&run.stderr.bytes).contains("texrun-sandbox-pids"),
+        "{}",
+        describe(&run)
+    );
+}
+
 #[test]
 fn the_address_space_limit_applies_in_the_container() {
     require_sandbox!();
