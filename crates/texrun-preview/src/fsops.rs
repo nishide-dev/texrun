@@ -300,14 +300,17 @@ impl Drop for ScratchDir {
 /// - it is a directory (`fstatat` without following a symlink) of the
 ///   effective uid of this process, with no permissions for others (mode
 ///   0700, as created);
-/// - its creator is gone ([`Creator::is_gone`]: same host, and no process
-///   with its PID and start time).
+/// - its creator is gone ([`Creator::is_gone`]: same host (or, on macOS,
+///   same machine), and no process with its PID and start time; or, #56,
+///   same machine in another boot, and the directory was last changed
+///   (its `ctime`) before this boot).
 ///
 /// It is removed with everything in it (a copy of the PDF and the tools'
 /// partial output: nothing that is kept elsewhere), up to
-/// [`MAX_REMOVE_ENTRIES`] entries per directory (the rest is left for a
-/// later run), through descriptors: `unlinkat` / `openat(O_NOFOLLOW)`
-/// below the held `parent`, never following a symlink.
+/// [`MAX_REMOVE_ENTRIES`] entries per tree (the rest is left for a later
+/// run; one of another boot whose removal was cut short has a new `ctime`
+/// and is then kept), through descriptors: `unlinkat` /
+/// `openat(O_NOFOLLOW)` below the held `parent`, never following a symlink.
 pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
     let euid = rustix::process::geteuid().as_raw();
     let Ok(mut entries) = rustix::fs::Dir::read_from(parent) else {
@@ -340,7 +343,7 @@ pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
         let private_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory
             && st.st_uid == euid
             && (Mode::from_raw_mode(st.st_mode) & (Mode::RWXG | Mode::RWXO)).is_empty();
-        if !private_dir || !creator.is_gone() {
+        if !private_dir || !creator.is_gone(changed_at(&st)) {
             continue;
         }
         remove_tree(parent, &name);
@@ -349,6 +352,14 @@ pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
         }
     }
     removed
+}
+
+/// When the inode was last changed (`st_ctime`, which, unlike the
+/// modification time, cannot be set by its owner); `None` before 1970.
+fn changed_at(st: &rustix::fs::Stat) -> Option<std::time::SystemTime> {
+    let seconds = u64::try_from(st.st_ctime).ok()?;
+    let nanos = u32::try_from(st.st_ctime_nsec).ok()?;
+    std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanos))
 }
 
 /// A random value for a directory name (the standard library's per-process
@@ -616,6 +627,22 @@ mod tests {
         child.wait().unwrap();
         let gone = Creator::new(pid, None, me.host()).tag();
         let elsewhere = Creator::new(pid, None, me.host() ^ 1).tag();
+        // #56: this machine with another host. On macOS (a machine and no
+        // boot) a renamed host: the PID is compared. Elsewhere unknown.
+        let renamed = Creator::new(pid, None, me.host() ^ 1)
+            .with_machine(me.machine(), None)
+            .tag();
+        let renamed_is_gone = me.machine().is_some() && me.boot().is_none();
+        // This machine in another boot: only what was changed before this
+        // boot, which the directory below was not.
+        let other_boot = Creator::new(pid, None, me.host() ^ 1)
+            .with_machine(me.machine(), Some(me.boot().unwrap_or(0) ^ 1))
+            .tag();
+        let other_machine = Creator::new(pid, None, me.host() ^ 1)
+            .with_machine(me.machine().map(|m| m ^ 1), me.boot())
+            .tag();
+        // The name of #49: no machine or boot.
+        let old = format!("{pid}-x-{:016x}", me.host());
         let random = "0123456789abcdef";
 
         let root = tempfile::tempdir().unwrap();
@@ -643,7 +670,11 @@ mod tests {
             private(&format!("p-{random}")),
             private(&format!("p-{gone}-{random}0")),
             private(&format!("p-{gone}-0123456789abcdeX")),
+            private(&format!("p-{other_boot}-5555555555555555")),
+            private(&format!("p-{other_machine}-6666666666666666")),
         ];
+        let left_by_49 = private(&format!("p-{old}-{random}"));
+        let left_renamed = private(&format!("p-{renamed}-4444444444444444"));
         let shared = root.path().join(format!("p-{gone}-1111111111111111"));
         fs::create_dir(&shared).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
@@ -654,9 +685,11 @@ mod tests {
 
         assert_eq!(
             reclaim_scratch_dirs(&open_dir(root.path()).unwrap(), "p-"),
-            1
+            2 + usize::from(renamed_is_gone)
         );
         assert!(!left.exists());
+        assert!(!left_by_49.exists());
+        assert_eq!(!left_renamed.exists(), renamed_is_gone);
         for dir in kept.iter().chain([&shared]) {
             assert!(dir.is_dir(), "{}", dir.display());
         }

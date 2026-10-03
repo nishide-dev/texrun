@@ -79,7 +79,7 @@ pub use container::{
 };
 pub use error::SandboxError;
 pub use owner::Creator;
-pub use reclaim::{LABEL_HOST, LABEL_PID, LABEL_STARTED, LABEL_UID};
+pub use reclaim::{LABEL_BOOT, LABEL_HOST, LABEL_MACHINE, LABEL_PID, LABEL_STARTED, LABEL_UID};
 pub use runtime::{Image, RUNTIME_ENV, Runtime, RuntimeKind};
 pub use session::Session;
 

@@ -1,16 +1,22 @@
-//! Reclaiming containers that a killed texrun left behind (#49).
+//! Reclaiming containers that a killed texrun left behind (#49, #56).
 //!
 //! Every container texrun creates carries, besides [`LABEL`](crate::LABEL),
 //! labels naming its creator ([`Creator`]): its PID, the start time of that
-//! process (Linux), the host the PID belongs to, and the effective uid of
-//! texrun. [`Runtime::reclaim_left_containers`] removes a container only if
-//! all of these hold:
+//! process (Linux), the host the PID belongs to, the machine and the boot
+//! (where known), and the effective uid of texrun.
+//! [`Runtime::reclaim_left_containers`] removes a container only if all of
+//! these hold:
 //!
-//! - it has every label, with the uid and host of this texrun;
+//! - it has the labels of the PID, the uid and the host, with the uid of
+//!   this texrun, and the host of this texrun or (#56) the machine of this
+//!   texrun;
 //! - its name is the one texrun gives a container of that PID
 //!   (`texrun-<pid>-...`);
-//! - its creator is gone ([`Creator::is_gone`]): no process has the PID
-//!   any more, or one with another start time (the PID was reused);
+//! - its creator is gone ([`Creator::is_gone`]): on the same host (or, on
+//!   macOS, the same machine), no process has the PID any more, or one
+//!   with another start time (the PID was reused); or (#56, Linux) it ran
+//!   on this machine in another boot and the container was created before
+//!   this boot;
 //! - it is not running: exited (or dead), or created but never started.
 //!
 //! It is removed with `rm` without `--force`, so a container that started
@@ -26,10 +32,10 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::error::SandboxError;
-use crate::owner::Creator;
+use crate::owner::{Creator, Relation, parse_hex16, relation};
 use crate::runtime::Runtime;
 
 /// Label with the PID of the texrun process that created the container.
@@ -40,6 +46,12 @@ pub const LABEL_STARTED: &str = "org.texrun.sandbox.started";
 pub const LABEL_HOST: &str = "org.texrun.sandbox.host";
 /// Label with the effective uid of that process.
 pub const LABEL_UID: &str = "org.texrun.sandbox.uid";
+/// Label with the machine of that process ([`Creator::machine`], 16 hex
+/// digits; only where it is known).
+pub const LABEL_MACHINE: &str = "org.texrun.sandbox.machine";
+/// Label with the boot of that process ([`Creator::boot`], 16 hex digits;
+/// only where it is known).
+pub const LABEL_BOOT: &str = "org.texrun.sandbox.boot";
 
 /// Timeout of `rm` (without `--force`) of a left container.
 const REMOVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,6 +73,12 @@ pub(crate) fn creator_labels(creator: Option<Creator>) -> Vec<String> {
             labels.push(format!("{LABEL_STARTED}={started}"));
         }
         labels.push(format!("{LABEL_HOST}={:016x}", creator.host()));
+        if let Some(machine) = creator.machine() {
+            labels.push(format!("{LABEL_MACHINE}={machine:016x}"));
+        }
+        if let Some(boot) = creator.boot() {
+            labels.push(format!("{LABEL_BOOT}={boot:016x}"));
+        }
     }
     labels
 }
@@ -71,6 +89,8 @@ pub(crate) struct Listed {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) status: String,
+    /// When the runtime created it (`None` if that cannot be read).
+    pub(crate) created: Option<SystemTime>,
     pub(crate) labels: BTreeMap<String, String>,
 }
 
@@ -83,14 +103,22 @@ pub(crate) fn candidate(listed: &Listed, me: &Creator, uid: u32) -> Option<Creat
         return None;
     }
     let host = u64::from_str_radix(label(LABEL_HOST)?, 16).ok()?;
-    if host != me.host() {
-        return None;
-    }
     let pid: u32 = label(LABEL_PID)?.parse().ok()?;
     let started = match label(LABEL_STARTED) {
         Some(s) => Some(s.parse().ok()?),
         None => None,
     };
+    // A malformed machine or boot keeps the container, like a malformed
+    // start time. Absent ones (#49) leave only the host to compare.
+    let id = |key: &str| match label(key) {
+        Some(id) => parse_hex16(id).map(Some),
+        None => Some(None),
+    };
+    let creator =
+        Creator::new(pid, started, host).with_machine(id(LABEL_MACHINE)?, id(LABEL_BOOT)?);
+    if relation(&creator, me) == Relation::Unknown {
+        return None;
+    }
     // Docker reports `/name`, Podman `name`.
     let name = listed.name.strip_prefix('/').unwrap_or(&listed.name);
     if !name.starts_with(&format!("texrun-{pid}-")) {
@@ -102,18 +130,25 @@ pub(crate) fn candidate(listed: &Listed, me: &Creator, uid: u32) -> Option<Creat
         listed.status.as_str(),
         "exited" | "dead" | "stopped" | "created" | "configured"
     );
-    stopped.then(|| Creator::new(pid, started, host))
+    stopped.then_some(creator)
 }
 
-/// Parses `inspect --format '{{.Id}} {{.Name}} {{.State.Status}} {{json
-/// .Config.Labels}}'`, one container per line.
+/// The `--format` of `inspect` that [`parse_listing`] reads. `.Created` is
+/// a string with Docker and a time with Podman; as JSON both are RFC 3339.
+const LISTING_FORMAT: &str =
+    "{{.Id}} {{.Name}} {{.State.Status}} {{json .Created}} {{json .Config.Labels}}";
+
+/// Parses `inspect --format LISTING_FORMAT`, one container per line.
 pub(crate) fn parse_listing(out: &str) -> Vec<Listed> {
     out.lines()
         .filter_map(|line| {
-            let mut fields = line.trim().splitn(4, ' ');
+            let mut fields = line.trim().splitn(5, ' ');
             let id = fields.next()?.to_owned();
             let name = fields.next()?.to_owned();
             let status = fields.next()?.to_owned();
+            let created = serde_json::from_str::<String>(fields.next()?)
+                .ok()
+                .and_then(|time| parse_rfc3339(&time));
             let labels: BTreeMap<String, String> =
                 serde_json::from_str::<Option<_>>(fields.next()?)
                     .ok()?
@@ -122,15 +157,89 @@ pub(crate) fn parse_listing(out: &str) -> Vec<Listed> {
                 id,
                 name,
                 status,
+                created,
                 labels,
             })
         })
         .collect()
 }
 
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+HH:MM|-HH:MM)` as a time; `None` for
+/// anything else, or before 1970.
+pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    fn number(s: &str, len: usize) -> Option<i64> {
+        (s.len() == len && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    }
+    let (date, rest) = text.split_once(['T', 't'])?;
+    let mut date = date.splitn(3, '-');
+    let year = number(date.next()?, 4)?;
+    let month = number(date.next()?, 2)?;
+    let day = number(date.next()?, 2)?;
+    let (time, zone) = rest.split_at(rest.find(['Z', 'z', '+', '-'])?);
+    let (time, fraction) = match time.split_once('.') {
+        Some((time, fraction)) => (time, Some(fraction)),
+        None => (time, None),
+    };
+    let mut time = time.splitn(3, ':');
+    let hour = number(time.next()?, 2)?;
+    let minute = number(time.next()?, 2)?;
+    let second = number(time.next()?, 2)?;
+    let nanos: u32 = match fraction {
+        None => 0,
+        Some(fraction) => {
+            if !(1..=32).contains(&fraction.len()) || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let digits = &fraction[..fraction.len().min(9)];
+            format!("{digits:0<9}").parse().ok()?
+        }
+    };
+    let offset = match zone {
+        "Z" | "z" => 0,
+        _ => {
+            let (sign, hours_minutes) = zone.split_at(1);
+            let (hours, minutes) = hours_minutes.split_once(':')?;
+            let (hours, minutes) = (number(hours, 2)?, number(minutes, 2)?);
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            let offset = hours * 3600 + minutes * 60;
+            if sign == "-" { -offset } else { offset }
+        }
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour >= 24
+        || minute >= 60
+        || second >= 61
+    {
+        return None;
+    }
+    let seconds =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    let seconds = u64::try_from(seconds).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+}
+
+/// Days from 1970-01-01 to the given date of the proleptic Gregorian
+/// calendar (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 impl Runtime {
     /// Removes the containers that texrun processes of this user on this
-    /// host created and left behind when they were killed (see the module
+    /// host (or, #56, on this machine before it was rebooted or renamed)
+    /// created and left behind when they were killed (see the module
     /// documentation for the exact conditions); returns how many were
     /// removed. Running containers and those of live texrun processes are
     /// never touched. A container that cannot be removed is skipped.
@@ -141,10 +250,11 @@ impl Runtime {
             return Ok(0);
         };
         let uid = rustix::process::geteuid().as_raw();
+        // Not filtered by the host: one of an earlier boot (or host name)
+        // has another. `candidate` checks the host or the machine.
         let filters = [
             format!("label={}=1", crate::LABEL),
             format!("label={LABEL_UID}={uid}"),
-            format!("label={LABEL_HOST}={:016x}", me.host()),
         ];
         let mut args = vec!["ps", "--all", "--quiet", "--no-trunc"];
         for filter in &filters {
@@ -161,7 +271,7 @@ impl Runtime {
                 let Some(creator) = candidate(&listed, &me, uid) else {
                     continue;
                 };
-                if !creator.is_gone() {
+                if !creator.is_gone(listed.created) {
                     continue;
                 }
                 // Without `--force`: a running container is refused.
@@ -185,8 +295,10 @@ impl Runtime {
         let inspect = |ids: &[String]| {
             let mut args: Vec<&str> = vec![
                 "inspect",
+                "--type",
+                "container",
                 "--format",
-                "{{.Id}} {{.Name}} {{.State.Status}} {{json .Config.Labels}}",
+                LISTING_FORMAT,
                 "--",
             ];
             args.extend(ids.iter().map(String::as_str));
@@ -217,6 +329,7 @@ mod tests {
             id: "0123".to_owned(),
             name: name.to_owned(),
             status: status.to_owned(),
+            created: None,
             labels: labels
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -313,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("left"),
-            format!("left-id /texrun-{dead}-0-0 exited {labels}\n"),
+            format!("left-id /texrun-{dead}-0-0 exited \"2026-01-02T03:04:05.6Z\" {labels}\n"),
         )
         .unwrap();
         let script = dir.path().join("docker");
@@ -352,16 +465,108 @@ esac
 
     #[test]
     fn inspect_output_is_parsed() {
-        let out = "abc /texrun-1-0-1 exited {\"org.texrun.sandbox\":\"1\",\"x\":\"a b\"}\n\
-                   def name running null\n\
+        let out = "abc /texrun-1-0-1 exited \"1970-01-01T00:00:10.5Z\" \
+                   {\"org.texrun.sandbox\":\"1\",\"x\":\"a b\"}\n\
+                   def name running \"soon\" null\n\
                    broken\n";
         let parsed = parse_listing(out);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].id, "abc");
         assert_eq!(parsed[0].name, "/texrun-1-0-1");
         assert_eq!(parsed[0].status, "exited");
+        assert_eq!(
+            parsed[0].created,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(10_500))
+        );
         assert_eq!(parsed[0].labels["x"], "a b");
+        // A creation time that cannot be read is not known.
+        assert_eq!(parsed[1].created, None);
         assert!(parsed[1].labels.is_empty());
+    }
+
+    #[test]
+    fn creation_times_are_parsed() {
+        let at = |secs: u64, nanos: u32| Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos));
+        // `date -u -d 2026-08-29T09:57:58Z +%s`
+        let docker = 1_787_997_478;
+        for (text, expected) in [
+            ("1970-01-01T00:00:00Z", at(0, 0)),
+            ("2026-08-29T09:57:58.283401317Z", at(docker, 283_401_317)),
+            // Podman: the local offset.
+            (
+                "2026-08-29T18:57:58.283401317+09:00",
+                at(docker, 283_401_317),
+            ),
+            ("2026-08-29T05:27:58-04:30", at(docker, 0)),
+            ("2000-02-29T00:00:00Z", at(951_782_400, 0)),
+            (
+                "2024-12-31T23:59:59.1234567891234Z",
+                at(1_735_689_599, 123_456_789),
+            ),
+        ] {
+            assert_eq!(parse_rfc3339(text), expected, "{text}");
+        }
+        for bad in [
+            "",
+            "0001-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-08-29 09:57:58Z",
+            "2026-08-29T09:57:58",
+            "2026-13-29T09:57:58Z",
+            "2026-08-29T24:57:58Z",
+            "2026-08-29T09:57:58.Z",
+            "2026-08-29T09:57:58.x1Z",
+            "2026-08-29T09:57:58+0900",
+            "2026-8-29T09:57:58Z",
+            "+2026-08-29T09:57:58Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
+
+    /// #56: the labels of the machine and the boot. A container of this
+    /// machine is a candidate even with another host; one without these
+    /// labels (#49) only with this host.
+    #[test]
+    fn containers_of_this_machine_are_candidates_whatever_the_host() {
+        let me = Creator::new(100, Some(5), 0xabc).with_machine(Some(0xd), Some(0xb0));
+        let other_host = |extra: &[(&'static str, &'static str)]| {
+            let mut labels = full("42");
+            labels[3].1 = "0000000000000abd".to_owned();
+            labels.extend(extra.iter().map(|(k, v)| (*k, (*v).to_owned())));
+            labels
+        };
+        let machine = (LABEL_MACHINE, "000000000000000d");
+        let other_machine = (LABEL_MACHINE, "000000000000000e");
+        let boot = |b: &'static str| (LABEL_BOOT, b);
+        let candidate_of = |labels: &[(&'static str, String)]| {
+            candidate(&listed("/texrun-42-0-1", "exited", &with(labels)), &me, 501)
+        };
+        // Another boot of this machine.
+        assert_eq!(
+            candidate_of(&other_host(&[machine, boot("00000000000000b1")])),
+            Some(Creator::new(42, Some(77), 0xabd).with_machine(Some(0xd), Some(0xb1)))
+        );
+        // Kept: another machine, no machine or boot (#49), a malformed one.
+        for extra in [
+            vec![other_machine, boot("00000000000000b1")],
+            vec![],
+            vec![boot("00000000000000b1")],
+            vec![machine],
+            vec![(LABEL_MACHINE, "d"), boot("00000000000000b1")],
+            vec![machine, boot("b1")],
+        ] {
+            assert_eq!(candidate_of(&other_host(&extra)), None, "{extra:?}");
+        }
+        // This host: a malformed machine label still keeps it.
+        let mut labels = full("42");
+        labels.push((LABEL_MACHINE, "zz".to_owned()));
+        assert_eq!(candidate_of(&labels), None);
+        // This host, with or without the new labels.
+        let mut labels = full("42");
+        labels.push((LABEL_MACHINE, "000000000000000e".to_owned()));
+        assert!(candidate_of(&labels).is_some());
+        assert!(candidate_of(&full("42")).is_some());
     }
 
     #[test]
@@ -374,6 +579,10 @@ esac
         assert!(labels.contains(&format!("{LABEL_HOST}=000000000000001f")));
         let uid = rustix::process::geteuid().as_raw();
         assert!(labels.contains(&format!("{LABEL_UID}={uid}")));
+        assert!(!labels.iter().any(|l| l.starts_with(LABEL_MACHINE)));
+        let labels = creator_labels(Some(creator.with_machine(Some(0xd), Some(0xe))));
+        assert!(labels.contains(&format!("{LABEL_MACHINE}=000000000000000d")));
+        assert!(labels.contains(&format!("{LABEL_BOOT}=000000000000000e")));
         let unidentified = creator_labels(None);
         assert!(!unidentified.iter().any(|l| l.starts_with(LABEL_HOST)));
     }

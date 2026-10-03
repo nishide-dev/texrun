@@ -1,17 +1,49 @@
 //! Who created a container or a scratch directory, so that the ones a
-//! killed texrun left behind can be reclaimed by a later one (#49,
+//! killed texrun left behind can be reclaimed by a later one (#49, #56,
 //! docs/security.md §4 "container のライフサイクル").
 //!
 //! A [`Creator`] names a texrun process by its PID, the start time of that
 //! process (where the kernel tells it without `unsafe`: Linux) and the
 //! "host" its PID belongs to (a hash of what makes PIDs comparable: the
-//! boot and the PID namespace on Linux, the host name elsewhere). A later
-//! texrun considers the creator gone only if it is on the same host and
-//! no process has that PID any more, or one with another start time has
-//! (the PID was reused). Whenever it cannot tell, the creator counts as
-//! alive: a leftover is kept rather than something in use removed.
+//! boot and the PID namespace on Linux, the host name elsewhere). Where
+//! they can be told, it also names the machine and the boot (#56).
+//!
+//! A later texrun considers the creator gone ([`Creator::is_gone`]) only
+//! if it knows that the creator's PID is comparable with its own and no
+//! process has that PID any more, or one with another start time has (the
+//! PID was reused); or if it knows that the creator ran on the same
+//! machine in an earlier boot. Whenever it cannot tell, the creator counts
+//! as alive: a leftover is kept rather than something in use removed.
+//!
+//! # The machine and the boot (#56)
+//!
+//! The host changes with every boot on Linux (and with the host name on
+//! macOS), so what is left before it changed would never be reclaimed by
+//! the host alone. The machine is recorded only where all processes of the
+//! machine (in one boot) share one PID space, which a later texrun on the
+//! same machine can rely on:
+//!
+//! - Linux: a hash of `/etc/machine-id`, only for a texrun in the initial
+//!   PID namespace and not in a container (`/.dockerenv`,
+//!   `/run/.containerenv`): a container's `machine-id` is often its
+//!   image's, shared by every container of that image. The boot is a hash
+//!   of `/proc/sys/kernel/random/boot_id`. A creator of the same machine
+//!   and another boot is gone if, in addition, what it left (a container,
+//!   a scratch directory) was created or last changed before this boot
+//!   (`btime` in `/proc/stat`), which rules out another live kernel that
+//!   happens to share the `machine-id` (a cloned VM) and the runtime.
+//! - macOS: a hash of the `IOPlatformUUID` (from `/usr/sbin/ioreg`, run
+//!   without a shell and with an empty environment), which does not change
+//!   with the host name. There are no PID namespaces, so a creator of the
+//!   same machine has a comparable PID. No boot is recorded: a PID that is
+//!   not in use means the creator is gone whatever the boot, and a PID in
+//!   use (maybe reused after a reboot) keeps what it left.
+//! - Elsewhere, or if these cannot be read: nothing, and only the host is
+//!   compared.
 
+use std::path::Path;
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use rustix::io::Errno;
 use rustix::process::Pid;
@@ -22,26 +54,54 @@ pub struct Creator {
     pid: u32,
     started: Option<u64>,
     host: u64,
+    machine: Option<u64>,
+    boot: Option<u64>,
+}
+
+/// How a recorded creator relates to this texrun process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relation {
+    /// Its PID is comparable with this process's.
+    SamePidSpace,
+    /// It ran on this machine in another boot.
+    OtherBoot,
+    /// Cannot be told: what it left is kept.
+    Unknown,
+}
+
+/// What this process knows about itself.
+#[derive(Debug)]
+struct Local {
+    me: Creator,
+    /// When this boot started (Linux).
+    booted: Option<SystemTime>,
 }
 
 impl Creator {
     /// This texrun process; `None` if the host cannot be identified (then
     /// nothing it creates is ever reclaimed).
     pub fn current() -> Option<Self> {
-        static CURRENT: OnceLock<Option<Creator>> = OnceLock::new();
-        *CURRENT.get_or_init(|| {
-            let pid = std::process::id();
-            Some(Self {
-                pid,
-                started: start_time(pid),
-                host: host_id()?,
-            })
-        })
+        local().map(|local| local.me)
     }
 
-    /// A creator from its parts (as recorded in labels).
+    /// A creator from its parts (as recorded in labels), without a machine
+    /// or boot (as recorded before #56).
     pub fn new(pid: u32, started: Option<u64>, host: u64) -> Self {
-        Self { pid, started, host }
+        Self {
+            pid,
+            started,
+            host,
+            machine: None,
+            boot: None,
+        }
+    }
+
+    /// This creator with the machine and the boot it ran on (as recorded).
+    #[must_use]
+    pub fn with_machine(mut self, machine: Option<u64>, boot: Option<u64>) -> Self {
+        self.machine = machine;
+        self.boot = boot;
+        self
     }
 
     /// The PID.
@@ -60,17 +120,39 @@ impl Creator {
         self.host
     }
 
-    /// A short text form for names: `<pid>-<started or x>-<host>` (decimal,
-    /// decimal, 16 hex digits; only `[0-9a-fx-]`).
+    /// The hash of the machine (see the module documentation for where it
+    /// is recorded); `None` if not known.
+    pub fn machine(&self) -> Option<u64> {
+        self.machine
+    }
+
+    /// The hash of the boot (Linux); `None` if not known.
+    pub fn boot(&self) -> Option<u64> {
+        self.boot
+    }
+
+    /// A short text form for names:
+    /// `<pid>-<started or x>-<host>-<machine or x>-<boot or x>` (decimal,
+    /// decimal, then 16 hex digits each; only `[0-9a-fx-]`).
     pub fn tag(&self) -> String {
         let started = self
             .started
             .map_or_else(|| "x".to_owned(), |s| s.to_string());
-        format!("{}-{started}-{:016x}", self.pid, self.host)
+        let id = |id: Option<u64>| id.map_or_else(|| "x".to_owned(), |id| format!("{id:016x}"));
+        format!(
+            "{}-{started}-{:016x}-{}-{}",
+            self.pid,
+            self.host,
+            id(self.machine),
+            id(self.boot)
+        )
     }
 
     /// Parses [`Creator::tag`] at the start of `text`; returns the creator
-    /// and the rest of `text` after the tag.
+    /// and the rest of `text` after the tag. A tag of #49 (`<pid>-<started
+    /// or x>-<host>`, without the machine and the boot) is parsed when what
+    /// follows the host is a single part (no `-`): the creator then has no
+    /// machine or boot.
     pub fn parse_tag(text: &str) -> Option<(Self, &str)> {
         let mut parts = text.splitn(4, '-');
         let pid = parse_decimal(parts.next()?)?;
@@ -78,26 +160,40 @@ impl Creator {
             "x" => None,
             s => Some(parse_decimal(s)?),
         };
-        let host = parts.next()?;
-        if host.len() != 16 || !host.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let host = u64::from_str_radix(host, 16).ok()?;
+        let host = parse_hex16(parts.next()?)?;
+        let creator = Self::new(u32::try_from(pid).ok()?, started, host);
         let rest = parts.next().unwrap_or("");
-        Some((Self::new(u32::try_from(pid).ok()?, started, host), rest))
+        let mut more = rest.splitn(3, '-');
+        if let (Some(machine), Some(boot), Some(after)) = (more.next(), more.next(), more.next()) {
+            let optional = |part: &str| match part {
+                "x" => Some(None),
+                part => parse_hex16(part).map(Some),
+            };
+            let (machine, boot) = (optional(machine)?, optional(boot)?);
+            return Some((creator.with_machine(machine, boot), after));
+        }
+        Some((creator, rest))
     }
 
-    /// Whether this creator is known to be gone: it is on this host (as
-    /// [`Creator::current`]) and its process no longer exists, or the PID
-    /// now belongs to a process with another start time. `false` whenever
-    /// that cannot be told.
-    pub fn is_gone(&self) -> bool {
-        let Some(me) = Self::current() else {
+    /// Whether this creator is known to be gone (see the module
+    /// documentation): its PID is comparable with this process's and no
+    /// process has it any more (or one with another start time); or it
+    /// ran on this machine in another boot and what it left was `created`
+    /// (or last changed) before this boot started. `false` whenever that
+    /// cannot be told.
+    pub fn is_gone(&self, created: Option<SystemTime>) -> bool {
+        let Some(local) = local() else {
             return false;
         };
-        if self.host != me.host || self.pid == me.pid {
-            return false;
+        match relation(self, &local.me) {
+            Relation::SamePidSpace => self.pid != local.me.pid && self.pid_is_gone(),
+            Relation::OtherBoot => before_boot(created, local.booted),
+            Relation::Unknown => false,
         }
+    }
+
+    /// No process has the PID any more, or one with another start time.
+    fn pid_is_gone(&self) -> bool {
         let Some(pid) = i32::try_from(self.pid).ok().and_then(Pid::from_raw) else {
             return false;
         };
@@ -113,11 +209,63 @@ impl Creator {
     }
 }
 
+/// How the recorded creator `other` relates to `me`.
+///
+/// - The same host: the same PID space.
+/// - The same machine (both recorded): the same PID space if neither has a
+///   boot (macOS, where a machine has one PID space); another boot if
+///   both have one and they differ (Linux).
+/// - Anything else: unknown. That includes another machine, a machine or
+///   a boot missing on one side, and the same machine and boot with
+///   another host, which cannot happen on Linux (a machine is only
+///   recorded in the initial PID namespace, so the host would be the
+///   same) unless the labels are forged or the hashes collide.
+pub(crate) fn relation(other: &Creator, me: &Creator) -> Relation {
+    if other.host == me.host {
+        return Relation::SamePidSpace;
+    }
+    match (other.machine, me.machine) {
+        (Some(a), Some(b)) if a == b => match (other.boot, me.boot) {
+            (None, None) => Relation::SamePidSpace,
+            (Some(a), Some(b)) if a != b => Relation::OtherBoot,
+            _ => Relation::Unknown,
+        },
+        _ => Relation::Unknown,
+    }
+}
+
+/// Whether `created` is known to be before `booted`.
+pub(crate) fn before_boot(created: Option<SystemTime>, booted: Option<SystemTime>) -> bool {
+    matches!((created, booted), (Some(created), Some(booted)) if created < booted)
+}
+
+fn local() -> Option<&'static Local> {
+    static LOCAL: OnceLock<Option<Local>> = OnceLock::new();
+    LOCAL
+        .get_or_init(|| {
+            let pid = std::process::id();
+            let (machine, boot) = machine_and_boot();
+            Some(Local {
+                me: Creator::new(pid, start_time(pid), host_id()?).with_machine(machine, boot),
+                booted: boot_time(),
+            })
+        })
+        .as_ref()
+}
+
 fn parse_decimal(text: &str) -> Option<u64> {
     if text.is_empty() || text.len() > 20 || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     text.parse().ok()
+}
+
+/// Exactly 16 hex digits.
+pub(crate) fn parse_hex16(text: &str) -> Option<u64> {
+    if text.len() != 16 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(text, 16).ok()
 }
 
 /// The start time of process `pid` in clock ticks since boot (field 22 of
@@ -157,6 +305,121 @@ fn host_id() -> Option<u64> {
     Some(fnv1a(text.as_bytes()))
 }
 
+/// The inode of the initial PID namespace (`PROC_PID_INIT_INO`), the same
+/// in every boot.
+const INITIAL_PID_NAMESPACE: &str = "pid:[4026531836]";
+
+/// The machine and the boot of this process, hashed (see the module
+/// documentation).
+fn machine_and_boot() -> (Option<u64>, Option<u64>) {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .map(|id| fnv1a(format!("linux-boot\n{id}").as_bytes()));
+        let in_initial_namespace = std::fs::read_link("/proc/self/ns/pid")
+            .is_ok_and(|ns| ns.as_os_str() == INITIAL_PID_NAMESPACE);
+        let in_container = ["/.dockerenv", "/run/.containerenv"]
+            .iter()
+            .any(|marker| std::fs::symlink_metadata(marker).is_ok());
+        let machine = (in_initial_namespace && !in_container)
+            .then(|| read_small("/etc/machine-id"))
+            .flatten()
+            .and_then(|text| {
+                linux_machine_id(&text).map(|id| fnv1a(format!("linux-machine\n{id}").as_bytes()))
+            });
+        (machine, boot)
+    } else if cfg!(target_os = "macos") {
+        let machine =
+            ioreg_platform_uuid().map(|uuid| fnv1a(format!("macos-machine\n{uuid}").as_bytes()));
+        (machine, None)
+    } else {
+        (None, None)
+    }
+}
+
+/// A valid `machine-id`: 32 lowercase hex digits (and a newline), not all
+/// zero (`uninitialized` and the empty file of an image are not).
+fn linux_machine_id(text: &str) -> Option<&str> {
+    let id = text.strip_suffix('\n').unwrap_or(text);
+    let valid = id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && id.bytes().any(|b| b != b'0');
+    valid.then_some(id)
+}
+
+/// The start of this boot (Linux: `btime` in `/proc/stat`, seconds).
+fn boot_time() -> Option<SystemTime> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return None;
+    }
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let seconds: u64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+}
+
+/// The start of a small text file (a `machine-id`).
+fn read_small(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(256)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// The `IOPlatformUUID` of this Mac, from `/usr/sbin/ioreg -rd1 -c
+/// IOPlatformExpertDevice` (by path, no shell, an empty environment, a
+/// timeout and a bounded output).
+fn ioreg_platform_uuid() -> Option<String> {
+    use texrun_process::{Capture, Cwd, Spec, Watch};
+
+    const IOREG: &str = "/usr/sbin/ioreg";
+    if !Path::new(IOREG).is_file() {
+        return None;
+    }
+    let spec = Spec::new(IOREG, Cwd::Path(Path::new("/")))
+        .with_args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .with_stdout(Capture::Keep(64 * 1024))
+        .with_stderr(Capture::Discard);
+    let finished = texrun_process::run(
+        &spec,
+        Watch::<()>::new().with_timeout(Duration::from_secs(5)),
+    )
+    .ok()?;
+    if finished.stop.is_some() || !finished.status.success() || finished.stdout.is_truncated() {
+        return None;
+    }
+    platform_uuid(&String::from_utf8_lossy(&finished.stdout.bytes))
+}
+
+/// The value of `"IOPlatformUUID" = "<uuid>"` in `ioreg` output, if it is a
+/// UUID (hex digits and dashes, 8-4-4-4-12).
+fn platform_uuid(ioreg: &str) -> Option<String> {
+    let uuid = ioreg.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("\"IOPlatformUUID\" = \"")?
+            .strip_suffix('"')
+    })?;
+    let groups: Vec<&str> = uuid.split('-').collect();
+    let shape = groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12]);
+    let hex = groups
+        .iter()
+        .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()));
+    let zero = uuid.bytes().all(|b| b == b'0' || b == b'-');
+    (shape && hex && !zero).then(|| uuid.to_ascii_uppercase())
+}
+
 /// 64-bit FNV-1a: stable across texrun versions and Rust releases (unlike
 /// the standard library's hashers).
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -175,14 +438,33 @@ mod tests {
     #[test]
     fn tags_round_trip() {
         let c = Creator::new(1234, Some(98765), 0x0123_4567_89ab_cdef);
-        assert_eq!(c.tag(), "1234-98765-0123456789abcdef");
+        assert_eq!(c.tag(), "1234-98765-0123456789abcdef-x-x");
         assert_eq!(
-            Creator::parse_tag("1234-98765-0123456789abcdef-rest-x"),
+            Creator::parse_tag(&format!("{}-r", c.tag())),
+            Some((c, "r"))
+        );
+        let c = c.with_machine(Some(0xfe), Some(0x0123_4567_89ab_cdef));
+        assert_eq!(
+            c.tag(),
+            "1234-98765-0123456789abcdef-00000000000000fe-0123456789abcdef"
+        );
+        assert_eq!(
+            Creator::parse_tag(&format!("{}-rest-x", c.tag())),
             Some((c, "rest-x"))
         );
+        let m = Creator::new(7, None, 1).with_machine(Some(2), None);
+        assert_eq!(
+            Creator::parse_tag(&format!("{}-r", m.tag())),
+            Some((m, "r"))
+        );
+        // The tag of #49: no machine or boot.
+        let old = Creator::new(1234, Some(98765), 0x0123_4567_89ab_cdef);
+        assert_eq!(
+            Creator::parse_tag("1234-98765-0123456789abcdef-0011223344556677"),
+            Some((old, "0011223344556677"))
+        );
         let c = Creator::new(7, None, 1);
-        assert_eq!(c.tag(), "7-x-0000000000000001");
-        assert_eq!(Creator::parse_tag(&c.tag()), Some((c, "")));
+        assert_eq!(Creator::parse_tag("7-x-0000000000000001"), Some((c, "")));
         for bad in [
             "",
             "x-1-0123456789abcdef",
@@ -191,6 +473,10 @@ mod tests {
             "-1-1-0123456789abcdef",
             "99999999999-1-0123456789abcdef",
             "1--0123456789abcdef",
+            // A malformed machine or boot.
+            "1-1-0123456789abcdef-0123-x-r",
+            "1-1-0123456789abcdef-x-y-r",
+            "1-1-0123456789abcdef--x-r",
         ] {
             assert_eq!(Creator::parse_tag(bad), None, "{bad}");
         }
@@ -200,9 +486,15 @@ mod tests {
     fn this_process_is_not_gone() {
         let me = Creator::current().expect("the host can be identified");
         assert_eq!(me.pid(), std::process::id());
-        assert!(!me.is_gone());
+        assert!(!me.is_gone(None));
+        assert!(!me.is_gone(Some(SystemTime::UNIX_EPOCH)));
         if cfg!(target_os = "linux") {
             assert!(me.started().is_some());
+            assert!(me.boot().is_some());
+        }
+        if cfg!(target_os = "macos") {
+            assert!(me.machine().is_some(), "the IOPlatformUUID is read");
+            assert_eq!(me.boot(), None);
         }
     }
 
@@ -213,9 +505,21 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         let gone = Creator::new(pid, None, me.host());
-        assert!(gone.is_gone());
+        assert!(gone.is_gone(None));
         // Another host: never.
-        assert!(!Creator::new(pid, None, me.host() ^ 1).is_gone());
+        assert!(!Creator::new(pid, None, me.host() ^ 1).is_gone(None));
+        // Another host of the same machine: the PID is compared on macOS
+        // (a machine and no boot), and the same boot with another host is
+        // unknown on Linux.
+        let renamed = Creator::new(pid, None, me.host() ^ 1).with_machine(me.machine(), me.boot());
+        assert_eq!(
+            renamed.is_gone(None),
+            me.machine().is_some() && me.boot().is_none()
+        );
+        // Another host of another machine.
+        let other = Creator::new(pid, None, me.host() ^ 1)
+            .with_machine(me.machine().map(|m| m ^ 1), me.boot());
+        assert!(!other.is_gone(None));
     }
 
     #[test]
@@ -227,11 +531,122 @@ mod tests {
         let parent = rustix::process::getppid().map_or(1, |p| p.as_raw_nonzero().get());
         let parent = u32::try_from(parent).unwrap();
         let reused = Creator::new(parent, Some(u64::MAX), me.host());
-        assert_eq!(reused.is_gone(), cfg!(target_os = "linux"));
+        assert_eq!(reused.is_gone(None), cfg!(target_os = "linux"));
         let unknown = Creator::new(parent, None, me.host());
-        assert!(!unknown.is_gone());
+        assert!(!unknown.is_gone(None));
         if let Some(started) = start_time(parent) {
-            assert!(!Creator::new(parent, Some(started), me.host()).is_gone());
+            assert!(!Creator::new(parent, Some(started), me.host()).is_gone(None));
+        }
+    }
+
+    /// Every combination of what is recorded and what is known here.
+    #[test]
+    fn creators_are_related_by_host_machine_and_boot() {
+        use Relation::{OtherBoot, SamePidSpace, Unknown};
+        let me = Creator::new(1, Some(1), 0xa).with_machine(Some(0xc0), Some(0xb0));
+        let other = |host, machine, boot| Creator::new(2, None, host).with_machine(machine, boot);
+        let cases = [
+            // The same host: whatever else is recorded (#49 records none).
+            (other(0xa, None, None), SamePidSpace),
+            (other(0xa, Some(0xf), Some(0xf)), SamePidSpace),
+            // Same machine, another boot: the creator's boot is over.
+            (other(0xb, Some(0xc0), Some(0xb1)), OtherBoot),
+            // Same machine and boot, another host: cannot happen where a
+            // machine is recorded (Linux, initial PID namespace), so kept.
+            (other(0xb, Some(0xc0), Some(0xb0)), Unknown),
+            // Another machine.
+            (other(0xb, Some(0xc1), Some(0xb1)), Unknown),
+            (other(0xb, Some(0xc1), Some(0xb0)), Unknown),
+            // A machine or boot missing on the recorded side.
+            (other(0xb, None, Some(0xb1)), Unknown),
+            (other(0xb, None, None), Unknown),
+            (other(0xb, Some(0xc0), None), Unknown),
+        ];
+        for (other, expected) in cases {
+            assert_eq!(relation(&other, &me), expected, "{other:?}");
+        }
+        // Missing here.
+        let no_machine = Creator::new(1, None, 0xa).with_machine(None, Some(0xb0));
+        let no_boot = Creator::new(1, None, 0xa).with_machine(Some(0xc0), None);
+        let recorded = other(0xb, Some(0xc0), Some(0xb1));
+        assert_eq!(relation(&recorded, &no_machine), Unknown);
+        assert_eq!(relation(&recorded, &no_boot), Unknown);
+        // macOS: a machine without boots on both sides.
+        let mac = Creator::new(1, None, 0xa).with_machine(Some(0xc0), None);
+        assert_eq!(relation(&other(0xb, Some(0xc0), None), &mac), SamePidSpace);
+        assert_eq!(relation(&other(0xb, Some(0xc1), None), &mac), Unknown);
+    }
+
+    #[test]
+    fn another_boot_counts_only_for_what_was_created_before_this_one() {
+        let booted = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let before = booted - Duration::from_secs(60);
+        let after = booted + Duration::from_secs(1);
+        assert!(before_boot(Some(before), Some(booted)));
+        assert!(!before_boot(Some(after), Some(booted)));
+        assert!(!before_boot(Some(booted), Some(booted)));
+        assert!(!before_boot(None, Some(booted)));
+        assert!(!before_boot(Some(before), None));
+    }
+
+    /// A creator of this machine in another boot is gone only with a
+    /// creation time before this boot, which cannot be the case for
+    /// anything created now.
+    #[test]
+    fn another_boot_of_this_machine_needs_an_earlier_creation() {
+        let me = Creator::current().unwrap();
+        let (Some(machine), Some(boot)) = (me.machine(), me.boot()) else {
+            return;
+        };
+        let earlier = Creator::new(std::process::id(), None, me.host() ^ 1)
+            .with_machine(Some(machine), Some(boot ^ 1));
+        assert!(!earlier.is_gone(None));
+        assert!(!earlier.is_gone(Some(SystemTime::now())));
+        assert!(earlier.is_gone(Some(SystemTime::UNIX_EPOCH)));
+        // Another machine, even long ago.
+        let elsewhere = earlier.with_machine(Some(machine ^ 1), Some(boot ^ 1));
+        assert!(!elsewhere.is_gone(Some(SystemTime::UNIX_EPOCH)));
+    }
+
+    #[test]
+    fn machine_ids_are_validated() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(linux_machine_id(&format!("{id}\n")), Some(id));
+        assert_eq!(linux_machine_id(id), Some(id));
+        for bad in [
+            "",
+            "\n",
+            "uninitialized\n",
+            "00000000000000000000000000000000\n",
+            "0123456789ABCDEF0123456789ABCDEF\n",
+            "0123456789abcdef0123456789abcde\n",
+            "0123456789abcdef0123456789abcdef0\n",
+            "0123456789abcdef0123456789abcdeg\n",
+        ] {
+            assert_eq!(linux_machine_id(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_platform_uuid_is_read_from_ioreg_output() {
+        let out = "+-o J314sAP  <class IOPlatformExpertDevice>\n\
+                   {\n\
+                   \x20 \"IOPlatformSerialNumber\" = \"XYZ\"\n\
+                   \x20 \"IOPlatformUUID\" = \"aa57f66d-9834-5b0f-ab38-67aaa471c7d2\"\n\
+                   }\n";
+        assert_eq!(
+            platform_uuid(out).as_deref(),
+            Some("AA57F66D-9834-5B0F-AB38-67AAA471C7D2")
+        );
+        for bad in [
+            "",
+            "\"IOPlatformUUID\" = \"\"",
+            "\"IOPlatformUUID\" = \"not-a-uuid\"",
+            "\"IOPlatformUUID\" = \"00000000-0000-0000-0000-000000000000\"",
+            "\"IOPlatformUUID\" = \"AA57F66D98345B0FAB3867AAA471C7D2\"",
+            "\"IOPlatformUUID\" = \"AA57F66D-9834-5B0F-AB38-67AAA471C7DZ\"",
+        ] {
+            assert_eq!(platform_uuid(bad), None, "{bad}");
         }
     }
 

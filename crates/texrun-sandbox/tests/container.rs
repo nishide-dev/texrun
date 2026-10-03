@@ -858,14 +858,106 @@ fn only_stopped_containers_of_gone_texrun_processes_are_reclaimed() {
         create_labelled(runtime, name, labels, state);
     }
 
-    let removed = runtime.reclaim_left_containers().unwrap();
-    assert!(removed >= reclaimed.len(), "{removed}");
+    // Not counted: another test may reclaim some of them first.
+    runtime.reclaim_left_containers().unwrap();
     for (name, _, _) in &reclaimed {
         assert!(
             containers_named(runtime, name).is_empty(),
             "{name} was kept"
         );
     }
+    for (name, _, _) in &kept {
+        assert_eq!(
+            containers_named(runtime, name).len(),
+            1,
+            "{name} was removed"
+        );
+        let _ = Command::new(runtime.program())
+            .args(["rm", "--force", "--", name])
+            .output();
+    }
+}
+
+/// #56: containers labelled with this machine but another host. Another
+/// boot of this machine counts only for a container created before this
+/// boot, which none created now is; on macOS (no boots recorded) the PID
+/// is compared. Labels of another machine, or malformed ones, keep it.
+#[test]
+fn containers_of_this_machine_are_judged_by_boot_and_creation() {
+    use texrun_sandbox::{Creator, LABEL_BOOT, LABEL_HOST, LABEL_MACHINE, LABEL_PID, LABEL_UID};
+
+    let runtime = require_sandbox!();
+    let me = Creator::current().unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let labels = |machine: Option<String>, boot: Option<String>| {
+        let mut labels = vec![
+            format!("{LABEL}=1"),
+            format!("{LABEL_PID}={dead}"),
+            format!("{LABEL_UID}={uid}"),
+            format!("{LABEL_HOST}={:016x}", me.host() ^ 1),
+        ];
+        labels.extend(machine.map(|m| format!("{LABEL_MACHINE}={m}")));
+        labels.extend(boot.map(|b| format!("{LABEL_BOOT}={b}")));
+        labels
+    };
+    let hex = |id: u64| format!("{id:016x}");
+    let machine = me.machine().unwrap_or(0);
+    let boot = me.boot().unwrap_or(0);
+    let ours = std::process::id();
+    let name = |n: u32| format!("texrun-{dead}-{ours}{n}-0");
+
+    // On macOS: this machine, another host name.
+    let renamed = (
+        name(1),
+        labels(Some(hex(machine)), me.boot().map(hex)),
+        "exited",
+    );
+    let renamed_is_reclaimed = me.machine().is_some() && me.boot().is_none();
+    let kept = [
+        // This machine, another boot, but created now.
+        (
+            name(2),
+            labels(Some(hex(machine)), Some(hex(boot ^ 1))),
+            "exited",
+        ),
+        // Another machine.
+        (
+            name(3),
+            labels(Some(hex(machine ^ 1)), me.boot().map(hex)),
+            "exited",
+        ),
+        (
+            name(4),
+            labels(Some(hex(machine ^ 1)), Some(hex(boot ^ 1))),
+            "created",
+        ),
+        // A malformed machine or boot.
+        (name(5), labels(Some("me".to_owned()), None), "exited"),
+        (
+            name(6),
+            labels(Some(hex(machine)), Some("0".to_owned())),
+            "exited",
+        ),
+        // No machine (#49) with another host.
+        (name(7), labels(None, None), "exited"),
+    ];
+    for (name, labels, state) in std::iter::once(&renamed).chain(&kept) {
+        create_labelled(runtime, name, labels, state);
+    }
+
+    runtime.reclaim_left_containers().unwrap();
+    assert_eq!(
+        containers_named(runtime, &renamed.0).is_empty(),
+        renamed_is_reclaimed,
+        "{}",
+        renamed.0
+    );
+    let _ = Command::new(runtime.program())
+        .args(["rm", "--force", "--", &renamed.0])
+        .output();
     for (name, _, _) in &kept {
         assert_eq!(
             containers_named(runtime, name).len(),
