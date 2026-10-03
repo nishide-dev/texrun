@@ -251,22 +251,20 @@ removes the workspace and then exits.
 | | `--backend host` (default) | `--backend container` |
 | --- | --- | --- |
 | TeX runs | on the host, as your user | in a container of the engine image (Docker or Podman), as a non-root user without capabilities |
+| Page previews (MuPDF / Poppler) | the host's tools, as your user | the image's tools, in a container of their own that sees only a copy of the PDF |
 | Shell escape off, texrun rc, environment allowlist, kpathsea paranoid mode, timeout and limits | yes | yes (the same settings) |
 | Host files TeX can reach | whatever kpathsea's paranoid mode does not refuse by name (e.g. the TeX Live tree, font lookups, pdfTeX's file embedding primitives) | only the workspace (read-only, except the output directory) and the image's own read-only TeX Live tree |
-| Network | not blocked | none (`--network none`) |
+| Network | not blocked | none (`--network none`), for the compile and the previews |
 | Memory / processes / CPUs of the whole compile | only with a delegated cgroup (`--cgroup`) | always (the container's cgroup) |
 | Needs | TeX Live + latexmk on the host | Docker 20.10+ or Podman 4+, and the engine image |
 
-Use `--backend container` for documents you do not trust. Until
-[#46](https://github.com/nishide-dev/texrun/issues/46), page previews are
-still rendered on the host from the PDF that TeX produced, so add
-`--no-preview` for such documents too. The default stays `host` because the
-container backend needs a container runtime and the image. Build the image
-once from this repository:
+Use `--backend container` for documents you do not trust. The default stays
+`host` because the container backend needs a container runtime and the image.
+Build the image once from this repository:
 
 ```bash
 docker build -t texrun-engine:latest docker/engine
-texrun compile --backend container --no-preview main.tex
+texrun compile --backend container main.tex
 ```
 
 The runtime must be local (a Unix socket; Docker Desktop and OrbStack are).
@@ -274,10 +272,11 @@ If it does not apply every restriction texrun asks for (for example a memory
 limit the kernel does not support), texrun refuses to start the container
 (exit 3) instead of running TeX with fewer restrictions.
 
-Page previews are rendered on the host with either backend (with the
-per-process limits of `--cgroup`); running them in the container too is
-tracked in [#46](https://github.com/nishide-dev/texrun/issues/46). See [docs/security.md](docs/security.md) §2 and §4 for exactly
-what each backend guarantees.
+With `--backend container`, page previews are rendered by the image's
+MuPDF / Poppler in one more container per compile, with the same
+restrictions and the preview limits; the host's preview tools are not used
+(and need not be installed). See [docs/security.md](docs/security.md) §2
+and §4 for exactly what each backend guarantees.
 
 ## System requirements
 
@@ -292,15 +291,16 @@ what each backend guarantees.
   (`docker/engine/Dockerfile`), for `--backend container`. Only Docker is
   tested in CI.
 - **Preview tool:** `mutool` (MuPDF) or `pdfinfo` + `pdftoppm` (Poppler), for
-  page previews. MuPDF is used when both are installed; without either,
+  page previews with `--backend host` (`--backend container` uses the
+  image's). MuPDF is used when both are installed; without either,
   compiling still works and the result says that previews were skipped.
   - Licensing: MuPDF is AGPL and Poppler is GPL. texrun only starts an
     installed binary as a separate process; it neither links nor ships them.
     To avoid MuPDF entirely, select the Poppler backend
     (`--preview-backend poppler`, or `BackendChoice::Poppler` in the library) or do not install
     `mutool`.
-  - The development Docker image below contains `mupdf-tools` and
-    `poppler-utils`. If that image is ever distributed, the AGPL / GPL terms
+  - The development Docker image below and the engine image
+    (`docker/engine`) contain `mupdf-tools` and `poppler-utils`. If that image is ever distributed, the AGPL / GPL terms
     for distributing those packages apply to the image and must be checked
     separately.
 
@@ -346,7 +346,7 @@ output limits. Running TeX on the host (`--backend host`) is **not** a
 complete sandbox, though: parts of the host such as the TeX Live tree remain
 readable, and network access is not blocked. `--backend container` adds an
 OS-level boundary: TeX then sees only the workspace, has no network and runs
-without privileges in a read-only container
+without privileges in a read-only container, and so do the preview tools
 ([Engine backends](#engine-backends)).
 
 See [docs/security.md](docs/security.md) for the trust boundary, guarantees,
