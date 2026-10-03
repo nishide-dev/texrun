@@ -242,6 +242,17 @@ jobs:
         run: |
           docker version --format 'docker {{.Server.Version}} ({{.Server.Os}}/{{.Server.Arch}})'
           docker run --rm --network none --entrypoint /usr/bin/latexmk "${TEXRUN_SANDBOX_IMAGE}" -v | head -n 2
+      # The image is built like a local `docker build docker/engine`,
+      # without a version label (#54): the tests cover that case. The
+      # labelled case is a unit test and an imported image.
+      - name: Engine image has no version label
+        run: |
+          version="$(docker image inspect --format '{{json .Config}}' "${TEXRUN_SANDBOX_IMAGE}" \
+            | jq -c '(.Labels // {})["org.opencontainers.image.version"]')"
+          if [ "${version}" != "null" ]; then
+            echo "::error::the engine image of the sandbox job has a version label: ${version}"
+            exit 1
+          fi
       # Like the integration job, fail if any test is #[ignore]d.
       - name: Run container backend tests
         shell: bash

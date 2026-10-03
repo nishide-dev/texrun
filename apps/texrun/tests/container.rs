@@ -70,7 +70,13 @@ fn a_document_compiles_in_the_container() {
     assert_eq!(doc["engine"]["name"], "texlive-container");
     let version = doc["engine"]["version"].as_str().unwrap();
     assert!(version.starts_with("latexmk "), "{version}");
-    assert!(version.contains(", image "), "{version}");
+    // A local build has no version label (#54; CI's `sandbox` job builds
+    // the image so).
+    assert!(
+        version.ends_with(", image without a version label)")
+            || version.contains(", image version "),
+        "{version}"
+    );
     assert_eq!(
         doc["resource_limits"],
         serde_json::json!({ "rlimits": true, "cgroup": true })
