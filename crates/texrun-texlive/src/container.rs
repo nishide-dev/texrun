@@ -44,6 +44,12 @@ const GUEST_RC_DIR: &str = "/texrun/rc";
 /// `/etc`, ...) or texrun's rc, or collide with the runtime's mounts.
 pub const GUEST_ROOT_PARENTS: &[&str] = &["/srv", "/mnt"];
 
+/// What a custom image (`--container-image`) must provide, for the error of
+/// a probe that failed in it (docs/security.md §4 "engine image").
+const IMAGE_REQUIREMENTS: &str = "the image must provide /usr/bin/latexmk with pdflatex, bibtex \
+     and makeindex in /usr/bin, /usr/bin/timeout, /usr/bin/prlimit and /bin/sh; see \
+     docs/security.md §4";
+
 /// Timeout of `latexmk -v` in a container: includes starting the
 /// container (and, on macOS, possibly the runtime's VM).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -214,12 +220,19 @@ impl ContainerEngine {
     }
 
     /// The runtime, detected now if it was not yet.
+    ///
+    /// Right after detecting it, the containers that killed texrun
+    /// processes of this user left behind are removed
+    /// ([`Runtime::reclaim_left_containers`], best effort): those of the
+    /// compile and of the page previews, once they have stopped.
     pub fn runtime(&self) -> Result<Runtime, EngineError> {
         let mut runtime = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(runtime) = runtime.as_ref() {
             return Ok(runtime.clone());
         }
         let detected = Runtime::detect(self.config.runtime).map_err(sandbox_error)?;
+        // A runtime that cannot list its containers fails the probe anyway.
+        let _ = detected.reclaim_left_containers();
         *runtime = Some(detected.clone());
         Ok(detected)
     }
@@ -317,7 +330,8 @@ impl TypesetEngine for ContainerEngine {
             _ => {
                 let stderr = String::from_utf8_lossy(&finished.stderr.bytes);
                 return Err(unavailable(format!(
-                    "`latexmk -v` in the image `{}` did not report a version (exit: {:?}): {}",
+                    "`latexmk -v` in the image `{}` did not report a version (exit: {:?}): {} \
+                     ({IMAGE_REQUIREMENTS})",
                     self.config.image,
                     ProcessExit::from(finished.status),
                     stderr.trim()
@@ -456,6 +470,9 @@ fn container_spec(config: &ContainerConfig, image: &str, timeout: Duration) -> C
     )
     .with_oci_runtime(config.oci_runtime.clone())
     .with_deadline(deadline)
+    // `pids.events`: a process limit that refused latexmk's `fork` is a
+    // `resource_limit` diagnostic (perl retries it until the timeout).
+    .with_report_pids(true)
 }
 
 /// The rc as latexmk sees it in the container.
@@ -521,6 +538,7 @@ mod tests {
         assert_eq!(spec.limits, ContainerLimits::new(4 << 30, 64, 2));
         assert_eq!(container_spec(&config, "x", Duration::MAX).deadline, None);
         assert!(spec.mounts.is_empty());
+        assert!(spec.report_pids);
     }
 
     #[test]

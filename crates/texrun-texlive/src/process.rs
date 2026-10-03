@@ -262,6 +262,10 @@ pub(crate) struct Job<'a> {
 
 /// Result of a supervised run (see [`texrun_process::Finished`]).
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about one finished run, not states"
+)]
 pub(crate) struct Finished {
     pub(crate) pid: u32,
     pub(crate) status: std::process::ExitStatus,
@@ -277,6 +281,10 @@ pub(crate) struct Finished {
     pub(crate) address_space_limited: bool,
     /// The container's memory limit stopped a process (OOM kill).
     pub(crate) container_oom: bool,
+    /// The container's process limit refused a new process (as reported
+    /// from inside the container,
+    /// `texrun_sandbox::ContainerSpec::report_pids`).
+    pub(crate) container_pids_limit: bool,
 }
 
 /// Runs latexmk and supervises it until it exits or is stopped.
@@ -332,16 +340,25 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
         });
     }
 
-    let (finished, address_space_limited, container_oom) =
+    let (finished, address_space_limited, container_oom, container_pids_limit) =
         if let Start::Container(container) = &job.start {
-            let finished = texrun_process::run_with(*container, &spec, watch)?;
-            let oom = container.outcome().is_some_and(|o| o.oom_killed);
-            (finished, true, oom)
+            let mut finished = texrun_process::run_with(*container, &spec, watch)?;
+            let outcome = container.outcome();
+            let oom = outcome.is_some_and(|o| o.oom_killed);
+            // Stopped by texrun: the container told when it was stopped;
+            // ended on its own: in the last line of its stderr, which is
+            // removed from the output either way.
+            let reported = container.take_pids_report(&mut finished.stderr);
+            let pids = outcome
+                .and_then(|o| o.pids_limit_reached)
+                .or(reported)
+                .unwrap_or(false);
+            (finished, true, oom, pids)
         } else {
             let finished = texrun_process::run(&spec, watch)?;
             let linux = cfg!(any(target_os = "linux", target_os = "android"));
             let limited = linux && finished.rlimits_applied;
-            (finished, limited, false)
+            (finished, limited, false, false)
         };
     Ok(Finished {
         pid: finished.pid,
@@ -358,6 +375,7 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
         cgroup: finished.cgroup,
         address_space_limited,
         container_oom,
+        container_pids_limit,
     })
 }
 
@@ -428,6 +446,20 @@ pub(crate) fn limit_reached(
             limits.max_memory_bytes
         )));
     }
+    let pids_limit = || {
+        // A refused `fork` may have been retried successfully.
+        Some(LimitReached::Resource {
+            message: format!(
+                "resource limit exceeded: the compile tried to run more than {} processes and \
+                 threads at once",
+                limits.max_processes
+            ),
+            transient: true,
+        })
+    };
+    if finished.container_pids_limit {
+        return pids_limit();
+    }
     if let CgroupOutcome::Applied(usage) = &finished.cgroup {
         if usage.oom_kills > 0 {
             return Some(LimitReached::fatal(format!(
@@ -437,15 +469,7 @@ pub(crate) fn limit_reached(
             )));
         }
         if usage.pids_max_hits > 0 {
-            // A refused `fork` may have been retried successfully.
-            return Some(LimitReached::Resource {
-                message: format!(
-                    "resource limit exceeded: the compile tried to run more than {} processes \
-                     and threads at once",
-                    limits.max_processes
-                ),
-                transient: true,
-            });
+            return pids_limit();
         }
     }
     if signal == Some(SIGXCPU) {
@@ -577,6 +601,7 @@ mod tests {
             cgroup,
             address_space_limited: cfg!(target_os = "linux"),
             container_oom: false,
+            container_pids_limit: false,
         }
     }
 
@@ -612,6 +637,14 @@ mod tests {
         usage.pids_max_hits = 3;
         assert!(matches!(
             reached(12 << 8, CgroupOutcome::Applied(usage)),
+            Some(LimitReached::Resource { message: m, transient: true }) if m.contains("64 processes")
+        ));
+        // Reported from inside a container, whatever the exit (e.g. the
+        // timeout's kill).
+        let mut in_container = finished(9, CgroupOutcome::NotRequested);
+        in_container.container_pids_limit = true;
+        assert!(matches!(
+            limit_reached(&in_container, b"", &limits, t),
             Some(LimitReached::Resource { message: m, transient: true }) if m.contains("64 processes")
         ));
     }

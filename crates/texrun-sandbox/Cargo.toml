@@ -15,8 +15,9 @@ texrun-process.workspace = true
 thiserror.workspace = true
 # Reading back the container's `HostConfig` (`inspect`).
 serde_json.workspace = true
-# `geteuid` / `getegid` for the container user (Unix only).
-rustix = { workspace = true, features = ["process"] }
+# `geteuid` / `getegid` for the container user, whether the creator of a
+# left container still runs, and the host name (Unix only).
+rustix = { workspace = true, features = ["process", "system"] }
 
 [dev-dependencies]
 tempfile.workspace = true

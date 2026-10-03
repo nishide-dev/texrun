@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use texrun_process::{Cwd, Launcher, Resource, RunError, Spec};
+use texrun_process::{CapturedOutput, Cwd, Launcher, Resource, RunError, Spec};
 
 use crate::error::SandboxError;
+use crate::owner::Creator;
 use crate::runtime::{Runtime, check_image};
 
 /// Timeout of `create`: creating a container from a local image normally
@@ -33,6 +34,67 @@ const PRLIMIT: &str = "/usr/bin/prlimit";
 /// Where `timeout` is expected in the image (coreutils), for
 /// [`ContainerSpec::deadline`].
 const TIMEOUT: &str = "/usr/bin/timeout";
+
+/// Where a POSIX shell is expected in the image, for
+/// [`ContainerSpec::report_pids`].
+const SH: &str = "/bin/sh";
+
+/// The main process of a container with [`ContainerSpec::report_pids`]
+/// (`sh -c REPORT_PIDS sh <nonce> <command...>`): runs the command, then
+/// kills whatever is left in the container (`kill -1` spares the shell and
+/// the init process) and reads the `max` counter of the container's
+/// `pids.events` (cgroup v2, or the v1 `pids` hierarchy).
+///
+/// - When the command ends, it prints `texrun-sandbox-pids <nonce> <max>`
+///   as the last line of stderr ([`Container::take_pids_report`]) and exits
+///   with the command's status.
+/// - On `SIGTERM` (texrun stops a running container, [`Launcher::on_kill`])
+///   it exits with [`PIDS_REACHED_EXIT`] or [`PIDS_NOT_REACHED_EXIT`]
+///   instead, which texrun reads with `wait` before removing the container.
+///
+/// The command runs in the background (`&` / `wait`) so that the shell
+/// handles `SIGTERM` while it runs, with the original stderr; the shell's
+/// own stderr is `/dev/null`, so that its job messages (e.g. for a command
+/// ended by `SIGXCPU`) do not add to the command's output.
+const REPORT_PIDS: &str = r#"n=$1; shift; h=
+r() {
+  kill -s KILL -1 2>/dev/null
+  for f in /sys/fs/cgroup/pids.events /sys/fs/cgroup/pids/pids.events; do
+    if [ -r "$f" ]; then
+      while read -r k v; do [ "$k" = max ] && h=$v; done < "$f"
+      break
+    fi
+  done
+}
+trap 'r; case "$h" in 0) exit 91 ;; [1-9]*) exit 90 ;; esac; exit 143' TERM
+exec 3>&2 2>/dev/null
+"$@" 2>&3 3>&- &
+wait $!
+s=$?
+r
+[ -n "$h" ] && printf '\ntexrun-sandbox-pids %s %s\n' "$n" "$h" >&3
+exit $s
+"#;
+
+/// Exit status of a [`REPORT_PIDS`] container stopped by texrun after its
+/// cgroup refused a new process (`pids.events` `max` > 0).
+const PIDS_REACHED_EXIT: &str = "90";
+/// ... and of one whose cgroup never did.
+const PIDS_NOT_REACHED_EXIT: &str = "91";
+
+/// Start of the last stderr line of a [`REPORT_PIDS`] container.
+const PIDS_MARKER: &[u8] = b"\ntexrun-sandbox-pids ";
+
+/// How long texrun waits, in all (`kill` and `wait` together), for a
+/// [`REPORT_PIDS`] container to report and exit after `SIGTERM`, before
+/// removing it anyway.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Part of [`Container::refusal`] (and of the errors made from it): the
+/// runtime created the container without a restriction texrun asked for,
+/// e.g. on a cgroup v1 host without swap accounting, where the daemon
+/// drops `--memory-swap`.
+pub const RESTRICTIONS_NOT_APPLIED: &str = "did not apply the container restrictions";
 
 /// The uid / gid used when texrun runs as root: the image's `texrun` user,
 /// not an id that other host processes (e.g. `nobody`) share.
@@ -160,6 +222,14 @@ pub struct ContainerSpec {
     pub deadline: Option<Duration>,
     /// Size of the `tmpfs` at `/tmp`, in bytes.
     pub tmp_bytes: u64,
+    /// Find out whether the container's process limit (`--pids-limit`)
+    /// refused a new process: the command runs under a small shell
+    /// (`/bin/sh` in the image) that reads the cgroup's `pids.events` when
+    /// the command ends or texrun stops the container
+    /// ([`ContainerOutcome::pids_limit_reached`],
+    /// [`Container::take_pids_report`]). Leftover processes of the command
+    /// are killed before that, as they would be when the container ends.
+    pub report_pids: bool,
 }
 
 impl ContainerSpec {
@@ -177,6 +247,7 @@ impl ContainerSpec {
             oci_runtime: None,
             deadline: None,
             tmp_bytes: Self::DEFAULT_TMP_BYTES,
+            report_pids: false,
         }
     }
 
@@ -207,6 +278,13 @@ impl ContainerSpec {
         self.deadline = deadline;
         self
     }
+
+    /// Sets [`ContainerSpec::report_pids`].
+    #[must_use]
+    pub fn with_report_pids(mut self, report: bool) -> Self {
+        self.report_pids = report;
+        self
+    }
 }
 
 /// What the runtime recorded about a container, read before it was
@@ -219,6 +297,17 @@ pub struct ContainerOutcome {
     pub oom_killed: bool,
     /// The exit code of the container's main process, if it ended.
     pub exit_code: Option<i32>,
+    /// For a container with [`ContainerSpec::report_pids`] that texrun
+    /// stopped while it ran (timeout, cancellation, output limit): whether
+    /// its cgroup had refused a new process (`pids.events`). `None` if it
+    /// ended on its own (see [`Container::take_pids_report`]) or did not
+    /// report.
+    ///
+    /// Advisory, like every report from inside the container: the limit
+    /// itself is enforced by the kernel, but the processes of the command
+    /// run as the same user as the reporting shell and could interfere
+    /// with it.
+    pub pids_limit_reached: Option<bool>,
 }
 
 /// State of the container across the launcher hooks.
@@ -251,6 +340,9 @@ pub struct Container<'r> {
     runtime: &'r Runtime,
     spec: ContainerSpec,
     name: String,
+    /// Random token of the [`REPORT_PIDS`] line, so that a line of the
+    /// command's own output is not taken for it by accident.
+    nonce: String,
     state: Mutex<State>,
 }
 
@@ -270,6 +362,7 @@ impl<'r> Container<'r> {
             runtime,
             spec,
             name,
+            nonce: format!("{:016x}", random_u64()),
             state: Mutex::new(State::default()),
         }
     }
@@ -297,6 +390,40 @@ impl<'r> Container<'r> {
     /// fails with [`RunError::Unsupported`] and the container is removed.
     pub fn refusal(&self) -> Option<String> {
         self.lock().refusal.clone()
+    }
+
+    /// For a container with [`ContainerSpec::report_pids`] that ended on
+    /// its own: removes the report line from the end of the captured
+    /// `stderr` of `start --attach` and returns whether the cgroup had
+    /// refused a new process. `None` without the line (e.g. the output was
+    /// truncated, or the cgroup's `pids.events` cannot be read in the
+    /// container). Advisory, see [`ContainerOutcome::pids_limit_reached`].
+    ///
+    /// The removed bytes are also taken off
+    /// [`CapturedOutput::total_bytes`], so that it stays what the command
+    /// itself wrote. When the capture was truncated, the line was not kept
+    /// (or only part of it): then nothing is removed and the result is
+    /// `None`.
+    pub fn take_pids_report(&self, stderr: &mut CapturedOutput) -> Option<bool> {
+        if !self.spec.report_pids || stderr.is_truncated() {
+            return None;
+        }
+        let bytes = &mut stderr.bytes;
+        let start = bytes
+            .windows(PIDS_MARKER.len())
+            .rposition(|w| w == PIDS_MARKER)?;
+        let line = std::str::from_utf8(&bytes[start + PIDS_MARKER.len()..]).ok()?;
+        let (nonce, max) = line.strip_suffix('\n')?.split_once(' ')?;
+        if nonce != self.nonce || max.is_empty() || !max.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let reached = max.bytes().any(|b| b != b'0');
+        let removed = bytes.len() - start;
+        bytes.truncate(start);
+        stderr.total_bytes = stderr
+            .total_bytes
+            .saturating_sub(u64::try_from(removed).unwrap_or(u64::MAX));
+        Some(reached)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -339,8 +466,6 @@ impl<'r> Container<'r> {
 
         let mut args: Vec<OsString> = Vec::new();
         let mut push = |parts: &[&str]| args.extend(parts.iter().map(OsString::from));
-        let label = format!("{}=1", crate::LABEL);
-        let pid_label = format!("{}.pid={}", crate::LABEL, std::process::id());
         let user = format!("{}:{}", user.0, user.1);
         let memory = c.limits.memory_bytes.to_string();
         let pids = c.limits.processes.to_string();
@@ -352,10 +477,6 @@ impl<'r> Container<'r> {
             "never",
             "--name",
             &self.name,
-            "--label",
-            &label,
-            "--label",
-            &pid_label,
             "--init",
             "--network",
             "none",
@@ -383,6 +504,9 @@ impl<'r> Container<'r> {
             "--log-driver",
             "none",
         ]);
+        for label in crate::reclaim::creator_labels(Creator::current()) {
+            args.extend(["--label".into(), label.into()]);
+        }
         if self.runtime.is_rootless_podman() {
             args.extend(["--userns".into(), "keep-id".into()]);
         }
@@ -437,9 +561,18 @@ impl<'r> Container<'r> {
             args.extend(["--env".into(), pair]);
         }
 
-        // The command: [timeout --signal=KILL <s>s] [prlimit --as=S:H --]
-        // program args...
+        // The command: [sh -c REPORT_PIDS sh <nonce>] [timeout
+        // --signal=KILL <s>s] [prlimit --as=S:H --] program args...
         let mut command: Vec<OsString> = Vec::new();
+        if c.report_pids {
+            command.extend([
+                SH.into(),
+                "-c".into(),
+                REPORT_PIDS.into(),
+                "sh".into(),
+                self.nonce.clone().into(),
+            ]);
+        }
         if let Some(deadline) = c.deadline {
             let secs = deadline.as_secs().max(1);
             command.extend([
@@ -504,7 +637,14 @@ impl<'r> Container<'r> {
             return;
         }
         if state.outcome.is_none() {
-            state.outcome = self.inspect_after_exit(&id);
+            let mut outcome = self.inspect_after_exit(&id);
+            if self.spec.report_pids
+                && let Some(o) = outcome.as_mut()
+                && o.exit_code.is_none()
+            {
+                o.pids_limit_reached = self.stop_for_report(&id);
+            }
+            state.outcome = outcome;
         }
         let args: Vec<OsString> = ["rm", "--force", "--"]
             .into_iter()
@@ -516,10 +656,51 @@ impl<'r> Container<'r> {
         }
     }
 
+    /// Asks the [`REPORT_PIDS`] shell of the running container `id` to stop
+    /// (`SIGTERM`, which the init process forwards to it) and waits for its
+    /// exit status, which says whether the cgroup refused a new process.
+    /// `None` if it did not answer in time (the container is removed
+    /// anyway).
+    fn stop_for_report(&self, id: &str) -> Option<bool> {
+        let args = |parts: &[&str]| -> Vec<OsString> {
+            parts
+                .iter()
+                .copied()
+                .chain([id])
+                .map(OsString::from)
+                .collect()
+        };
+        // One deadline for both commands: at most REPORT_TIMEOUT in all.
+        let deadline = std::time::Instant::now() + REPORT_TIMEOUT;
+        self.runtime
+            .exec(&args(&["kill", "--signal", "TERM", "--"]), REPORT_TIMEOUT)
+            .ok()?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let status = self.runtime.exec(&args(&["wait", "--"]), left).ok()?;
+        match status.trim() {
+            PIDS_REACHED_EXIT => Some(true),
+            PIDS_NOT_REACHED_EXIT => Some(false),
+            _ => None,
+        }
+    }
+
     /// [`Self::inspect`], waiting a little for the OOM flag of a container
     /// whose main process was killed (exit 137): the runtime records the
     /// OOM event asynchronously and may not have done so when the
     /// container's exit is already visible.
+    ///
+    /// Only exit 137 (`128 + SIGKILL`, how the OOM killer ends the main
+    /// process) is read again. When the OOM killer stops another process of
+    /// the container instead (e.g. pdflatex under latexmk), the main
+    /// process exits later, by which time the runtime has recorded the
+    /// event: so it was in every measurement (docs/security.md §4). A
+    /// container ended by its deadline (`timeout --signal=KILL`) also exits
+    /// with 137 and is read again too, so that path waits up to
+    /// [`OOM_EVENT_POLLS`] × [`OOM_EVENT_INTERVAL`] (1 s) as well. A change
+    /// to which exit codes are read again must keep these cases in mind.
     fn inspect_after_exit(&self, id: &str) -> Option<ContainerOutcome> {
         let mut outcome = self.inspect(id);
         for _ in 0..OOM_EVENT_POLLS {
@@ -552,6 +733,7 @@ impl<'r> Container<'r> {
         Some(ContainerOutcome {
             oom_killed,
             exit_code,
+            pids_limit_reached: None,
         })
     }
 
@@ -639,7 +821,7 @@ impl Container<'_> {
             .and_then(|json| check_host_config(&json, self.runtime.kind(), &expected));
         if let Err(reason) = checked {
             let reason = format!(
-                "{} did not apply the container restrictions: {reason}",
+                "{} {RESTRICTIONS_NOT_APPLIED}: {reason}",
                 self.runtime.kind()
             );
             self.lock().refusal = Some(reason.clone());
@@ -868,6 +1050,16 @@ pub(crate) fn check_host_config(
     }
 }
 
+/// A random value (the standard library's per-process random hash keys,
+/// mixed with a counter).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
 /// Hands `dir` and everything below it to `user` (without following
 /// symlinks).
 fn chown_tree(dir: &Path, user: (u32, u32)) -> io::Result<()> {
@@ -993,6 +1185,117 @@ pub(crate) mod tests {
         let gvisor = Container::new(&rt, spec("x").with_oci_runtime(Some("runsc".to_owned())));
         let args = strings(&gvisor.create_args(&run("/bin/x", "/w"), (1, 1)).unwrap());
         assert!(args.join(" ").contains("--runtime runsc"));
+    }
+
+    #[test]
+    fn create_args_name_the_creator() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("x"));
+        let run = Spec::new("/bin/x", Cwd::Path(Path::new("/w")));
+        let joined = strings(&container.create_args(&run, (1, 1)).unwrap()).join(" ");
+        let pid = std::process::id();
+        for label in [
+            format!("--label {}=1", crate::LABEL),
+            format!("--label {}={pid}", crate::LABEL_PID),
+            format!(
+                "--label {}={}",
+                crate::LABEL_UID,
+                rustix::process::geteuid().as_raw()
+            ),
+            format!(
+                "--label {}={:016x}",
+                crate::LABEL_HOST,
+                Creator::current().unwrap().host()
+            ),
+        ] {
+            assert!(joined.contains(&label), "missing `{label}` in {joined}");
+        }
+        assert!(container.name().starts_with(&format!("texrun-{pid}-")));
+    }
+
+    #[test]
+    fn a_pids_report_runs_the_command_under_the_shell() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("img").with_report_pids(true));
+        let run = Spec::new("/usr/bin/latexmk", Cwd::Path(Path::new("/w"))).with_args(["-v"]);
+        let args = strings(&container.create_args(&run, (1, 1)).unwrap());
+        let image = args.iter().position(|a| a == "img").unwrap();
+        assert_eq!(args[image - 3..image], ["--entrypoint", SH, "--"]);
+        assert_eq!(
+            args[image + 1..image + 4],
+            ["-c".to_owned(), REPORT_PIDS.to_owned(), "sh".to_owned()]
+        );
+        assert_eq!(args[image + 4], container.nonce);
+        assert_eq!(
+            args[image + 5..],
+            [
+                "/usr/bin/timeout",
+                "--signal=KILL",
+                "90s",
+                "/usr/bin/latexmk",
+                "-v"
+            ]
+        );
+        // Without it, no shell.
+        let plain = Container::new(&rt, spec("img"));
+        let args = strings(&plain.create_args(&run, (1, 1)).unwrap());
+        assert!(!args.iter().any(|a| a == SH), "{args:?}");
+    }
+
+    #[test]
+    fn the_pids_report_is_taken_from_the_end_of_stderr() {
+        let rt = runtime();
+        let container = Container::new(&rt, spec("x").with_report_pids(true));
+        let nonce = container.nonce.clone();
+        let report = |text: &str| -> (Option<bool>, String) {
+            let mut out = captured(text);
+            let reached = container.take_pids_report(&mut out);
+            // `total_bytes` stays what the command wrote.
+            assert!(!out.is_truncated(), "{text:?}");
+            assert_eq!(out.total_bytes, out.bytes.len() as u64, "{text:?}");
+            (reached, String::from_utf8(out.bytes).unwrap())
+        };
+        assert_eq!(
+            report(&format!("out\n\ntexrun-sandbox-pids {nonce} 0\n")),
+            (Some(false), "out\n".to_owned())
+        );
+        assert_eq!(
+            report(&format!("out\ntexrun-sandbox-pids {nonce} 15\n")),
+            (Some(true), "out".to_owned())
+        );
+        assert_eq!(
+            report(&format!("\ntexrun-sandbox-pids {nonce} 2\n")),
+            (Some(true), String::new())
+        );
+        // Another nonce, a line that is not the last, a malformed count:
+        // left as they are.
+        for text in [
+            "x\ntexrun-sandbox-pids 0000000000000000 1\n".to_owned(),
+            format!("\ntexrun-sandbox-pids {nonce} 1\nmore\n"),
+            format!("\ntexrun-sandbox-pids {nonce} -1\n"),
+            format!("\ntexrun-sandbox-pids {nonce} \n"),
+            format!("\ntexrun-sandbox-pids {nonce} 1"),
+            "no report".to_owned(),
+        ] {
+            assert_eq!(report(&text), (None, text.clone()), "{text:?}");
+        }
+        // Only for a container that reports.
+        let plain = Container::new(&rt, spec("x"));
+        let mut out = captured(&format!("\ntexrun-sandbox-pids {} 1\n", plain.nonce));
+        assert_eq!(plain.take_pids_report(&mut out), None);
+        // A truncated capture: the line is not trusted, nothing is removed.
+        let line = format!("\ntexrun-sandbox-pids {nonce} 1\n");
+        let mut out = captured(&line);
+        out.total_bytes += 100;
+        assert_eq!(container.take_pids_report(&mut out), None);
+        assert_eq!(out.bytes, line.as_bytes());
+    }
+
+    fn captured(text: &str) -> CapturedOutput {
+        let mut out = CapturedOutput::default();
+        out.bytes = text.as_bytes().to_vec();
+        out.total_bytes = out.bytes.len() as u64;
+        out
     }
 
     #[test]
@@ -1126,7 +1429,9 @@ case "$1" in
     if [ -e "$here/create-fails" ]; then exit 1; fi
     echo "WARNING: this kernel does not support a limit" >&2; echo fake-id ;;
   inspect)
-    if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json"; else echo "false false 0"; fi ;;
+    if [ "$3" = "{{json .HostConfig}}" ]; then cat "$here/hostconfig.json";
+    elif [ -e "$here/running" ]; then echo "false true 0"; else echo "false false 0"; fi ;;
+  wait) cat "$here/wait-status" ;;
 esac
 "#,
         )
@@ -1180,7 +1485,7 @@ esac
         // Removed, never started.
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.contains("rm --force -- fake-id"), "{calls}");
-        assert!(!calls.contains("start"), "{calls}");
+        assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
     }
 
     #[test]
@@ -1208,5 +1513,37 @@ esac
             calls.contains(&format!("rm --force -- {}", container.name())),
             "{calls}"
         );
+    }
+
+    #[test]
+    fn a_reporting_container_stopped_by_texrun_says_whether_its_pids_limit_was_reached() {
+        for (status, expected) in [("90\n", Some(true)), ("91\n", Some(false)), ("143\n", None)] {
+            let dir = tempfile::tempdir().unwrap();
+            let rt = fake_runtime(dir.path(), &host_config(4096));
+            let container = Container::new(&rt, unmounted().with_report_pids(true));
+            container.command(&limited_run()).unwrap();
+            // Still running when the supervisor kills the run.
+            std::fs::write(dir.path().join("running"), "").unwrap();
+            std::fs::write(dir.path().join("wait-status"), status).unwrap();
+            container.on_kill(1);
+            let outcome = container.outcome().unwrap();
+            assert_eq!(outcome.pids_limit_reached, expected, "{status}");
+            let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+            let kill = calls.find("kill --signal TERM -- fake-id").expect(&calls);
+            let wait = calls.find("wait -- fake-id").expect(&calls);
+            let rm = calls.find("rm --force -- fake-id").expect(&calls);
+            assert!(kill < wait && wait < rm, "{calls}");
+        }
+
+        // A container that ended on its own is not signalled.
+        let dir = tempfile::tempdir().unwrap();
+        let rt = fake_runtime(dir.path(), &host_config(4096));
+        let container = Container::new(&rt, unmounted().with_report_pids(true));
+        container.command(&limited_run()).unwrap();
+        container.on_reaped(1);
+        assert_eq!(container.outcome().unwrap().pids_limit_reached, None);
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(!calls.contains("kill --signal"), "{calls}");
+        assert!(calls.contains("rm --force -- fake-id"), "{calls}");
     }
 }

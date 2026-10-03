@@ -56,8 +56,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// own (timeout, cancellation, a failed check), the whole session is removed
 /// ([`Session::stop`]) and later runs fail. Dropping the session removes
 /// the container too; if texrun is killed, the main process ends after
-/// the lifetime and the stopped container is left (found by its
-/// [label](crate::LABEL)).
+/// the lifetime and the stopped container is left until a later texrun
+/// removes it ([`Runtime::reclaim_left_containers`]).
 #[derive(Debug)]
 pub struct Session<'r> {
     container: Container<'r>,
@@ -353,7 +353,7 @@ mod tests {
         );
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.contains("rm --force -- fake-id"), "{calls}");
-        assert!(!calls.contains("start"), "{calls}");
+        assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
     }
 
     #[test]

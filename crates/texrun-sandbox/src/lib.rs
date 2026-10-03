@@ -48,7 +48,8 @@
 //! still running; [`Launcher::on_reaped`](texrun_process::Launcher::on_reaped)
 //! and dropping the [`Container`] remove it again if that failed, so a
 //! created container is removed on every path through texrun. Containers
-//! left by a texrun process that was killed can be found by their label.
+//! left by a texrun process that was killed are found by their labels and
+//! removed by a later texrun ([`Runtime::reclaim_left_containers`], #49).
 //!
 //! The runtime CLI itself (the `docker` / `podman` binary, trusted like TeX
 //! Live on the host) is always started by path with an argument array and
@@ -67,14 +68,18 @@ compile_error!("texrun-sandbox supports Unix hosts only");
 
 mod container;
 mod error;
+mod owner;
+mod reclaim;
 mod runtime;
 mod session;
 
 pub use container::{
     Container, ContainerLimits, ContainerOutcome, ContainerSpec, ContainerUser, Mount,
-    ROOT_FALLBACK_ID,
+    RESTRICTIONS_NOT_APPLIED, ROOT_FALLBACK_ID,
 };
 pub use error::SandboxError;
+pub use owner::Creator;
+pub use reclaim::{LABEL_HOST, LABEL_PID, LABEL_STARTED, LABEL_UID};
 pub use runtime::{Image, RUNTIME_ENV, Runtime, RuntimeKind};
 pub use session::Session;
 

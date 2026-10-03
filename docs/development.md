@@ -213,7 +213,8 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 - `crates/texrun-preview/tests/real_tools.rs` も `TEXRUN_TEST_BACKEND=container` で `Previewer::in_container` を使い、engine image の MuPDF / Poppler で同じ test を全て実行する。
 - `TEXRUN_SANDBOX_IMAGE` で image を変えられる（test の既定は、上で build する `texrun-engine:latest`。texrun 自身の既定の `ghcr.io/nishide-dev/texrun-engine:<version>` ではない）。CI の `sandbox` job は `texrun-engine:ci` を build して使う。どちらも label を付けないので、`engine.version` は `image without a version label` になる（CI はこの image に version label が無いことも確認する）。label の有無による違いは、`texrun-sandbox` の test が空の image を `import` して確かめる。
 - runtime や image が無い環境（dev コンテナ、`test (macos)`、image を build していない `test (linux)`）では、これらの test は `SKIPPED` を出して何もしない。CI の `sandbox` job は `TEXRUN_REQUIRE_SANDBOX=1` で実行し、最後に label `org.texrun.sandbox` の container が残っていないことも確認する。
-- texrun が強制終了された場合などに残った container は、`docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる。container 内の `timeout` により、残っても compile の timeout + 45 秒で終了する。
+- texrun が強制終了された場合などに残った container は、container 内の `timeout`（preview は `sleep`）で止まった後、次に container backend を使う texrun が消す（同じ user・host の、終わった texrun のものだけ。[security.md](security.md) §4「container のライフサイクル」）。それより前に消したい場合は `docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる。test を途中で止めた場合も同じである。
+- host の識別子が変わった後（Linux の再起動、macOS の host 名の変更、使い捨ての container の中で texrun を動かした場合など）は、それ以前の container と temp dir の `texrun-preview-*` は自動では回収されないので、同じ方法で手で消す（#56）。
 
 ### engine image の公開
 

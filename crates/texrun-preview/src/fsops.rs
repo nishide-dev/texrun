@@ -17,6 +17,7 @@ use std::path::Path;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use texrun_core::WorkspacePath;
+use texrun_sandbox::Creator;
 
 /// A directory without following a final symlink.
 const DIR_FLAGS: OFlags = OFlags::RDONLY
@@ -207,6 +208,13 @@ pub(crate) fn copy_in(source: &Path, dir: &OwnedFd, name: &str) -> io::Result<u6
 /// create a few levels of caches in their `HOME`.
 const MAX_REMOVE_DEPTH: usize = 32;
 
+/// Most entries [`remove_tree`] visits in one tree. A scratch directory
+/// holds a few files per page; a tool that was compromised could have
+/// filled it with many more, and removing them must not hold up a preview
+/// (or texrun's exit) for long. What is left is removed by a later run
+/// ([`reclaim_scratch_dirs`]).
+const MAX_REMOVE_ENTRIES: usize = 100_000;
+
 /// A private directory created below a held parent directory with `mkdirat`
 /// and opened with `O_NOFOLLOW`, removed (through the descriptors) when
 /// dropped.
@@ -219,13 +227,18 @@ pub(crate) struct ScratchDir {
 }
 
 impl ScratchDir {
-    /// Creates `<parent>/<prefix><random>` (mode 0700) through the held
-    /// directory `parent`, whose path is `parent_path` (only used to build
-    /// [`ScratchDir::path`]). A name that exists already (whatever it is) is
-    /// never reused.
+    /// Creates `<parent>/<prefix><creator>-<random>` (mode 0700) through the
+    /// held directory `parent`, whose path is `parent_path` (only used to
+    /// build [`ScratchDir::path`]). `<creator>` names this texrun process
+    /// ([`Creator::tag`]), so that a later texrun can reclaim the directory
+    /// if this one is killed ([`reclaim_scratch_dirs`]); without it (the
+    /// host cannot be identified) the name is `<prefix><random>`. A name
+    /// that exists already (whatever it is) is never reused.
     pub(crate) fn create(parent: OwnedFd, parent_path: &Path, prefix: &str) -> io::Result<Self> {
+        let creator = Creator::current().map(|c| format!("{}-", c.tag()));
+        let creator = creator.as_deref().unwrap_or("");
         for _ in 0..64 {
-            let name = format!("{prefix}{:016x}", random_u64());
+            let name = format!("{prefix}{creator}{:016x}", random_u64());
             match rustix::fs::mkdirat(&parent, name.as_str(), Mode::from_raw_mode(0o700)) {
                 Ok(()) => {}
                 Err(Errno::EXIST) => continue,
@@ -271,9 +284,71 @@ impl ScratchDir {
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         if let Ok(name) = std::ffi::CString::new(self.name.as_str()) {
-            remove_tree(&self.parent, &name, 0);
+            remove_tree(&self.parent, &name);
         }
     }
+}
+
+/// Removes the scratch directories `<prefix><creator>-<random>` in the held
+/// directory `parent` that texrun processes killed before they could remove
+/// them left behind (#49); returns how many were removed.
+///
+/// An entry is removed only if all of these hold:
+///
+/// - its name is exactly that of a [`ScratchDir::create`] with `prefix`
+///   (older names without a creator are kept);
+/// - it is a directory (`fstatat` without following a symlink) of the
+///   effective uid of this process, with no permissions for others (mode
+///   0700, as created);
+/// - its creator is gone ([`Creator::is_gone`]: same host, and no process
+///   with its PID and start time).
+///
+/// It is removed with everything in it (a copy of the PDF and the tools'
+/// partial output: nothing that is kept elsewhere), up to
+/// [`MAX_REMOVE_ENTRIES`] entries per directory (the rest is left for a
+/// later run), through descriptors: `unlinkat` / `openat(O_NOFOLLOW)`
+/// below the held `parent`, never following a symlink.
+pub(crate) fn reclaim_scratch_dirs(parent: &OwnedFd, prefix: &str) -> usize {
+    let euid = rustix::process::geteuid().as_raw();
+    let Ok(mut entries) = rustix::fs::Dir::read_from(parent) else {
+        return 0;
+    };
+    let mut names = Vec::new();
+    while let Some(Ok(entry)) = entries.read() {
+        let name = entry.file_name();
+        if name.to_bytes().starts_with(prefix.as_bytes()) {
+            names.push(name.to_owned());
+        }
+    }
+    let mut removed = 0;
+    for name in names {
+        let Some(creator) = name
+            .to_str()
+            .ok()
+            .and_then(|n| n.strip_prefix(prefix))
+            .and_then(Creator::parse_tag)
+            .filter(|(_, random)| {
+                random.len() == 16 && random.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .map(|(creator, _)| creator)
+        else {
+            continue;
+        };
+        let Ok(st) = rustix::fs::statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        let private_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory
+            && st.st_uid == euid
+            && (Mode::from_raw_mode(st.st_mode) & (Mode::RWXG | Mode::RWXO)).is_empty();
+        if !private_dir || !creator.is_gone() {
+            continue;
+        }
+        remove_tree(parent, &name);
+        if rustix::fs::statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW).is_err() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// A random value for a directory name (the standard library's per-process
@@ -288,9 +363,21 @@ fn random_u64() -> u64 {
 }
 
 /// Removes `name` in `dir` and, if it is a directory, everything below it,
-/// best effort. Symlinks are removed, never followed; directories are
-/// opened with `O_NOFOLLOW` below the held descriptor.
-fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize) {
+/// best effort, visiting at most [`MAX_REMOVE_ENTRIES`] entries (a larger
+/// tree is left partly removed, for a later run). Symlinks are removed,
+/// never followed; directories are opened with `O_NOFOLLOW` below the held
+/// descriptor.
+fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr) {
+    let mut budget = MAX_REMOVE_ENTRIES;
+    remove_tree_within(dir, name, 0, &mut budget);
+}
+
+/// [`remove_tree`] at `depth`, with `budget` entries left to visit.
+fn remove_tree_within(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
     if rustix::fs::unlinkat(dir, name, AtFlags::empty()).is_ok() {
         return;
     }
@@ -300,13 +387,16 @@ fn remove_tree(dir: &OwnedFd, name: &std::ffi::CStr, depth: usize) {
     {
         let mut names = Vec::new();
         while let Some(Ok(entry)) = entries.read() {
+            if names.len() >= *budget {
+                break;
+            }
             let entry_name = entry.file_name();
             if !matches!(entry_name.to_bytes(), b"." | b"..") {
                 names.push(entry_name.to_owned());
             }
         }
         for n in names {
-            remove_tree(&sub, &n, depth + 1);
+            remove_tree_within(&sub, &n, depth + 1, budget);
         }
     }
     let _ = rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR);
@@ -498,6 +588,108 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, ["page-001.png"]);
+    }
+
+    #[test]
+    fn scratch_dirs_name_their_creator() {
+        let root = tempfile::tempdir().unwrap();
+        let a = ScratchDir::create(open_dir(root.path()).unwrap(), root.path(), "p-").unwrap();
+        let name = a.path().file_name().unwrap().to_str().unwrap().to_owned();
+        let (creator, random) = Creator::parse_tag(name.strip_prefix("p-").unwrap()).unwrap();
+        assert_eq!(Some(creator), Creator::current());
+        assert_eq!(random.len(), 16);
+        // Ours, and we are alive: kept.
+        assert_eq!(
+            reclaim_scratch_dirs(&open_dir(root.path()).unwrap(), "p-"),
+            0
+        );
+        assert!(a.path().is_dir());
+    }
+
+    #[test]
+    fn only_private_scratch_dirs_of_gone_creators_are_reclaimed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let me = Creator::current().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let gone = Creator::new(pid, None, me.host()).tag();
+        let elsewhere = Creator::new(pid, None, me.host() ^ 1).tag();
+        let random = "0123456789abcdef";
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), b"x").unwrap();
+        let private = |name: &str| {
+            let dir = root.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        };
+
+        // Left behind, with content (and a symlink out, which is removed,
+        // not followed).
+        let left = private(&format!("p-{gone}-{random}"));
+        fs::create_dir_all(left.join("work/sub")).unwrap();
+        fs::write(left.join("work/sub/page.png"), b"png").unwrap();
+        symlink(outside.path(), left.join("home")).unwrap();
+        // Kept: a live creator, another host, another prefix, an old name,
+        // a malformed random part, readable by others, a symlink, a file.
+        let kept = [
+            private(&format!("p-{}-{random}", me.tag())),
+            private(&format!("p-{elsewhere}-{random}")),
+            private(&format!("q-{gone}-{random}")),
+            private(&format!("p-{random}")),
+            private(&format!("p-{gone}-{random}0")),
+            private(&format!("p-{gone}-0123456789abcdeX")),
+        ];
+        let shared = root.path().join(format!("p-{gone}-1111111111111111"));
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join(format!("p-{gone}-2222222222222222"));
+        symlink(outside.path(), &link).unwrap();
+        let file = root.path().join(format!("p-{gone}-3333333333333333"));
+        fs::write(&file, b"").unwrap();
+
+        assert_eq!(
+            reclaim_scratch_dirs(&open_dir(root.path()).unwrap(), "p-"),
+            1
+        );
+        assert!(!left.exists());
+        for dir in kept.iter().chain([&shared]) {
+            assert!(dir.is_dir(), "{}", dir.display());
+        }
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(file.is_file());
+        assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn removal_visits_a_bounded_number_of_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("t");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        for i in 0..10 {
+            fs::write(tree.join(format!("f{i}")), b"").unwrap();
+            fs::write(tree.join(format!("sub/g{i}")), b"").unwrap();
+        }
+        let fd = open_dir(root.path()).unwrap();
+        let name = std::ffi::CString::new("t").unwrap();
+        let mut budget = 5;
+        remove_tree_within(&fd, &name, 0, &mut budget);
+        assert_eq!(budget, 0);
+        // Partly removed, the rest left for later.
+        assert!(tree.is_dir());
+        let left = fs::read_dir(&tree).unwrap().count();
+        assert!((1..=11).contains(&left), "{left}");
+        remove_tree(&fd, &name);
+        assert!(!tree.exists());
     }
 
     #[test]

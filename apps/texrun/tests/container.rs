@@ -230,3 +230,185 @@ fn previews_are_rendered_in_the_container() {
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{page}");
     }
 }
+
+/// Runs the container runtime CLI with `args` and returns its stdout
+/// (empty if it fails).
+fn runtime(args: &[&str]) -> String {
+    let dir = runtime_dir();
+    let program = if dir.join("docker").is_file() {
+        dir.join("docker")
+    } else {
+        dir.join("podman")
+    };
+    let out = Command::new(program).args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The IDs of the containers created by the texrun process `pid`, with
+/// `status` (`running`, `exited`, ...) if given.
+fn containers_of(pid: u32, status: Option<&str>) -> Vec<String> {
+    let label = format!("label=org.texrun.sandbox.pid={pid}");
+    let status = status.map(|s| format!("status={s}"));
+    let mut args = vec!["ps", "--all", "--quiet", "--no-trunc", "--filter", &label];
+    if let Some(status) = &status {
+        args.extend(["--filter", status]);
+    }
+    runtime(&args)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Waits (at most 60 s) until `ready` returns something.
+fn wait_for<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(value) = ready() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `texrun compile --json --backend container <args> main.tex` in `dir` as
+/// a child process, with `TMPDIR` set to `tmp`.
+fn spawn_compile(dir: &Path, tmp: &Path, args: &[&str]) -> std::process::Child {
+    let image = common::sandbox_image();
+    Command::new(env!("CARGO_BIN_EXE_texrun"))
+        .args([
+            "compile",
+            "--json",
+            "--backend",
+            "container",
+            "--container-image",
+            &image,
+        ])
+        .args(args)
+        .arg("main.tex")
+        .env("TMPDIR", tmp)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// A directory for texrun's `TMPDIR`, below the system temporary directory
+/// (which the runtime's VM shares on macOS).
+fn private_tmp() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("texrun-it-tmp-")
+        .tempdir()
+        .unwrap()
+}
+
+/// The `texrun-preview-*` scratch directories in `tmp`.
+fn scratch_dirs(tmp: &Path) -> Vec<String> {
+    fs::read_dir(tmp)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("texrun-preview-"))
+        .collect()
+}
+
+const TRIVIAL: &str = "\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n";
+
+/// texrun is killed (`SIGKILL`) during a compile: its container is left.
+/// The next texrun keeps it while it runs and removes it once it stopped.
+#[test]
+fn a_container_left_by_a_killed_run_is_reclaimed_once_it_stopped() {
+    common::require_sandbox!();
+    let tmp = private_tmp();
+    let looping = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\def\\x{\\x}\\x\n\\end{document}\n",
+    )]);
+    let mut killed = spawn_compile(
+        looping.path(),
+        tmp.path(),
+        &["--no-preview", "--timeout", "60s"],
+    );
+    let pid = killed.id();
+    // The compile's container (not the probe's, which ends at once): the
+    // same one running for a while.
+    let left = wait_for("the compile container", || {
+        let first = containers_of(pid, Some("running"));
+        std::thread::sleep(Duration::from_millis(500));
+        let second = containers_of(pid, Some("running"));
+        (first.len() == 1 && first == second).then(|| first[0].clone())
+    });
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+
+    // Still running (its deadline is far): the next run keeps it.
+    let other = project(&[("main.tex", TRIVIAL)]);
+    let (code, doc, stderr) = compile(other.path(), &["main.tex"]);
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    assert_eq!(
+        containers_of(pid, Some("running")),
+        std::slice::from_ref(&left)
+    );
+
+    // Stopped (as by its deadline): the next run removes it.
+    runtime(&["kill", "--", &left]);
+    // (The texrun of another test may remove it as soon as it stopped.)
+    wait_for("the container to stop", || {
+        containers_of(pid, Some("running")).is_empty().then_some(())
+    });
+    let (code, doc, stderr) = compile(other.path(), &["main.tex"]);
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    assert!(containers_of(pid, None).is_empty(), "{left} was kept");
+}
+
+/// texrun is killed during the preview: its session container and its
+/// scratch directory are left. The next texrun removes both (the
+/// container once it stopped).
+#[test]
+fn a_preview_left_by_a_killed_run_is_reclaimed() {
+    common::require_sandbox!();
+    let tmp = private_tmp();
+    // Enough pages that the preview runs for seconds.
+    let many = project(&[(
+        "main.tex",
+        "\\documentclass{article}\n\\begin{document}\n\\count1=0\n\
+         \\loop\\advance\\count1 by 1 Page \\the\\count1.\\newpage\\ifnum\\count1<200\\repeat\n\
+         \\end{document}\n",
+    )]);
+    let mut killed = spawn_compile(many.path(), tmp.path(), &["--pages", "1-200"]);
+    let pid = killed.id();
+    // Kill it once its preview container runs (its scratch directory is
+    // made before the container); the compile's container is gone by then.
+    let scratch = wait_for("the preview scratch directory", || {
+        scratch_dirs(tmp.path()).first().cloned()
+    });
+    let session = wait_for("the preview container", || {
+        let running = containers_of(pid, Some("running"));
+        (running.len() == 1).then(|| running[0].clone())
+    });
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    assert!(tmp.path().join(&scratch).is_dir(), "{scratch}");
+    assert_eq!(containers_of(pid, None), std::slice::from_ref(&session));
+
+    // The session container stops after its lifetime; stop it now.
+    runtime(&["kill", "--", &session]);
+    wait_for("the container to stop", || {
+        containers_of(pid, Some("running")).is_empty().then_some(())
+    });
+
+    let other = project(&[("main.tex", TRIVIAL)]);
+    let out = spawn_compile(other.path(), tmp.path(), &[])
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        other
+            .path()
+            .join("texrun-out/preview/page-001.png")
+            .is_file(),
+        "the next run rendered its own preview"
+    );
+    assert!(containers_of(pid, None).is_empty(), "{session} was kept");
+    assert_eq!(scratch_dirs(tmp.path()), Vec::<String>::new());
+}
