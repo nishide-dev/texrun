@@ -515,7 +515,7 @@ mod tests {
         let hint = refused.hint.unwrap();
         assert!(hint.contains("swap accounting"), "{hint}");
         let missing = ErrorInfo::from_engine(Stage::Probe, &unavailable("no image"));
-        assert!(missing.hint.unwrap().contains("docker build"));
+        assert!(missing.hint.unwrap().contains("docker pull"));
     }
 
     #[test]
