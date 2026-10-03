@@ -82,5 +82,7 @@ pub use process::{CapturedOutput, Limits};
 /// For [`LatexmkConfig::with_exec_gate`] and [`LatexmkConfig::with_cgroups`]
 /// (from `texrun-process`).
 pub use texrun_process::{Cgroups, ExecGate};
+/// The default of [`ContainerConfig::image`] (from `texrun-sandbox`).
+pub use texrun_sandbox::DEFAULT_IMAGE as DEFAULT_CONTAINER_IMAGE;
 /// For [`ContainerConfig::with_runtime`] (from `texrun-sandbox`).
 pub use texrun_sandbox::RuntimeKind;

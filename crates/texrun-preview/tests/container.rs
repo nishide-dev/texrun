@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use texrun_preview::{NoticeKind, PreviewContainer, PreviewOptions, PreviewStatus, Previewer};
-use texrun_sandbox::{DEFAULT_IMAGE, LABEL, Runtime};
+use texrun_sandbox::{LABEL, Runtime};
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
 const IMAGE_ENV: &str = "TEXRUN_SANDBOX_IMAGE";
@@ -26,7 +26,7 @@ fn sandbox() -> Option<&'static (Runtime, String)> {
         let image = std::env::var(IMAGE_ENV)
             .ok()
             .filter(|i| !i.is_empty())
-            .unwrap_or_else(|| DEFAULT_IMAGE.to_owned());
+            .unwrap_or_else(|| "texrun-engine:latest".to_owned());
         let runtime = Runtime::detect(None).map_err(|e| e.to_string())?;
         let id = runtime.image_id(&image).map_err(|e| e.to_string())?;
         Ok((runtime, id))

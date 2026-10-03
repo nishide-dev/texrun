@@ -289,11 +289,13 @@ impl ErrorInfo {
             EngineError::Unavailable { engine, .. }
                 if engine == texrun_texlive::CONTAINER_ENGINE_NAME =>
             {
-                info.with_hint(
-                    "--backend container needs Docker (or Podman) and the engine image: build it \
-                     with `docker build -t texrun-engine:latest docker/engine` in the texrun \
-                     repository, or pass --container-image",
-                )
+                info.with_hint(format!(
+                    "--backend container needs Docker (or Podman) and the engine image, which \
+                     texrun never pulls: pull the image of this version with `docker pull {}` \
+                     (or build it from docker/engine in the texrun repository), or pass \
+                     --container-image",
+                    texrun_texlive::DEFAULT_CONTAINER_IMAGE
+                ))
             }
             EngineError::Unavailable { .. } => info.with_hint(
                 "install TeX Live with latexmk and make sure `latexmk` is on PATH, or use the \

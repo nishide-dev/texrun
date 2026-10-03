@@ -1,0 +1,523 @@
+name: Engine image
+
+# Publishes the engine image of the container backend
+# (docker/engine/Dockerfile, docs/security.md §4) to GHCR for every release,
+# so that `texrun compile --backend container` works without cloning the
+# repository (#48):
+#
+#   ghcr.io/nishide-dev/texrun-engine:<version>   (linux/amd64, linux/arm64)
+#
+# <version> is the texrun version (Cargo.toml `workspace.package.version`,
+# without the `v` of the tag); it is the default image of that texrun
+# (texrun_sandbox::DEFAULT_IMAGE) and the image's
+# `org.opencontainers.image.version` label, which texrun reports in
+# `engine.version`. Each version is pushed once: the tag is never
+# overwritten, so a digest users pinned stays the one of that version.
+#
+# Jobs:
+# - version: the version, and whether this run publishes (a `v*` tag of a
+#   commit on main whose version is the workspace version).
+# - verify (amd64 and arm64, each on a native runner): builds the image,
+#   runs the container backend tests against it, and records its layers
+#   and Debian packages.
+# - build (dry run, when not publishing): the multi-arch build of publish,
+#   with SBOM and provenance, written to an archive instead of a registry.
+# - sources: downloads the Debian source packages of the image at the
+#   installed versions (the corresponding source of its GPL / AGPL
+#   programs).
+# - publish (after verify and sources): pushes the multi-arch image by
+#   digest, checks that each platform has exactly the layers verify tested,
+#   then attests and tags it.
+# - release: attaches the sources to the GitHub release of the tag.
+#
+# Triggers: a `v*` tag push publishes. Pull requests (engine image, this
+# workflow or its script changed) and workflow_dispatch with `publish` off
+# (the default) run everything except publish and release. workflow_dispatch
+# with `publish` on publishes when run on a `v*` tag (e.g. to retry a failed
+# publish) and fails on any other ref.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - docker/engine/**
+      - .github/workflows/engine-image.yml
+      - .github/scripts/fetch-engine-sources.sh
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the image to GHCR (only when run on a v* tag); off = dry run
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One run per PR or ref: a tag push and a manual publish of the same tag
+# run one after the other, so the second stops at the overwrite check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only cancel superseded PR runs; a publish always completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/nishide-dev/texrun-engine
+  PLATFORMS: linux/amd64,linux/arm64
+  # QEMU for the arm64 part of the multi-arch build on the amd64 runner.
+  # Pinned by digest; not updated by Dependabot, bump it manually.
+  BINFMT_IMAGE: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # For the ancestry check below.
+          fetch-depth: 0
+      # Only a v* tag of a commit on main whose version is the workspace
+      # version is published.
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "${PUBLISH}" != "true" ]; then
+            echo "dry run of version ${cargo_version}"
+            { echo "version=${cargo_version}"; echo "publish=false"; } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::error::images are only published from a v* tag (this run is on ${GITHUB_REF})"
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not v<semver>"
+            exit 1
+          fi
+          if [ "${version}" != "${cargo_version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version ${cargo_version} (Cargo.toml)"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not a commit on main"
+            exit 1
+          fi
+          { echo "version=${version}"; echo "publish=true"; } >> "${GITHUB_OUTPUT}"
+
+  # The image of each platform, built natively and tested before anything
+  # is pushed. No write permissions: the tests build and run the
+  # workspace's crates. (On PRs the amd64 part repeats ci.yml's `sandbox`
+  # job; it only runs when the engine image or this workflow changes.)
+  verify:
+    name: verify (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      TEXRUN_SANDBOX_IMAGE: texrun-engine:verify
+      TEXRUN_REQUIRE_SANDBOX: "1"
+      VERSION: ${{ needs.version.outputs.version }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # A release is built afresh (current packages), not from main's cache;
+      # its layers are cached for publish, which reuses them.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/engine
+          file: docker/engine/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ env.TEXRUN_SANDBOX_IMAGE }}
+          load: true
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+          cache-from: ${{ env.PUBLISH != 'true' && matrix.arch == 'amd64' && 'type=gha,scope=texrun-engine' || '' }}
+          cache-to: ${{ env.PUBLISH == 'true' && format('type=gha,scope=texrun-engine-release-{0},mode=max', matrix.arch) || '' }}
+      # What publish compares the pushed image with (its layers) and what
+      # the source packages are fetched for.
+      - name: Record layers and packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/verify"
+          docker image inspect --format '{{json .RootFS.Layers}}' "${TEXRUN_SANDBOX_IMAGE}" \
+            | jq -c . > "${RUNNER_TEMP}/verify/layers-${{ matrix.arch }}.json"
+          docker run --rm --network none --entrypoint /usr/bin/dpkg-query "${TEXRUN_SANDBOX_IMAGE}" \
+            -W -f '${source:Package} ${source:Version}\n' | sort -u > "${RUNNER_TEMP}/verify/packages-${{ matrix.arch }}.txt"
+          cat "${RUNNER_TEMP}/verify/layers-${{ matrix.arch }}.json"
+          wc -l "${RUNNER_TEMP}/verify/packages-${{ matrix.arch }}.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verify-${{ matrix.arch }}
+          path: ${{ runner.temp }}/verify
+          retention-days: 7
+          if-no-files-found: error
+      # rustup comes with both runner images (as in ci.yml); no installer is
+      # downloaded here. The toolchain is the one rust-toolchain.toml pins.
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      # The same tests as ci.yml's `sandbox` job.
+      - name: Run container backend tests
+        shell: bash
+        env:
+          TEXRUN_REQUIRE_TEXLIVE: "1"
+          TEXRUN_TEST_BACKEND: container
+        run: |
+          set -o pipefail
+          log="${RUNNER_TEMP}/sandbox.log"
+          cargo test --locked --all-features -p texrun-sandbox 2>&1 | tee "${log}"
+          cargo test --locked --all-features -p texrun-texlive \
+            --test container --test scenarios --test security 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun-preview \
+            --test container --test real_tools 2>&1 | tee -a "${log}"
+          cargo test --locked --all-features -p texrun --test container 2>&1 | tee -a "${log}"
+          if grep -E 'test result: .* [1-9][0-9]* ignored' "${log}"; then
+            echo "::error::Some tests are #[ignore]d and never run in CI"
+            exit 1
+          fi
+      # texrun of this version uses the image by default once it has the
+      # published name, and reports it as its own (`engine.version`).
+      - name: Check engine.version
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "${TEXRUN_SANDBOX_IMAGE}" "${IMAGE}:${VERSION}"
+          dir="$(mktemp -d)"
+          printf '%s\n' '\documentclass{article}' '\begin{document}' 'x' '\end{document}' > "${dir}/main.tex"
+          cargo run --locked -q -p texrun -- compile --json --backend container "${dir}/main.tex" > "${dir}/result.json"
+          jq -r '.engine.version' "${dir}/result.json"
+          jq -e --arg v "image version ${VERSION})" '.texrun_exit_code == 0 and .preview.status == "rendered" and (.engine.version | endswith($v))' "${dir}/result.json" >/dev/null \
+            || { cat "${dir}/result.json"; echo "::error::the compile did not succeed with previews, or engine.version does not report image version ${VERSION}"; exit 1; }
+      - name: No containers left behind
+        run: |
+          left="$(docker ps --all --quiet --filter label=org.texrun.sandbox)"
+          if [ -n "${left}" ]; then
+            docker ps --all --filter label=org.texrun.sandbox
+            echo "::error::texrun left containers behind"
+            exit 1
+          fi
+
+  # Multi-arch build without pushing: the image is written to an OCI
+  # archive on the runner, and the archive is checked to contain both
+  # platforms with their SBOM / provenance attestations.
+  build:
+    name: build (dry run)
+    needs: version
+    if: needs.version.outputs.publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The amd64 layers come from the cache of ci.yml's `sandbox` job.
+      - name: Build (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/engine
+          file: docker/engine/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/engine-image.tar
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=texrun-engine
+      - name: Check platforms and attestations
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/engine-image.tar"
+          blob() { tar -xOf "${archive}" "blobs/sha256/${1#sha256:}"; }
+          index="$(tar -xOf "${archive}" index.json | jq -r '.manifests[0].digest')"
+          manifests="$(blob "${index}" | jq -c '.manifests[]')"
+          echo "${manifests}" | jq -r '[.platform.os, .platform.architecture, (.annotations["vnd.docker.reference.type"] // "image")] | join(" ")'
+          for arch in amd64 arm64; do
+            image="$(echo "${manifests}" | jq -r --arg a "${arch}" 'select(.platform.architecture == $a and .platform.os == "linux") | .digest')"
+            [ -n "${image}" ] || { echo "::error::no linux/${arch} image"; exit 1; }
+            attestation="$(echo "${manifests}" | jq -r --arg d "${image}" \
+              'select(.annotations["vnd.docker.reference.type"] == "attestation-manifest" and .annotations["vnd.docker.reference.digest"] == $d) | .digest')"
+            [ -n "${attestation}" ] || { echo "::error::no attestations for linux/${arch}"; exit 1; }
+            types="$(blob "${attestation}" | jq -r '.layers[].annotations["in-toto.io/predicate-type"]')"
+            echo "linux/${arch}: ${types//$'\n'/, }"
+            for type in https://spdx.dev/Document https://slsa.dev/provenance/v1; do
+              grep -qxF "${type}" <<< "${types}" || { echo "::error::no ${type} attestation for linux/${arch}"; exit 1; }
+            done
+          done
+          du -h "${archive}"
+
+  # Waits for sources too: a version whose source cannot be fetched and
+  # checked is not published.
+  publish:
+    name: publish
+    needs: [version, verify, sources]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Push to GHCR.
+      packages: write
+      # Signed artifact attestation (Sigstore) of the pushed image.
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Continues only if the registry says the tag does not exist; any
+      # other error (network, authentication, rate limit) stops the publish
+      # instead of risking an overwrite. Run again just before tagging.
+      - name: Refuse to overwrite a published version
+        id: absent
+        shell: bash
+        run: |
+          set -uo pipefail
+          cat > "${RUNNER_TEMP}/check-absent.sh" <<'EOF'
+          if out="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>&1)"; then
+            echo "::error::${IMAGE}:${VERSION} already exists; published versions are not overwritten"
+            exit 1
+          elif ! grep -qiE 'not found|manifest unknown|name unknown' <<< "${out}"; then
+            echo "::error::cannot tell whether ${IMAGE}:${VERSION} exists: ${out}"
+            exit 1
+          fi
+          echo "${IMAGE}:${VERSION} does not exist yet"
+          EOF
+          bash "${RUNNER_TEMP}/check-absent.sh"
+      # Pushed by digest only (no tag yet), so that nothing is published
+      # under the version before the layers are checked.
+      - name: Build and push by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/engine
+          file: docker/engine/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # SBOM (the Debian packages of the image, from the dpkg database)
+          # and SLSA provenance, stored with the image in the registry.
+          sbom: true
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}#engine-image
+            org.opencontainers.image.title=texrun-engine
+            org.opencontainers.image.description=TeX Live engine image of the texrun container backend (--backend container)
+          annotations: |
+            index:org.opencontainers.image.version=${{ env.VERSION }}
+            index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            index:org.opencontainers.image.description=TeX Live engine image of the texrun container backend (--backend container)
+          # The layers verify built and tested (on both platforms).
+          cache-from: |
+            type=gha,scope=texrun-engine-release-amd64
+            type=gha,scope=texrun-engine-release-arm64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: verify-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/verify
+      # The published image must be the one verify tested: the same layers
+      # (uncompressed digests) on each platform. Otherwise (e.g. the cache
+      # was evicted and apt installed other versions) nothing is tagged.
+      - name: Check the layers against verify
+        shell: bash
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            pushed="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+              --format "{{json (index .Image \"linux/${arch}\").RootFS.DiffIDs}}" | jq -c .)"
+            tested="$(cat "${RUNNER_TEMP}/verify/layers-${arch}.json")"
+            if [ "${pushed}" != "${tested}" ]; then
+              echo "::error::linux/${arch}: the pushed layers are not the ones verify tested"
+              echo "pushed: ${pushed}"
+              echo "tested: ${tested}"
+              exit 1
+            fi
+            echo "linux/${arch}: ${pushed}"
+          done
+      # Before the tag: an attestation belongs to the digest, and if it
+      # fails, nothing is published under the version yet, so the run can
+      # simply be retried.
+      - name: Attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          # Storage records are only available to organization-owned
+          # repositories.
+          create-storage-record: false
+      - name: Tag
+        shell: bash
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          bash "${RUNNER_TEMP}/check-absent.sh"
+          docker buildx imagetools create --tag "${IMAGE}:${VERSION}" "${IMAGE}@${DIGEST}"
+          tagged="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "${tagged}" != "${DIGEST}" ]; then
+            echo "::error::${IMAGE}:${VERSION} is ${tagged}, not the pushed ${DIGEST}"
+            exit 1
+          fi
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          {
+            echo "### ${IMAGE}:${VERSION}"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo "gh attestation verify oci://${IMAGE}:${VERSION} -R ${GITHUB_REPOSITORY}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # The complete corresponding source of the image's packages (GPLv2 §3(a),
+  # GPLv3 / AGPLv3 §6(a): the source accompanies the published binaries),
+  # at exactly the versions verify found in the image of each platform.
+  # On a dry run, fetched and checked but not kept.
+  sources:
+    name: sources
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: verify-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/verify
+      # In a container of the image's base (the digest of its FROM line).
+      - name: Fetch the source packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(awk '/^FROM /{ print $2; exit }' docker/engine/Dockerfile)"
+          work="${RUNNER_TEMP}/sources"
+          name="texrun-engine-${VERSION}-sources"
+          mkdir -p "${work}/${name}"
+          sort -u "${RUNNER_TEMP}"/verify/packages-*.txt > "${work}/${name}/packages.txt"
+          docker run --rm \
+            -v "${work}:/work" \
+            -v "${GITHUB_WORKSPACE}/.github/scripts/fetch-engine-sources.sh:/fetch-engine-sources.sh:ro" \
+            "${base}" /bin/sh /fetch-engine-sources.sh "/work/${name}/packages.txt" "/work/${name}"
+          tar -cf "${work}/${name}.tar" -C "${work}" "${name}"
+          ls -l "${work}/${name}.tar"
+          size="$(stat -c %s "${work}/${name}.tar")"
+          # GitHub release assets are limited to 2 GiB each.
+          if [ "${size}" -ge 2147483648 ]; then
+            echo "::error::${name}.tar is ${size} bytes, over the 2 GiB limit of a release asset"
+            exit 1
+          fi
+      - if: needs.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-sources
+          path: ${{ runner.temp }}/sources/texrun-engine-${{ env.VERSION }}-sources.tar
+          retention-days: 7
+          if-no-files-found: error
+          # Already compressed archives.
+          compression-level: 0
+
+  # Attaches the sources to the GitHub release of the tag, creating the
+  # release if the tag was pushed without one.
+  release:
+    name: release
+    needs: [version, publish, sources]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Create the release and upload its assets.
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engine-sources
+          path: ${{ runner.temp }}/assets
+      - name: Upload the sources to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          asset="${RUNNER_TEMP}/assets/texrun-engine-${VERSION}-sources.tar"
+          if gh release view "${TAG}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${asset}" -R "${GITHUB_REPOSITORY}"
+          else
+            prerelease=()
+            if [[ "${VERSION}" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "${TAG}" "${asset}" -R "${GITHUB_REPOSITORY}" --verify-tag \
+              --title "${TAG}" "${prerelease[@]}" \
+              --notes "Engine image: \`${IMAGE}:${VERSION}\`. \`texrun-engine-${VERSION}-sources.tar\` has the Debian source packages of everything in the image, at the installed versions."
+          fi

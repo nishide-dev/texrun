@@ -69,8 +69,13 @@ pub const REQUIRE_PREVIEW_TOOLS_ENV: &str = "TEXRUN_REQUIRE_PREVIEW_TOOLS";
 pub const TEST_BACKEND_ENV: &str = "TEXRUN_TEST_BACKEND";
 
 /// The image of the container backend in tests (default:
-/// `texrun-engine:latest`).
+/// [`LOCAL_SANDBOX_IMAGE`]).
 pub const SANDBOX_IMAGE_ENV: &str = "TEXRUN_SANDBOX_IMAGE";
+
+/// The image the tests use unless [`SANDBOX_IMAGE_ENV`] is set: a local
+/// build of `docker/engine` (`docker build -t texrun-engine:latest
+/// docker/engine`), not the published image that texrun uses by default.
+pub const LOCAL_SANDBOX_IMAGE: &str = "texrun-engine:latest";
 
 /// Set to `1` to fail (instead of skip) tests that need the container
 /// backend (a runtime and the engine image).
@@ -85,7 +90,7 @@ pub fn container_backend() -> bool {
 pub fn container_engine(config: ContainerConfig) -> ContainerEngine {
     let config = match std::env::var(SANDBOX_IMAGE_ENV) {
         Ok(image) if !image.is_empty() => config.with_image(image),
-        _ => config,
+        _ => config.with_image(LOCAL_SANDBOX_IMAGE),
     };
     ContainerEngine::new(config)
 }

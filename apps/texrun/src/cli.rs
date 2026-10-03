@@ -139,8 +139,9 @@ pub struct CompileArgs {
     pub container_runtime: Option<ContainerRuntime>,
 
     /// Engine image for --backend container; must exist locally (texrun
-    /// never pulls) [default: texrun-engine:latest, built from
-    /// docker/engine/Dockerfile].
+    /// never pulls: `docker pull` it first) [default:
+    /// ghcr.io/nishide-dev/texrun-engine:<VERSION>, the image published for
+    /// this version of texrun].
     #[arg(long, value_name = "IMAGE")]
     pub container_image: Option<String>,
 

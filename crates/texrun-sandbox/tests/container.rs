@@ -19,8 +19,7 @@ use texrun_process::{
     Cwd, EnvAllowlist, Finished, Launcher, Resource, Rlimits, Spec, Stop, Watch, run_with,
 };
 use texrun_sandbox::{
-    Container, ContainerLimits, ContainerSpec, DEFAULT_IMAGE, LABEL, Mount, Runtime, SandboxError,
-    Session,
+    Container, ContainerLimits, ContainerSpec, LABEL, Mount, Runtime, SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -30,7 +29,7 @@ fn image() -> String {
     std::env::var(IMAGE_ENV)
         .ok()
         .filter(|i| !i.is_empty())
-        .unwrap_or_else(|| DEFAULT_IMAGE.to_owned())
+        .unwrap_or_else(|| "texrun-engine:latest".to_owned())
 }
 
 /// The runtime, if it and the image can be used.
@@ -358,6 +357,14 @@ fn containers_carry_the_texrun_label() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "{out:?}");
+}
+
+#[test]
+fn the_image_is_inspected() {
+    let runtime = require_sandbox!();
+    let found = runtime.image(&image()).unwrap();
+    assert!(found.id.starts_with("sha256:"), "{found:?}");
+    assert_eq!(runtime.image_id(&image()).unwrap(), found.id);
 }
 
 #[test]
