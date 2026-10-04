@@ -215,7 +215,7 @@ layer.
 | Code | Meaning |
 | --- | --- |
 | 0 | The document compiled and a PDF was produced |
-| 1 | The document failed to compile (see the diagnostics), also when a resource limit stopped it (`resource_limit`) |
+| 1 | The document failed to compile (see the diagnostics), including when a resource limit stopped it (`resource_limit`) |
 | 2 | Usage or input error: invalid arguments, entrypoint not found or outside `--root`, project rejected (symlink leaving the root, input limits, unsafe root) |
 | 3 | Runtime error: latexmk missing or unusable (with `--backend container`: no usable container runtime or engine image), I/O errors, artifacts could not be copied, `--cgroup required` without a usable cgroup |
 | 4 | The compile timed out |

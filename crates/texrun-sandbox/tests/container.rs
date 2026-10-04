@@ -20,7 +20,7 @@ use texrun_process::{
 };
 use texrun_sandbox::{
     Container, ContainerLimits, ContainerSpec, IMAGE_VERSION_LABEL, LABEL, Mount, Runtime,
-    RuntimeKind, SandboxError, Session,
+    SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -361,30 +361,66 @@ fn an_oom_kill_is_recorded() {
         &sh(script),
         Watch::new().with_timeout(Duration::from_secs(60)),
     );
-    assert!(!finished.status.success(), "{finished:?}");
-    // Rootless Podman does not record `OOMKilled` (docs/security.md §4).
-    if runtime.kind() == RuntimeKind::Docker {
-        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
-    }
-
-    // With the report of the compile containers, both runtimes tell: the
-    // shell reads the cgroup's `oom_kill` counter.
-    let container = Container::new(
-        runtime,
-        ContainerSpec::new(image(), limits).with_report_pids(true),
-    );
-    let mut finished = run(
-        &container,
-        &sh(script),
-        Watch::new().with_timeout(Duration::from_secs(60)),
-    );
-    assert!(!finished.status.success(), "{finished:?}");
+    assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
     assert_eq!(
-        container.take_pids_report(&mut finished.stderr),
-        Some(false),
+        container.outcome().unwrap().exit_code,
+        Some(128 + 9),
         "{finished:?}"
     );
-    assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    // Without the report, only the runtime's record could tell, and it
+    // misses kills: rootless Podman does not keep it, and Docker on cgroup
+    // v2 loses a few percent of them for good (#60). So it is not asserted.
+
+    // With the report of the compile containers, both runtimes tell every
+    // time: the shell reads the cgroup's `oom_kill` counter, which the
+    // kernel raises before it sends `SIGKILL`. Several kills, since a
+    // missed one shows only now and then.
+    for _ in 0..3 {
+        let container = Container::new(
+            runtime,
+            ContainerSpec::new(image(), limits).with_report_pids(true),
+        );
+        let mut finished = run(
+            &container,
+            &sh(script),
+            Watch::new().with_timeout(Duration::from_secs(60)),
+        );
+        assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
+        assert_eq!(
+            container.take_pids_report(&mut finished.stderr),
+            Some(false),
+            "{finished:?}"
+        );
+        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    }
+}
+
+#[test]
+fn the_oom_killer_takes_the_command_before_the_reporting_shell() {
+    let runtime = require_sandbox!();
+    let container = Container::new(
+        runtime,
+        ContainerSpec::new(image(), limits()).with_report_pids(true),
+    );
+    // The parent of the command is the reporting shell.
+    let mut finished = run(
+        &container,
+        &sh("cat /proc/self/oom_score_adj /proc/$PPID/oom_score_adj"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr),
+        Some(false)
+    );
+    // The shell keeps the runtime's value (0 with Docker; a rootless
+    // runtime may pass on a user session's own).
+    let out = stdout(&finished);
+    let scores: Vec<i32> = out.lines().map(|l| l.parse().unwrap()).collect();
+    assert_eq!(scores.len(), 2, "{out}");
+    assert_eq!(scores[0], 1000, "{out}");
+    assert!(scores[1] < 1000, "{out}");
+    assert!(finished.stderr.bytes.is_empty(), "{finished:?}");
 }
 
 #[test]
@@ -735,16 +771,21 @@ fn an_oom_kill_in_a_session_is_recorded() {
     )
     .unwrap();
     assert!(!finished.status.success(), "{finished:?}");
-    // Recorded asynchronously by the runtime.
-    let mut oom = session.oom_killed();
-    for _ in 0..20 {
-        if oom == Some(true) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        oom = session.oom_killed();
-    }
-    assert_eq!(oom, Some(true), "{finished:?}");
+    // The cgroup counts the kill before the run ends: no waiting for the
+    // runtime's record (#60).
+    assert_eq!(session.oom_killed(), Some(true), "{finished:?}");
+    // Only kills since the previous question.
+    assert_eq!(session.oom_killed(), Some(false));
+    let finished = exec(
+        &session,
+        &sh("kill -KILL $$"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    )
+    .unwrap();
+    assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
+    // A run killed otherwise is not taken for an OOM kill, although the
+    // runtime may have recorded the earlier one for the whole session.
+    assert_eq!(session.oom_killed(), Some(false));
 }
 
 #[test]

@@ -311,8 +311,8 @@ fn limit_exceeded(status: ExitStatus, cgroup: &CgroupOutcome, cpu_seconds: u64) 
 
 /// The limit a tool in a container reached, if any. The runtime CLI exits
 /// with 128 + the signal that ended the tool: `SIGXCPU`, or `SIGKILL` from
-/// the OOM killer of the container's cgroup (which the runtime records,
-/// asynchronously, as `OOMKilled`).
+/// the OOM killer of the container's cgroup (which the cgroup counts,
+/// [`Session::oom_killed`]).
 fn container_limit_exceeded(
     status: ExitStatus,
     session: &Session<'_>,
@@ -326,7 +326,7 @@ fn container_limit_exceeded(
         return None;
     }
     // At most OOM_EVENT_WAIT in all, however long each question takes
-    // (with Podman, each is an `exec` into the container).
+    // (each is an `exec` into the container).
     let deadline = std::time::Instant::now() + OOM_EVENT_WAIT;
     loop {
         if session.oom_killed() == Some(true) {
@@ -342,9 +342,9 @@ fn container_limit_exceeded(
 }
 
 /// How long, and how far apart, a container is asked whether a tool that
-/// was killed was killed by the OOM killer (the runtime may record it
-/// asynchronously). A question started before the deadline may take
-/// longer (with Podman, at most 2 s).
+/// was killed was killed by the OOM killer (when the cgroup counter cannot
+/// be read, the runtime records it asynchronously). A question started
+/// before the deadline may take longer (an `exec`, at most 2 s).
 const OOM_EVENT_WAIT: Duration = Duration::from_secs(1);
 const OOM_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
