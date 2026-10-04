@@ -36,7 +36,7 @@ and they enforce different boundaries:
   is protected by TeX's own restrictions and texrun's limits, but it is
   **not** a complete sandbox.
 - `--backend container` runs TeX and the page preview tools in a hardened
-  container of the engine image. In addition to the host backend's
+  container built from the engine image. In addition to the host backend's
   guarantees, it confines them at the OS level: they see only the workspace
   and the image, have no network access and run without privileges.
 
@@ -63,7 +63,11 @@ example:
   `--backend host`, these include font-related lookups, the PDF-object
   embedding primitives it mentions, the TeX Live tree being readable by
   name, the lack of network blocking and of OS-level isolation, and
-  process-tree limits without a delegated cgroup.
+  process-tree limits without a delegated cgroup. For `--backend
+  container`, these include the workspace being readable and the output
+  directory writable from inside the container, the lack of isolation
+  between preview tool runs, and the reliability of the process-limit
+  report.
 - Escaping a container through a vulnerability in the container runtime,
   the OCI runtime or the Linux kernel.
 - Vulnerabilities in TeX Live, latexmk, MuPDF, Poppler, Docker or Podman

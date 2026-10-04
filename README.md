@@ -1,9 +1,9 @@
 # texrun
 
-texrun compiles and inspects TeX documents through a safe, predictable
-command-line interface. It is built for AI agents and automated pipelines as
-much as for people: instead of a long latexmk log, you get structured
-diagnostics, the PDF and PNG previews of its pages, as text or as a single
+texrun compiles TeX documents through a safe, predictable command-line
+interface. It is built as much for AI agents and automated pipelines as for
+people: instead of a long latexmk log, you get structured diagnostics, the
+PDF, and PNG previews of its pages, either as readable text or as a single
 JSON document.
 
 > [!NOTE]
@@ -21,29 +21,33 @@ latexmk so that callers get:
   schema.
 - **The PDF and page previews.** The PDF, the log and PNG previews of the
   first pages are copied to an output directory.
-- **Isolation.** Each compile runs in a fresh temporary workspace with shell
-  escape disabled, a minimal environment, a timeout and resource limits.
-  The container backend adds an OS-level sandbox with no network access.
+- **Safe defaults.** Each compile runs in a fresh temporary workspace with
+  shell escape disabled, a minimal environment, a timeout and resource
+  limits. The container backend adds OS-level isolation with no network
+  access.
 - **Clear exit codes.** Success, a document error, a usage error, a runtime
   error and a timeout each have their own exit code.
 
 ## Installation
 
-texrun needs Rust 1.98 or newer to build. Install it with Cargo:
+texrun runs on Linux and macOS; Windows is not supported. It needs Rust 1.98
+or newer to build. Install it with Cargo:
 
 ```bash
 cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.0 texrun
 ```
 
-Then install what the backend you use needs:
+Then install the tools for the backend you plan to use:
 
-- **Host backend (default):** TeX Live with `latexmk`.
+- **Host backend (default):** TeX Live with `latexmk`. texrun does not
+  install missing LaTeX packages; install them with TeX Live (for example,
+  `tlmgr`).
 - **Page previews on the host (optional):** `mutool` (MuPDF), or `pdfinfo`
   and `pdftoppm` (Poppler). Without either, texrun still compiles and
   reports that previews were skipped.
 - **Container backend (optional):** Docker 20.10+ or Podman 4+, and the
-  engine image of your texrun version. texrun never pulls images, so pull it
-  once:
+  engine image that matches your texrun version. texrun never pulls images,
+  so pull it once:
 
   ```bash
   docker pull ghcr.io/nishide-dev/texrun-engine:0.1.0
@@ -74,7 +78,7 @@ Compiled main.tex in 222ms
 ```
 
 For tools and AI agents, `--json` prints exactly one JSON document on stdout,
-also when the compile fails or texrun itself hits an error:
+even when the compile fails or texrun itself hits an error:
 
 ```bash
 texrun compile --json main.tex
@@ -112,9 +116,9 @@ texrun can run TeX in two places, selected with `--backend`:
   TeX can still read parts of the host, such as the TeX Live tree, and
   network access is not blocked.
 - **`container`** runs latexmk, and the page preview tools, in a hardened
-  container of the engine image (Docker or Podman). TeX sees only the
-  workspace, has no network access and runs as a non-root user without
-  capabilities on a read-only filesystem.
+  container built from the engine image (Docker or Podman). TeX sees only
+  the workspace, has no network access and runs as a non-root user without
+  capabilities, with a read-only root filesystem.
 
 **Use `--backend container` for documents you do not trust:**
 
@@ -161,7 +165,8 @@ texrun treats every document as untrusted input. It disables shell escape,
 runs latexmk with its own configuration instead of any `latexmkrc` in the
 project, restricts TeX's file access to the workspace where kpathsea allows
 it, passes a minimal environment, and enforces a timeout and limits on
-output size, CPU time, memory and processes.
+output size and CPU time. Memory and process limits for the whole compile
+need the container backend, or a delegated cgroup on Linux (`--cgroup`).
 
 With the default host backend, these measures do not make a complete
 sandbox; use the container backend for untrusted documents (see
@@ -171,10 +176,6 @@ sandbox; use the container backend for untrusted documents (see
   exactly what each backend guarantees (in Japanese).
 - [SECURITY.md](SECURITY.md) explains how to report a vulnerability
   privately.
-
-## Platform support
-
-texrun supports Linux and macOS. Windows is not supported.
 
 ## Development
 

@@ -41,7 +41,7 @@ texrun compile --backend container main.tex
 | `--pages <RANGE>` | first 20 pages | Pages to preview: `N`, `N-M`, `N-`, `-M` (at most 200) |
 | `--preview-dpi <DPI>` | `144` | Preview resolution (long edge at most 4096 px) |
 | `--preview-backend <BACKEND>` | `auto` | `auto` (MuPDF, else Poppler), `mupdf` or `poppler` |
-| `--backend <BACKEND>` | `host` | Where TeX runs: `host` (the host's latexmk, as your user) or `container` (in a hardened container of the engine image; see [Engine backends](#engine-backends)) |
+| `--backend <BACKEND>` | `host` | Where TeX runs: `host` (the host's latexmk, as your user) or `container` (in a hardened container built from the engine image; see [Engine backends](#engine-backends)) |
 | `--container-runtime <RUNTIME>` | `auto` | With `--backend container`: `auto` (Docker if installed and running, otherwise Podman), `docker` or `podman`. Rootless Docker is not supported (use rootless Podman); see [Engine backends](#engine-backends) |
 | `--container-image <IMAGE>` | `ghcr.io/nishide-dev/texrun-engine:<version>` | With `--backend container`: the engine image; must exist locally, texrun never pulls (see [engine-image.md](engine-image.md)) |
 | `--cgroup <MODE>` | `auto` | Linux: run latexmk and the preview tools in cgroups of their own (memory, processes, CPU). `auto` uses a delegated cgroup if there is one (e.g. `systemd-run --user --scope -p Delegate=yes texrun ...`), otherwise only the per-process limits apply (see `resource_limits`); `required` fails with exit 3 instead; `off` never uses one |
@@ -85,7 +85,7 @@ Problems with previews never change the exit code (except a signal, see
   PDF (or the log on failure) and previews. Warnings and errors of texrun
   itself go to stderr. Control, bidi and zero-width characters in file names
   and messages are shown escaped (`\u{202E}`).
-- With `--json`, stdout contains exactly one JSON document, also on compile
+- With `--json`, stdout contains exactly one JSON document, even on compile
   failure, timeout and runtime errors (and for usage errors when `--json` is
   on the command line). Strings are not escaped beyond JSON. stderr may still
   carry human-readable warnings.
@@ -231,7 +231,7 @@ workspace and then exits.
 
 | | `--backend host` (default) | `--backend container` |
 | --- | --- | --- |
-| TeX runs | on the host, as your user | in a container of the engine image (Docker or Podman), as a non-root user without capabilities |
+| TeX runs | on the host, as your user | in a container built from the engine image (Docker or Podman), as a non-root user without capabilities |
 | Page previews (MuPDF / Poppler) | the host's tools, as your user | the image's tools, in a container of their own that sees only a copy of the PDF |
 | Shell escape off, texrun rc, environment allowlist, kpathsea paranoid mode, timeout and limits | yes | yes (the same settings) |
 | Host files TeX can reach | whatever kpathsea's paranoid mode does not refuse by name (e.g. the TeX Live tree, font lookups, pdfTeX's file embedding primitives) | only the workspace (read-only, except the output directory) and the image's own read-only TeX Live tree |

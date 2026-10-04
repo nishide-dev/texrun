@@ -1,7 +1,7 @@
 # Engine image
 
 `texrun compile --backend container` runs TeX and the page preview tools in
-containers of the engine image. This document describes how the image is
+containers built from the engine image. This document describes how the image is
 published, how to get and verify it, and the licenses of the software in it.
 For what the container backend guarantees, see [security.md](security.md) §4
 and the [backend comparison](cli.md#engine-backends).
