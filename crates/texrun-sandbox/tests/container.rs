@@ -20,7 +20,7 @@ use texrun_process::{
 };
 use texrun_sandbox::{
     Container, ContainerLimits, ContainerSpec, IMAGE_VERSION_LABEL, LABEL, Mount, Runtime,
-    RuntimeKind, SandboxError, Session,
+    SandboxError, Session,
 };
 
 const REQUIRE_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
@@ -361,30 +361,38 @@ fn an_oom_kill_is_recorded() {
         &sh(script),
         Watch::new().with_timeout(Duration::from_secs(60)),
     );
-    assert!(!finished.status.success(), "{finished:?}");
-    // Rootless Podman does not record `OOMKilled` (docs/security.md §4).
-    if runtime.kind() == RuntimeKind::Docker {
-        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
-    }
-
-    // With the report of the compile containers, both runtimes tell: the
-    // shell reads the cgroup's `oom_kill` counter.
-    let container = Container::new(
-        runtime,
-        ContainerSpec::new(image(), limits).with_report_pids(true),
-    );
-    let mut finished = run(
-        &container,
-        &sh(script),
-        Watch::new().with_timeout(Duration::from_secs(60)),
-    );
-    assert!(!finished.status.success(), "{finished:?}");
+    assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
     assert_eq!(
-        container.take_pids_report(&mut finished.stderr),
-        Some(false),
+        container.outcome().unwrap().exit_code,
+        Some(128 + 9),
         "{finished:?}"
     );
-    assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    // Without the report, only the runtime's record could tell, and it
+    // misses kills: rootless Podman does not keep it, and Docker on cgroup
+    // v2 loses a few percent of them for good (#60). So it is not asserted.
+
+    // With the report of the compile containers, both runtimes tell every
+    // time: the shell reads the cgroup's `oom_kill` counter, which the
+    // kernel raises before it sends `SIGKILL`. Several kills, since a
+    // missed one shows only now and then.
+    for _ in 0..3 {
+        let container = Container::new(
+            runtime,
+            ContainerSpec::new(image(), limits).with_report_pids(true),
+        );
+        let mut finished = run(
+            &container,
+            &sh(script),
+            Watch::new().with_timeout(Duration::from_secs(60)),
+        );
+        assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
+        assert_eq!(
+            container.take_pids_report(&mut finished.stderr),
+            Some(false),
+            "{finished:?}"
+        );
+        assert!(container.outcome().unwrap().oom_killed, "{finished:?}");
+    }
 }
 
 #[test]

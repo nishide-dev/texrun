@@ -12,22 +12,41 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
+    env:
+      TEXRUN_SANDBOX_IMAGE: texrun-engine:ci
+      TEXRUN_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Docker
-        run: |
-          docker version --format 'docker {{.Server.Version}}'
-          docker info --format '{{.CgroupVersion}} {{.KernelVersion}} {{.NCPU}}'
-          docker run --rm debian:trixie-slim true
-      - name: OOM kills, 4 in parallel, with CPU load
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build engine image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/engine
+          file: docker/engine/Dockerfile
+          tags: ${{ env.TEXRUN_SANDBOX_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=texrun-engine
+      - name: Install Rust toolchain
+        run: rustup toolchain install && rustup show
+      - name: Build tests
+        run: cargo test --locked --all-features -p texrun-sandbox --test container --no-run
+      - name: OOM tests, 4 in parallel, with CPU load
+        shell: bash
         run: |
           for i in $(seq "$(nproc)"); do (while :; do :; done) & done
-          sh .github/diag/oom.sh debian:trixie-slim 4 30 | tee "${RUNNER_TEMP}/diag.log"
-          echo "--- flag false right after exit:"; grep -c 'exit+flag=137 false' "${RUNNER_TEMP}/diag.log" || true
-          echo "--- flag still false after 1 s:"; grep -c '1s=false' "${RUNNER_TEMP}/diag.log" || true
-          echo "--- flag still false after 5 s:"; grep -c '5s=false' "${RUNNER_TEMP}/diag.log" || true
-          echo "--- counter not 1:"; grep 'counter=' "${RUNNER_TEMP}/diag.log" | grep -vc 'counter=1$' || true
-          grep -E '1s=false|5s=false' "${RUNNER_TEMP}/diag.log" || true
+          bin="$(ls -t target/debug/deps/container-* | grep -v '\.d$' | head -n 1)"
+          worker() {
+            local pass=0 fail=0
+            for i in $(seq 12); do
+              if "${bin}" an_oom_kill > "${RUNNER_TEMP}/w$1-$i.log" 2>&1; then pass=$((pass+1)); else
+                fail=$((fail+1)); echo "worker $1 run $i failed"; grep -E 'panicked|Finished \{' "${RUNNER_TEMP}/w$1-$i.log"; fi
+            done
+            echo "worker $1: pass=${pass} fail=${fail}"
+          }
+          for w in 1 2 3 4; do worker "$w" & done
+          wait -n; wait -n; wait -n; wait -n
+          echo "--- whole container suite, 5 times"
+          for i in $(seq 5); do "${bin}" 2>&1 | grep -E 'test result|FAILED|panicked'; done
