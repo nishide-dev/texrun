@@ -621,7 +621,7 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 `docker/engine/Dockerfile`。dev image（`docker/dev`）とは別の、最小の runtime image である。
 
 - base は `debian:trixie-slim` を multi-arch index の digest で固定し、Dependabot が digest を更新する。
-- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（`mupdf-tools` / `poppler-utils`）も dev image と揃えて入れる（#46。AGPL / GPL の配布条件は README）。Rust toolchain やコンパイラは入れない。
+- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（`mupdf-tools` / `poppler-utils`）も dev image と揃えて入れる（#46。AGPL / GPL の配布条件は [engine-image.md](engine-image.md#licenses)）。Rust toolchain やコンパイラは入れない。
 - 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
 - texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout` と `/usr/bin/sleep`（coreutils）、`/usr/bin/prlimit`（util-linux）、`/bin/sh`（POSIX shell。プロセス数の上限の報告）、`/usr/bin/mutool` または `/usr/bin/pdfinfo` + `/usr/bin/pdftoppm`（preview）。`/workspace` と `/texrun` には何も置かない。
 - CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image は、その版の texrun のために公開した `ghcr.io/nishide-dev/texrun-engine:<version>`（`texrun_sandbox::DEFAULT_IMAGE`、`--container-image` で変えられる）。公開の仕組みは次の「engine image の公開」を参照。
@@ -644,7 +644,7 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
   - `engine.version` に image の ID と版の label を出し、texrun の版と違えば `image version X, not Y of texrun` と書く。
   - 固定したい利用者は `--container-image ghcr.io/nishide-dev/texrun-engine@sha256:<digest>` を使える（compile は、probe で解決した image の ID で行う）。
 - **ローカルの build。** `docker build -t ghcr.io/nishide-dev/texrun-engine:<version> docker/engine`、または任意の名前と `--container-image`。label が無いので `engine.version` は `image without a version label` になる。開発用の test は、既定で `texrun-engine:latest`（`TEXRUN_SANDBOX_IMAGE` で変えられる）を使う。
-- **配布条件。** image は texrun の code を含まず、Debian の未改変のパッケージ（TeX Live、latexmk、coreutils、util-linux、preview 用の MuPDF（AGPL）と Poppler（GPL）など）から成る。各パッケージの license は image の `/usr/share/doc/<package>/copyright` に残し、対応する source は同じ tag の GitHub release に付ける（上記、README の「Engine image」）。
+- **配布条件。** image は texrun の code を含まず、Debian の未改変のパッケージ（TeX Live、latexmk、coreutils、util-linux、preview 用の MuPDF（AGPL）と Poppler（GPL）など）から成る。各パッケージの license は image の `/usr/share/doc/<package>/copyright` に残し、対応する source は同じ tag の GitHub release に付ける（上記、[engine-image.md](engine-image.md#source-code)）。
 
 ### container の設定
 
@@ -732,7 +732,7 @@ latexmk 1 回の compile ごとに container を 1 つ作る（`texrun_sandbox::
 
 ### CLI
 
-- `--backend host|container`。既定は `host` のままにする。container backend には container runtime と engine image が必要で、既定にすると、それが無いほとんどの環境で texrun が動かなくなるためである。信頼できない文書には `--backend container` を使う（README に記載）。
+- `--backend host|container`。既定は `host` のままにする。container backend には container runtime と engine image が必要で、既定にすると、それが無いほとんどの環境で texrun が動かなくなるためである。信頼できない文書には `--backend container` を使う（README と [cli.md](cli.md#engine-backends) に記載）。
 - `--container-runtime auto|docker|podman`、`--container-image <IMAGE>`。`--backend host` と一緒に指定すると usage error（exit 2）にする。
 - `--cgroup` は host で動くプロセス（`--backend host` の engine と preview tool）に効く。container backend の engine と preview tool には、container の cgroup が常に掛かる。
 

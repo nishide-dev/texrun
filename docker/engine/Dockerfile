@@ -27,7 +27,7 @@
 # the #10 fixtures and the preview tests behave the same with both
 # backends. MuPDF is AGPL-licensed and Poppler GPL-licensed: they are
 # installed from Debian as separate programs, and texrun only starts them
-# (see README for what distributing this image means).
+# (see docs/engine-image.md for what distributing this image means).
 
 # Pinned by digest (multi-arch index); Dependabot (docker ecosystem)
 # updates it.

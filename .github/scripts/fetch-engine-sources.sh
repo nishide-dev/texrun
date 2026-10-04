@@ -2,7 +2,7 @@
 # Downloads the Debian source packages of the engine image
 # (docker/engine/Dockerfile) at exactly the versions installed in it, for the
 # release asset that accompanies every published image
-# (.github/workflows/engine-image.yml, README "Engine image"): the complete
+# (.github/workflows/engine-image.yml, docs/engine-image.md): the complete
 # corresponding source of the GPL / AGPL packages in the image (and of all
 # the others).
 #
