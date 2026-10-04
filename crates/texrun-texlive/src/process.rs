@@ -347,7 +347,7 @@ pub(crate) fn run(job: &Job<'_>) -> Result<Finished, RunError> {
             // ended on its own: in the last line of its stderr, which is
             // removed from the output either way. Taken before the outcome,
             // which adds the OOM kill counted there (rootless Podman does
-            // not record `OOMKilled`).
+            // not record `OOMKilled`, Docker sometimes loses it, #60).
             let reported = container.take_pids_report(&mut finished.stderr);
             let outcome = container.outcome();
             let oom = outcome.is_some_and(|o| o.oom_killed);
