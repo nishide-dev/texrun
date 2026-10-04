@@ -396,6 +396,34 @@ fn an_oom_kill_is_recorded() {
 }
 
 #[test]
+fn the_oom_killer_takes_the_command_before_the_reporting_shell() {
+    let runtime = require_sandbox!();
+    let container = Container::new(
+        runtime,
+        ContainerSpec::new(image(), limits()).with_report_pids(true),
+    );
+    // The parent of the command is the reporting shell.
+    let mut finished = run(
+        &container,
+        &sh("cat /proc/self/oom_score_adj /proc/$PPID/oom_score_adj"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    );
+    assert!(finished.status.success(), "{finished:?}");
+    assert_eq!(
+        container.take_pids_report(&mut finished.stderr),
+        Some(false)
+    );
+    // The shell keeps the runtime's value (0 with Docker; a rootless
+    // runtime may pass on a user session's own).
+    let out = stdout(&finished);
+    let scores: Vec<i32> = out.lines().map(|l| l.parse().unwrap()).collect();
+    assert_eq!(scores.len(), 2, "{out}");
+    assert_eq!(scores[0], 1000, "{out}");
+    assert!(scores[1] < 1000, "{out}");
+    assert!(finished.stderr.bytes.is_empty(), "{finished:?}");
+}
+
+#[test]
 fn a_created_container_is_removed_when_dropped() {
     let runtime = require_sandbox!();
     let container = Container::new(runtime, ContainerSpec::new(image(), limits()));

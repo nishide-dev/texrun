@@ -58,6 +58,12 @@ const SH: &str = "/bin/sh";
 /// handles `SIGTERM` while it runs, with the original stderr; the shell's
 /// own stderr is `/dev/null`, so that its job messages (e.g. for a command
 /// ended by `SIGXCPU`) do not add to the command's output.
+///
+/// The command gets the highest `oom_score_adj` (1000; raising it needs no
+/// privilege), so that the OOM killer takes every process of the command
+/// before the shell: memory that a kill does not free at once can make the
+/// kernel pick another victim, and without this it was sometimes the
+/// shell, which then never reported (#60).
 const REPORT_PIDS: &str = r#"n=$1; shift; h=; o=
 r() {
   kill -s KILL -1 2>/dev/null
@@ -76,7 +82,7 @@ r() {
 }
 trap 'r; case "$h" in 0) exit 91 ;; [1-9]*) exit 90 ;; esac; exit 143' TERM
 exec 3>&2 2>/dev/null
-"$@" 2>&3 3>&- &
+(echo 1000 2>/dev/null >/proc/self/oom_score_adj; exec "$@") 2>&3 3>&- &
 wait $!
 s=$?
 r

@@ -40,7 +40,7 @@ jobs:
           bin="$(ls -t target/debug/deps/container-* | grep -v '\.d$' | head -n 1)"
           worker() {
             local pass=0 fail=0
-            for i in $(seq 12); do
+            for i in $(seq 15); do
               if "${bin}" an_oom_kill > "${RUNNER_TEMP}/w$1-$i.log" 2>&1; then pass=$((pass+1)); else
                 fail=$((fail+1)); echo "worker $1 run $i failed"; grep -E 'panicked|Finished \{' "${RUNNER_TEMP}/w$1-$i.log"; fi
             done
