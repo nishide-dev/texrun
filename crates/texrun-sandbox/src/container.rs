@@ -399,9 +399,9 @@ impl<'r> Container<'r> {
     /// removed; `None` if it was never created or could not be inspected.
     ///
     /// [`ContainerOutcome::oom_killed`] is also set if the report taken by
-    /// [`Container::take_pids_report`] counted an OOM kill: rootless Podman
-    /// does not record `OOMKilled` (docs/security.md §4), so call that
-    /// first.
+    /// [`Container::take_pids_report`] counted an OOM kill: the runtime's
+    /// record can miss it (rootless Podman, Docker #60; docs/security.md
+    /// §4), so call that first.
     pub fn outcome(&self) -> Option<ContainerOutcome> {
         let state = self.lock();
         state.outcome.map(|mut o| {

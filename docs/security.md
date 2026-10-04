@@ -146,7 +146,7 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 | container 内でも CPU 時間・address space の上限で `resource_limit` になる、timeout / cancel で container が残らない | 同: `the_cpu_time_limit_applies_in_the_container` など |
 | diagnostics の path が、mount 先（既定の `/workspace`、任意の path）によらず workspace 相対になる | 同: `diagnostics_are_workspace_relative_with_any_mount_point`、`apps/texrun/tests/container.rs` |
 | container の中から network に出られない（`NetworkMode=none`、外部への TCP / UDP 接続が `Network is unreachable`、名前解決の失敗。compile の container と preview の container） | `crates/texrun-sandbox/tests/container.rs`: `a_container_cannot_reach_the_network`、`a_session_runs_programs_one_after_another_in_one_container` |
-| preview の container: 制限と上限（rlimit は tool ごとに `prlimit`）、PDF のコピーが read-only、kill された run で container ごと消える、OOM kill の記録、container の寿命 | 同: `a_session_*`、`a_killed_run_stops_the_session`、`an_oom_kill_in_a_session_is_recorded` |
+| preview の container: 制限と上限（rlimit は tool ごとに `prlimit`）、PDF のコピーが read-only、kill された run で container ごと消える、OOM kill の検出（cgroup の `oom_kill`）、container の寿命 | 同: `a_session_*`、`a_killed_run_stops_the_session`、`an_oom_kill_in_a_session_is_recorded` |
 | preview の画像は container から見えないコピーを検査して保存し、保存後に元のファイルを書き換えても成果物は変わらない（別の inode） | `crates/texrun-preview/src/fsops.rs` の unit test: `a_staged_copy_is_what_is_stored` |
 | preview tool を container で動かしても結果が host と同じ。出力先の symlink をたどらない、container と scratch を残さない、container が使えなければ host の tool に fallback しない | `crates/texrun-preview/tests/real_tools.rs`（`TEXRUN_TEST_BACKEND=container`）、`crates/texrun-preview/tests/container.rs`、`apps/texrun/tests/container.rs`: `previews_are_rendered_in_the_container` |
 

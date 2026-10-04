@@ -161,8 +161,8 @@ impl<'r> Session<'r> {
     ///
     /// The runtime's own record (`OOMKilled`, for the whole session) is
     /// only the fallback when the counter cannot be read: rootless Podman
-    /// does not keep it, and Docker keeps it only once containerd's OOM
-    /// event has reached the daemon, which can come late (#60).
+    /// does not keep it, and Docker on cgroup v2 loses containerd's OOM
+    /// event for a few percent of the kills (#60).
     ///
     /// The counter is not read before every run: that would be one more
     /// `exec` per run (about 0.03 s, per page of a preview).
