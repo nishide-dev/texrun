@@ -221,7 +221,9 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 `.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。release の手順:
 
-1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、README の例（`docker pull ghcr.io/nishide-dev/texrun-engine:<version>`、`cargo install ... --tag v<version>`、`gh attestation verify` など）の版も同じにした commit を main に入れる。
+1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.0' -- README.md docs/` で確かめられる（`0.1.0` は現在の版）。
+   - `README.md`: 冒頭の note、Installation の `cargo install ... --tag v<version>` と `docker pull ghcr.io/nishide-dev/texrun-engine:<version>`
+   - `docs/engine-image.md`: `cargo install`・`docker pull`・`docker build` の例、`engine.version` の例、`gh attestation verify` の例
 2. その commit に `v<version>` の tag を push する（または、その tag で GitHub release を作る）。workflow が、版の一致と tag が main の祖先であることを確かめ、両 platform の image を test してから、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。image の Debian source package は `texrun-engine-<version>-sources.tar` として、tag の GitHub release に付く（release が無ければ workflow が作る）。
 3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
 4. workflow の summary に出る digest で `docker pull`・`gh attestation verify` を確かめる。
