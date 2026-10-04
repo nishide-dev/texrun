@@ -735,16 +735,21 @@ fn an_oom_kill_in_a_session_is_recorded() {
     )
     .unwrap();
     assert!(!finished.status.success(), "{finished:?}");
-    // Recorded asynchronously by the runtime.
-    let mut oom = session.oom_killed();
-    for _ in 0..20 {
-        if oom == Some(true) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        oom = session.oom_killed();
-    }
-    assert_eq!(oom, Some(true), "{finished:?}");
+    // The cgroup counts the kill before the run ends: no waiting for the
+    // runtime's record (#60).
+    assert_eq!(session.oom_killed(), Some(true), "{finished:?}");
+    // Only kills since the previous question.
+    assert_eq!(session.oom_killed(), Some(false));
+    let finished = exec(
+        &session,
+        &sh("kill -KILL $$"),
+        Watch::new().with_timeout(Duration::from_secs(60)),
+    )
+    .unwrap();
+    assert_eq!(finished.status.code(), Some(128 + 9), "{finished:?}");
+    // A run killed otherwise is not taken for an OOM kill, although the
+    // runtime may have recorded the earlier one for the whole session.
+    assert_eq!(session.oom_killed(), Some(false));
 }
 
 #[test]

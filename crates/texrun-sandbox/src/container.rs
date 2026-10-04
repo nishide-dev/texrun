@@ -302,6 +302,12 @@ impl ContainerSpec {
 pub struct ContainerOutcome {
     /// The kernel's OOM killer stopped a process of the container
     /// (`--memory`).
+    ///
+    /// The runtime's record alone can miss a kill: rootless Podman does not
+    /// keep it, and Docker on cgroup v2 loses containerd's OOM event for a
+    /// few percent of the kills (#60). A container that must tell an OOM
+    /// kill dependably reports the cgroup's own counter
+    /// ([`ContainerSpec::report_pids`], [`Container::take_pids_report`]).
     pub oom_killed: bool,
     /// The exit code of the container's main process, if it ended.
     pub exit_code: Option<i32>,
@@ -725,14 +731,16 @@ impl<'r> Container<'r> {
     /// container's exit is already visible.
     ///
     /// Only exit 137 (`128 + SIGKILL`, how the OOM killer ends the main
-    /// process) is read again. When the OOM killer stops another process of
-    /// the container instead (e.g. pdflatex under latexmk), the main
-    /// process exits later, by which time the runtime has recorded the
-    /// event: so it was in every measurement (docs/security.md §4). A
-    /// container ended by its deadline (`timeout --signal=KILL`) also exits
-    /// with 137 and is read again too, so that path waits up to
-    /// [`OOM_EVENT_POLLS`] × [`OOM_EVENT_INTERVAL`] (1 s) as well. A change
-    /// to which exit codes are read again must keep these cases in mind.
+    /// process) is read again. A container ended by its deadline (`timeout
+    /// --signal=KILL`) also exits with 137 and is read again too, so that
+    /// path waits up to [`OOM_EVENT_POLLS`] × [`OOM_EVENT_INTERVAL`] (1 s)
+    /// as well. A change to which exit codes are read again must keep this
+    /// in mind.
+    ///
+    /// Waiting does not bring back an event the runtime lost: Docker on
+    /// cgroup v2 never records a few percent of the kills, whichever
+    /// process was killed (#60, [`ContainerOutcome::oom_killed`]); the
+    /// [`REPORT_PIDS`] counter covers those.
     fn inspect_after_exit(&self, id: &str) -> Option<ContainerOutcome> {
         let mut outcome = self.inspect(id);
         for _ in 0..OOM_EVENT_POLLS {
