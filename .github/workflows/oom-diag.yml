@@ -1,0 +1,33 @@
+# Temporary diagnostic for #60; removed before the PR is merged.
+name: OOM diag
+on:
+  push:
+    branches: [fix/oom-detection]
+permissions:
+  contents: read
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Docker
+        run: |
+          docker version --format 'docker {{.Server.Version}}'
+          docker info --format '{{.CgroupVersion}} {{.KernelVersion}} {{.NCPU}}'
+          docker run --rm debian:trixie-slim true
+      - name: OOM kills, 4 in parallel, with CPU load
+        run: |
+          for i in $(seq "$(nproc)"); do (while :; do :; done) & done
+          sh .github/diag/oom.sh debian:trixie-slim 4 30 | tee "${RUNNER_TEMP}/diag.log"
+          echo "--- flag false right after exit:"; grep -c 'exit+flag=137 false' "${RUNNER_TEMP}/diag.log" || true
+          echo "--- flag still false after 1 s:"; grep -c '1s=false' "${RUNNER_TEMP}/diag.log" || true
+          echo "--- flag still false after 5 s:"; grep -c '5s=false' "${RUNNER_TEMP}/diag.log" || true
+          echo "--- counter not 1:"; grep 'counter=' "${RUNNER_TEMP}/diag.log" | grep -vc 'counter=1$' || true
+          grep -E '1s=false|5s=false' "${RUNNER_TEMP}/diag.log" || true
