@@ -36,7 +36,8 @@ Any other name works too, with `--container-image`.
 ## Versions and pinning
 
 A published version is never overwritten. To pin exactly what you verified,
-pass the digest the release workflow printed:
+pass the digest in the release notes of the version (also printed by the
+release workflow):
 
 ```bash
 texrun compile --backend container \

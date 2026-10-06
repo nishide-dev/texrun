@@ -47,7 +47,7 @@ body = """
 {{ "" }}
 """
 footer = ""
-trim = true
+trim = false
 
 [git]
 conventional_commits = true

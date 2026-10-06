@@ -217,20 +217,45 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 - texrun が強制終了された場合などに残った container は、container 内の `timeout`（preview は `sleep`）で止まった後、次に container backend を使う texrun が消す（同じ user・host の、終わった texrun のものだけ。[security.md](security.md) §4「container のライフサイクル」）。それより前に消したい場合は `docker ps -a --filter label=org.texrun.sandbox` で見つけて `docker rm -f` で消せる（Podman では `podman` に読み替える）。test を途中で止めた場合も同じである。
 - Linux の host の再起動と macOS の host 名の変更の後も、同じマシンのものなら回収される（#56。再起動の前のものは今の boot より前に作られたものに限り、Linux では container の外の、初期 PID namespace で動かした texrun のものに限る）。それ以外で host の識別子が変わった場合（使い捨ての container や dev コンテナの中で texrun を動かした場合、Linux の `/etc/machine-id`・`boot_id` や macOS の `IOPlatformUUID`・`kern.bootsessionuuid` が読めない場合、#56 より前の texrun が作ったもの）は、それ以前の container と temp dir の `texrun-preview-*` は自動では回収されないので、同じ方法で手で消す（[security.md](security.md) §2「sandbox backend で追加で保証する」の 5）。
 
-### engine image の公開
+### release（engine image の公開と release notes）
 
-`.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。release の手順:
+`.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。`v<version>` の tag を push するだけで、検証 → engine image の公開 → release notes 付きの GitHub release の作成までが行われる。release の手順:
 
 1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.0' -- README.md docs/` で確かめられる（`0.1.0` は現在の版）。
    - `README.md`: 冒頭の note、Installation の `cargo install ... --tag v<version>` と `docker pull ghcr.io/nishide-dev/texrun-engine:<version>`
    - `docs/engine-image.md`: `cargo install`・`docker pull`・`docker build` の例、`engine.version` の例、`gh attestation verify` の例
-2. その commit に `v<version>` の tag を push する（または、その tag で GitHub release を作る）。workflow が、版の一致と tag が main の祖先であることを確かめ、両 platform の image を test してから、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。image の Debian source package は `texrun-engine-<version>-sources.tar` として、tag の GitHub release に付く（release が無ければ workflow が作る）。
+2. その commit に `v<version>` の tag を push する（`git tag v<version> <commit>` と `git push origin v<version>`）。workflow が、版の一致と tag が main の祖先であることを確かめ、両 platform の image を test してから、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。続く `release` job が tag の GitHub release を作り、release notes（下記）を書き、image の Debian source package を `texrun-engine-<version>-sources.tar` として付ける。版に `-` を含む（`v0.2.0-rc.1` など）場合は prerelease になる。
 3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
-4. workflow の summary に出る digest で `docker pull`・`gh attestation verify` を確かめる。
+4. release notes（または workflow の summary）に出る digest で `docker pull`・`gh attestation verify` を確かめる。
+
+#### release notes
+
+release notes は `cliff.toml`（[git-cliff](https://git-cliff.org)）と `.github/scripts/release-notes.sh` が、main の commit から作る。手で書く必要はない（GitHub release を先に手で作っても、`release` job が notes を生成したものに置き換える）。
+
+- **What's changed**: 前の版の tag から今回の tag までの commit を、Conventional Commits の type で分ける（`feat` → Features、`fix` → Bug fixes、`perf` → Performance、`docs` → Documentation、`refactor` / `test` / `build` / `chore` → Other changes）。`chore(deps)`（Dependabot）は Dependencies に件数と PR 番号の 1 行にまとめる。`!` または `BREAKING CHANGE:` footer の commit は Breaking changes にも載る。各行は commit のタイトル（= squash merge した PR のタイトル）で、PR へのリンクが付く。
+  - 安定版（`-` を含まない版）は前の安定版からの差分で、間の prerelease の分も含む。prerelease は直前の tag（prerelease を含む）からの差分。最初の版（`v0.1.0`）は全履歴。
+  - したがって notes の文面は PR タイトル（type・scope・description）で決まる。PR タイトルは利用者が読む 1 行として書く（[CONTRIBUTING.md](../CONTRIBUTING.md#pr-title)）。merge 後に commit のタイトルは直せないので、公開後に気付いた誤りは GitHub の release を手で編集して直す（下記の作り直しや `release` の再実行をすると、手の編集は消える）。分類の規則を変える場合は `cliff.toml` を変える。
+- **Install / Engine image / Source of the engine image**: `cargo install --locked --git ... --tag v<version> texrun`、image の tag と `publish` が push した digest での `docker pull` と `--container-image` の指定、`gh attestation verify`、source tar の説明。固定の文面で、`release-notes.sh` にある。
+
+ローカルで確かめる（git-cliff 2.14.2 を `cargo install --locked git-cliff@2.14.2` などで入れる。CI と同じ版）:
+
+```bash
+# 公開済みの版の notes（digest は省略すると placeholder）
+.github/scripts/release-notes.sh v0.1.0
+# まだ tag の無い版: 最後の tag から HEAD までを、その版として表示する
+.github/scripts/release-notes.sh v0.2.0
+# 全履歴の changelog（CHANGELOG.md は repository に置かない。GitHub release が changelog）
+git cliff
+```
+
+notes の生成だけを行う workflow が `.github/workflows/release-notes.yml` にある。image の公開や release の作成はしない。
+
+- PR（`cliff.toml`・`release-notes.sh`・この workflow を変えたとき）: 最後の tag の notes と、次の版（最後の tag の patch + 1）として最後の tag 以降の commit の notes を生成し、job summary と artifact `release-notes` に出す。
+- 既存の release の notes を作り直す: `gh workflow run release-notes.yml --ref main -f tag=v<version> -f update=true`。notes を生成し（digest は GHCR にあるその版の image のもの）、`gh release edit` で置き換える。`update=false`（既定）なら生成して summary に出すだけ（dry run）。`update=true` は main か tag の上でのみ実行でき、image が公開されていない版では失敗する。
 
 公開した版の tag は上書きしない（workflow も拒否する）。失敗した場合:
 
-- `release` だけが失敗した場合（image は公開済み）: `gh run rerun <run-id> --failed` で、同じ run の artifact（`engine-sources`）を使って `release` だけを再実行する。artifact の保持は 7 日なので、それまでに行う。release に sources の asset が既にあれば、先に消す。
+- `release` だけが失敗した場合（image は公開済み）: `gh run rerun <run-id> --failed` で、同じ run の artifact（`engine-sources`）を使って `release` だけを再実行する。artifact の保持は 7 日なので、それまでに行う。release に sources の asset が既にあれば、先に消す（notes は再実行で生成し直して置き換わる）。
 - `publish` の tag を付ける前（layer の比較、attestation など）で失敗した場合: 版の tag はまだ無い。GHCR に digest だけの image が残っていれば消し、`gh run rerun <run-id> --failed` または `workflow_dispatch`（`publish` を on、tag を選ぶ）で再実行する。
 - 版の tag が付いた後にやり直す場合: GHCR から該当の版を消してから、`workflow_dispatch` で再実行する。
 - 最初の公開では、`Refuse to overwrite a published version` step の出力を確かめる。まだ無い package に対して GHCR が `not found` / `manifest unknown` / `name unknown` 以外（`denied` など）を返すと、その run は止まる（fail-closed）。その場合は、この step の正規表現を GHCR の実際の文言に合わせる。

@@ -1,0 +1,146 @@
+name: Release notes
+
+# Generates the release notes of a version (cliff.toml,
+# .github/scripts/release-notes.sh) without publishing anything. The notes
+# of a release are written by engine-image.yml when its tag is pushed; this
+# workflow previews them and rewrites the notes of an existing release
+# (docs/development.md, "release notes").
+#
+# Triggers:
+# - pull_request (the notes configuration changed): the notes of the
+#   latest tag and a preview of the next version (the commits since that
+#   tag, including the PR), in the job summary and the `release-notes`
+#   artifact.
+# - workflow_dispatch with `tag`: the notes of that tag, the same way. With
+#   `update` on, they also replace the notes of the GitHub release of the
+#   tag (run on main or on a tag). The image is not published again: the
+#   digest is the one GHCR has for the version.
+
+on:
+  pull_request:
+    paths:
+      - cliff.toml
+      - .github/scripts/release-notes.sh
+      - .github/workflows/release-notes.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release (v<semver>)
+        type: string
+        required: true
+      update:
+        description: Replace the notes of the GitHub release of the tag; off = dry run
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.tag }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/nishide-dev/texrun-engine
+
+jobs:
+  notes:
+    name: notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The history and tags the notes are made from.
+          fetch-depth: 0
+      # Keep the version in sync with engine-image.yml.
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: git-cliff@2.14.2
+      - name: Generate
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.update }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
+            if [ "${UPDATE}" = true ] && [ "${GITHUB_REF}" != refs/heads/main ] && [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+              echo "::error::update the notes from main or a v* tag (this run is on ${GITHUB_REF})"
+              exit 1
+            fi
+            if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::no tag ${TAG}"
+              exit 1
+            fi
+            tags=("${TAG}")
+          else
+            # The latest release, and the next one (its patch version + 1)
+            # as a preview of the commits since then.
+            latest="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)"
+            IFS=. read -r major minor patch <<< "${latest%%-*}"
+            tags=("${latest}" "${major}.${minor}.$((patch + 1))")
+          fi
+          mkdir -p "${RUNNER_TEMP}/notes"
+          for tag in "${tags[@]}"; do
+            version="${tag#v}"
+            # The published image of the version; a version without one
+            # gets a placeholder (only allowed for a preview).
+            if out="$(docker buildx imagetools inspect "${IMAGE}:${version}" --format '{{json .Manifest}}' 2>&1)"; then
+              digest="$(jq -r .digest <<< "${out}")"
+            elif grep -qiE 'not found|manifest unknown|name unknown' <<< "${out}"; then
+              if [ "${UPDATE}" = true ]; then
+                echo "::error::${IMAGE}:${version} is not published; publish the release with engine-image.yml"
+                exit 1
+              fi
+              echo "::warning::${IMAGE}:${version} is not published; the notes have a placeholder digest"
+              digest=""
+            else
+              echo "::error::cannot look up ${IMAGE}:${version}: ${out}"
+              exit 1
+            fi
+            bash .github/scripts/release-notes.sh "${tag}" ${digest:+"${digest}"} > "${RUNNER_TEMP}/notes/${tag}.md"
+            {
+              echo "# ${tag}"
+              echo
+              echo "Image digest: \`${digest:-not published}\`"
+              echo
+              cat "${RUNNER_TEMP}/notes/${tag}.md"
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+          retention-days: 7
+          if-no-files-found: error
+
+  # Only this job can write, and it runs no repository code.
+  update:
+    name: update
+    needs: notes
+    if: github.event_name == 'workflow_dispatch' && inputs.update
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Edit the release.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+      - name: Replace the notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Releases are created by engine-image.yml (with the sources), not here.
+          gh release view "${TAG}" -R "${GITHUB_REPOSITORY}" --json tagName >/dev/null
+          gh release edit "${TAG}" -R "${GITHUB_REPOSITORY}" --notes-file "${RUNNER_TEMP}/notes/${TAG}.md"
+          echo "Updated the notes of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}" >> "${GITHUB_STEP_SUMMARY}"
