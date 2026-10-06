@@ -575,3 +575,89 @@ fn max_diagnostics_applies_to_real_logs() {
     );
     assert_eq!(parsed.diagnostics[2].severity, Severity::Info);
 }
+
+/// pdfTeX's own fatal error (`!pdfTeX error:`, #66): a font it cannot load
+/// while writing the PDF, after the input was read. No position is printed,
+/// so none is reported.
+#[test]
+fn pdftex_error_for_a_missing_font() {
+    let d = parse("pdftex-missing-font");
+    assert_eq!(kinds(&d), [K::Other, K::EmergencyStop]);
+    assert_at(&d[0], Severity::Error, K::Other, (None, None));
+    assert_eq!(
+        d[0].message,
+        "pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not found"
+    );
+    let excerpt = d[0].raw_excerpt.as_deref().unwrap();
+    assert!(excerpt.ends_with(" ==> Fatal error occurred, no output PDF file produced!"));
+    // The summary that follows is a consequence (#40).
+    assert_at(&d[1], Severity::Info, K::EmergencyStop, (None, None));
+    assert_eq!(
+        d[1].message,
+        "Fatal error occurred, no output PDF file produced!"
+    );
+    // The default configuration finds it too.
+    assert_eq!(
+        parse_log(&read("pdftex-missing-font"))[0].message,
+        d[0].message
+    );
+}
+
+/// The same while the input is read: the file being read is not reported
+/// either, since pdfTeX does not say where the image was requested.
+#[test]
+fn pdftex_error_for_a_missing_image() {
+    let d = parse("pdftex-missing-image");
+    assert_eq!(kinds(&d), [K::Other, K::EmergencyStop]);
+    assert_at(&d[0], Severity::Error, K::Other, (None, None));
+    assert_eq!(
+        d[0].message,
+        "pdfTeX error: pdflatex: cannot find image file nosuch.png"
+    );
+    assert_eq!(d[1].severity, Severity::Info);
+}
+
+/// A pdfTeX error reported through TeX's error routine has the usual form.
+#[test]
+fn pdftex_error_with_a_position() {
+    let d = parse("pdftex-error-ext");
+    assert_eq!(kinds(&d), [K::Other, K::EmergencyStop]);
+    assert_at(
+        &d[0],
+        Severity::Error,
+        K::Other,
+        (Some("main.tex"), Some(5)),
+    );
+    assert!(
+        d[0].message
+            .starts_with("pdfTeX error (ext4): pdf_link_stack empty"),
+        "{}",
+        d[0].message
+    );
+    assert_eq!(d[1].severity, Severity::Info);
+}
+
+/// Other fatal engine errors are TeX errors: an error, then the stop as info.
+#[test]
+fn fatal_engine_errors() {
+    for (name, message, line) in [
+        (
+            "capacity-exceeded",
+            "TeX capacity exceeded, sorry [input stack size=10000].",
+            4,
+        ),
+        ("cannot-write", "I can't write on file `/tmp/out.txt'.", 3),
+        ("interruption", "Interruption.", 4),
+    ] {
+        let d = parse(name);
+        assert_eq!(kinds(&d), [K::Other, K::EmergencyStop], "{name}");
+        assert_at(
+            &d[0],
+            Severity::Error,
+            K::Other,
+            (Some("main.tex"), Some(line)),
+        );
+        assert_eq!(d[0].message, message, "{name}");
+        assert_eq!(d[1].severity, Severity::Info, "{name}");
+    }
+}

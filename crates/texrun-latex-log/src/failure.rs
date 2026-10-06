@@ -86,6 +86,8 @@ pub fn unexplained_failure(log: &[u8]) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     #[test]
@@ -102,7 +104,7 @@ mod tests {
     fn excerpts_the_last_lines() {
         let mut log = String::new();
         for n in 0..100 {
-            log.push_str(&format!("line {n}\n\n"));
+            writeln!(log, "line {n}\n").unwrap();
         }
         let d = unexplained_failure(log.as_bytes());
         assert!(d.message.contains("no error was recognized"));

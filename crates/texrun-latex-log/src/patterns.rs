@@ -379,6 +379,33 @@ mod tests {
     }
 
     #[test]
+    fn pdftex_fail_headers() {
+        let line = "!pdfTeX error: pdflatex (file x): Font x at 600 not found";
+        assert_eq!(pdftex_fail(line), Some(&line[1..]));
+        let h = error_header(line).unwrap();
+        assert_eq!((h.file, h.line, h.text), (None, None, &line[1..]));
+        assert_eq!(classify_error(h.text).kind, DiagnosticKind::Other);
+        for not_fail in [
+            "!pdfTeX error:",
+            "!pdfTeX error:   ",
+            "! pdfTeX error (ext4): x",
+            "pdfTeX error: x",
+            "!pdfTeX warning: x",
+        ] {
+            assert_eq!(pdftex_fail(not_fail), None, "{not_fail:?}");
+        }
+        assert_eq!(
+            pdftex_fatal_summary(" ==> Fatal error occurred, no output PDF file produced!"),
+            Some("Fatal error occurred, no output PDF file produced!")
+        );
+        assert_eq!(
+            pdftex_fatal_summary("==> Fatal error occurred, no output PDF file produced!"),
+            None
+        );
+        assert_eq!(pdftex_fatal_summary(" ==> something else"), None);
+    }
+
+    #[test]
     fn missing_file_names_and_loaders() {
         assert_eq!(
             missing_file_name("LaTeX Error: File `tikz.sty' not found."),

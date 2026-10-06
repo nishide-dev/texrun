@@ -24,6 +24,13 @@
 # - `wrapped`: without `max_print_line` (TeX's default 79-column wrapping);
 # - `rerun`: a single `pdflatex` pass with the same options, because latexmk
 #   reruns until the "Rerun to get cross-references right" warning is gone.
+# - `pdftex-missing-font`: with `MKTEXPK=0` (as the TeX Live engine sets it),
+#   so that a font without a Type 1 version (here `ecrm1000`, cm-super not
+#   being used) cannot be made as a bitmap: `!pdfTeX error: ... not found`.
+# - `cannot-write`: with `openout_any=p` (as the TeX Live engine), which
+#   refuses `\openout` to an absolute path.
+# - `interruption`: a single `pdflatex` pass in an endless loop, stopped
+#   with SIGINT after 3 seconds (`! Interruption.`).
 #
 # The BibTeX logs `logs/bibtex-*.blg` come from one `pdflatex` pass (same
 # options) followed by `bibtex main` in the document directory (mode
@@ -59,6 +66,12 @@ compile() {
         latexmk -pdf -norc "${common[@]}" -file-line-error main.tex ;;
       single-pass)
         max_print_line=10000 pdflatex "${common[@]}" -file-line-error main.tex ;;
+      no-mktexpk)
+        MKTEXPK=0 max_print_line=10000 latexmk -pdf -norc "${common[@]}" -file-line-error main.tex ;;
+      paranoid-out)
+        openout_any=p max_print_line=10000 latexmk -pdf -norc "${common[@]}" -file-line-error main.tex ;;
+      interrupt)
+        max_print_line=10000 timeout -s INT 3 pdflatex "${common[@]}" -file-line-error main.tex ;;
       bibtex)
         max_print_line=10000 pdflatex "${common[@]}" -file-line-error main.tex || true
         openin_any=p bibtex main ;;
@@ -106,6 +119,12 @@ compile missing-package-same-line default
 compile missing-package-in-sty default
 compile missing-package-traditional traditional missing-package-before-usepackage
 compile missing-package-indented default
+compile pdftex-missing-font no-mktexpk
+compile pdftex-missing-image default
+compile pdftex-error-ext default
+compile capacity-exceeded default
+compile cannot-write paranoid-out
+compile interruption interrupt
 compile bibtex-syntax bibtex
 compile bibtex-missing-database bibtex
 compile bibtex-missing-entry bibtex

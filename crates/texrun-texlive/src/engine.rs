@@ -1634,7 +1634,11 @@ mod tests {
         let result = run_failing_with_log("");
         let errors: Vec<_> = result.errors().collect();
         assert_eq!(errors.len(), 1, "{errors:#?}");
-        assert!(errors[0].message.contains("no log"), "{}", errors[0].message);
+        assert!(
+            errors[0].message.contains("no log"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]
