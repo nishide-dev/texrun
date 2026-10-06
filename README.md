@@ -159,6 +159,27 @@ New fields and enum values may be added without changing `schema_version`.
 The full schema, every error and note kind, and the details of each exit code
 are in [docs/cli.md](docs/cli.md).
 
+## Using texrun from AI agents
+
+The repository includes an [Agent Skill](skills/texrun/SKILL.md) that
+teaches an AI agent the compile-fix-preview loop: compile with `--json`,
+fix the errors at the reported file and line, recompile, and look at the
+page previews, using `--backend container` for untrusted documents. Install
+texrun first, then add the skill to Claude Code as a plugin, at the
+release tag of your texrun so that the skill matches its CLI (releases from
+v0.1.1 contain the plugin):
+
+```text
+/plugin marketplace add nishide-dev/texrun@v<version>
+/plugin install texrun@texrun
+```
+
+Or copy [`skills/texrun/`](skills/texrun/) to `~/.claude/skills/`, or to the
+skills directory of another agent that supports the Agent Skills format. See
+[docs/agent-skills.md](docs/agent-skills.md) for updating, texrun installed
+from the default branch, the Claude Agent SDK, other agents, and why
+Claude.ai and the Claude API are not supported.
+
 ## Security
 
 texrun treats every document as untrusted input. It disables shell escape,

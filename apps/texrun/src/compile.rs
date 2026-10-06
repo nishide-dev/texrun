@@ -39,6 +39,7 @@ use crate::human::{self, Paths};
 use crate::output::{self, OutputDirError};
 use crate::report::{
     Category, CompileReport, ErrorInfo, Note, ProjectInfo, Stage, WorkspaceInfo, host_path, kind,
+    note,
 };
 use crate::signals::SignalGuard;
 
@@ -305,7 +306,7 @@ fn parent_directory_note(result: &CompileResult) -> Option<Note> {
         .any(|d| d.kind == DiagnosticKind::MissingFile && d.message.contains("../"))
         .then(|| Note {
             severity: Severity::Info,
-            kind: "parent_directory_input",
+            kind: note::PARENT_DIRECTORY_INPUT,
             message: "TeX cannot read files above the entrypoint's directory, even with --root; \
                       move the entrypoint into the directory that contains the files it includes"
                 .to_owned(),
@@ -525,7 +526,7 @@ fn check_root(root: &Path, explicit: bool) -> Result<Option<Note>, ErrorInfo> {
     let shown = human::show(root);
     if explicit && root.parent().is_some() {
         return Ok(Some(warn_now(
-            "broad_project_root",
+            note::BROAD_PROJECT_ROOT,
             format!(
                 "the project root {shown} is {what}; everything below it is copied into the \
                  workspace"
@@ -575,7 +576,7 @@ fn workspace_config(
         }
         OutputExclusion::ContainsEntrypoint => Some(Note {
             severity: Severity::Info,
-            kind: "output_contains_entrypoint",
+            kind: note::OUTPUT_CONTAINS_ENTRYPOINT,
             message: format!(
                 "the output directory {} contains the entrypoint, so it is copied into the \
                  workspace with the project, including the output of earlier runs; use an \

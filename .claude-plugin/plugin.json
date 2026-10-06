@@ -1,0 +1,12 @@
+{
+  "name": "texrun",
+  "description": "Compile LaTeX documents with texrun, fix errors from its JSON diagnostics and check the page previews",
+  "author": {
+    "name": "nishide-dev",
+    "url": "https://github.com/nishide-dev"
+  },
+  "homepage": "https://github.com/nishide-dev/texrun",
+  "repository": "https://github.com/nishide-dev/texrun",
+  "license": "MIT",
+  "keywords": ["latex", "tex", "pdf", "texrun"]
+}
