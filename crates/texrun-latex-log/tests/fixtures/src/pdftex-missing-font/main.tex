@@ -1,5 +1,6 @@
 \documentclass{article}
-\usepackage[T1]{fontenc}
+% cmntt10 has a TFM and METAFONT source in TeX Live, but no Type 1 font.
+\font\nonstandardtt=cmntt10
 \begin{document}
-Text.
+Text {\nonstandardtt AB}.
 \end{document}

@@ -25,8 +25,10 @@
 # - `rerun`: a single `pdflatex` pass with the same options, because latexmk
 #   reruns until the "Rerun to get cross-references right" warning is gone.
 # - `pdftex-missing-font`: with `MKTEXPK=0` (as the TeX Live engine sets it),
-#   so that a font without a Type 1 version (here `ecrm1000`, cm-super not
-#   being used) cannot be made as a bitmap: `!pdfTeX error: ... not found`.
+#   so that a font without a Type 1 version cannot be made as a bitmap:
+#   `!pdfTeX error: ... not found`. The font is `cmntt10` (cmextra): the dev
+#   image has Type 1 fonts for the usual encodings (cm-super, #65), so the
+#   EC / TC fonts no longer fail.
 # - `cannot-write`: with `openout_any=p` (as the TeX Live engine), which
 #   refuses `\openout` to an absolute path.
 # - `interruption`: a single `pdflatex` pass in an endless loop, stopped

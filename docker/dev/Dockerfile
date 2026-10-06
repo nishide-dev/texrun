@@ -28,12 +28,17 @@ RUN printf '%s\n' \
 
 # TeX Live (latexmk + pdflatex + bibtex) and PDF preview tools.
 # `texlive-binaries` (pulled in by texlive-latex-base) provides `bibtex`.
+# The fonts are the same as in the engine image (Type1 fonts for T1 / TS1,
+# Latin Modern and PSNFSS; see docker/engine/Dockerfile and #65).
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
          latexmk \
          texlive-latex-base \
          texlive-latex-recommended \
+         texlive-fonts-recommended \
+         cm-super \
+         lmodern \
          mupdf-tools \
          poppler-utils \
     && apt-get clean \

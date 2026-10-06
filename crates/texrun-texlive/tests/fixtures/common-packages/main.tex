@@ -1,0 +1,65 @@
+% A typical document with the default fonts (OT1 Computer Modern), at 11pt
+% so that the TS1 symbols (\textbullet of itemize, textcomp) are needed at
+% sizes other than 10pt too (#65).
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{textcomp}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[margin=25mm]{geometry}
+\usepackage{microtype}
+\usepackage{hyperref}
+\begin{document}
+\section{Lists \textbullet{} and symbols}\label{sec:lists}
+\begin{itemize}
+  \item First \textbullet{} \textdegree{}C \texteuro{}10 \textcopyright{}
+    \textmu{}m \textperthousand{} \textrightarrow{} --- ``quotes''
+  \begin{itemize}
+    \item nested
+    \begin{itemize}
+      \item deeper
+      \begin{itemize}
+        \item deepest
+      \end{itemize}
+    \end{itemize}
+  \end{itemize}
+\end{itemize}
+\begin{enumerate}
+  \item One\footnote{A footnote \textbullet{} \texteuro{}.}
+  \item {\small Two \textbullet} {\large Three \textbullet} {\Huge \textbullet}
+\end{enumerate}
+\begin{description}
+  \item[Term] A description \textbullet
+  \begin{itemize}
+    \item with a list \textdegree{}
+  \end{itemize}
+\end{description}
+\textbf{Bold \textbullet} \textit{italic} \textsf{sans} \texttt{mono} \textsc{Small Caps}
+
+\section{Math, tables and figures}
+\begin{align}
+  a^2 + b^2 &= c^2 \label{eq:pythagoras} \\
+  \mathbb{R} &\subsetneq \mathbb{C}, \quad \varnothing \leqslant \mathfrak{g}
+\end{align}
+Equation~\eqref{eq:pythagoras}, Section~\ref{sec:lists},
+\url{https://example.com}.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lr}
+    \toprule
+    Item & Value \\
+    \midrule
+    a & 1 \\
+    b & 2 \\
+    \bottomrule
+  \end{tabular}
+  \caption{A table.}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=2cm]{figure.png}
+  \caption{A figure.}
+\end{figure}
+\end{document}

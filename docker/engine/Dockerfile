@@ -45,12 +45,28 @@ RUN printf '%s\n' \
       'path-exclude=/usr/share/texmf/doc/*' \
       > /etc/dpkg/dpkg.cfg.d/01-texrun-nodoc
 
+# Fonts (#65): texrun sets MKTEXPK=0 (docs/security.md §3.4), so a font
+# without a Type1 file fails the compile ("Font ... not found") instead of
+# being generated as a bitmap. texlive-latex-base only brings Computer
+# Modern (OT1) in Type1, but current LaTeX takes \textbullet (itemize) and
+# the other textcomp symbols from TS1, and fontenc T1 is common:
+# - cm-super: the Type1 EC / TC fonts (T1 and TS1) at every size
+#   (cm-super-minimal only has the 10pt ones, so 11pt documents or headings
+#   still fail);
+# - lmodern: the LaTeX support of Latin Modern (\usepackage{lmodern}); the
+#   fonts themselves (fonts-lmodern) come with texlive-latex-base;
+# - texlive-fonts-recommended: the PSNFSS fonts (Times, Helvetica, Courier,
+#   Palatino, ... for mathptmx, helvet, mathpazo); it comes from the same
+#   source package as texlive-base, so it adds nothing to the sources.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
          latexmk \
          texlive-latex-base \
          texlive-latex-recommended \
+         texlive-fonts-recommended \
+         cm-super \
+         lmodern \
          mupdf-tools \
          poppler-utils \
     && apt-get clean \

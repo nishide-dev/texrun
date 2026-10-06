@@ -151,7 +151,7 @@ does not show it. A missing package or class has the line of its
 `\usepackage` / `\documentclass` only when it can be told for certain.
 
 Errors pdfTeX reports itself, e.g. a font or an image it cannot load
-(`!pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not found`),
+(`!pdfTeX error: pdflatex (file cmntt10): Font cmntt10 at 600 not found`),
 are `other` errors without `file` and `line`: pdfTeX does not say where, and
 it often fails while writing the PDF. Other fatal engine errors (`TeX
 capacity exceeded`, `I can't write on file`, `Interruption`) are `other`

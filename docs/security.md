@@ -303,7 +303,7 @@ in-process 実行の「保証する」1〜5 は、sandbox backend でもその�
 | `HOME` | `<workspace>/.texrun/home`（texrun が作る空ディレクトリ） | user の `~/texmf`（TEXMFHOME）や `~/.latexmkrc` を使わないため。**未設定にしてはいけない**。`HOME` が無いと、TEXMFHOME と TEXMFVAR が cwd（= workspace）相対のパスになる |
 | `openin_any` / `openout_any` | `p` | §3.7 |
 | `max_print_line` | `10000` | ログの 79 文字折り返しを抑える（#7 の parse 精度のため）。`error_line` / `half_error_line` も変えるかは #7 で決める |
-| `MKTEXTFM` / `MKTEXPK` / `MKTEXMF` / `MKTEXTEX` / `MKTEXFMT` | `0` | ファイルが見つからないときに、kpathsea が生成 script を起動しないようにする。この起動は `-no-shell-escape` とは独立に行われ、生成物を TEXMFVAR に書き込む |
+| `MKTEXTFM` / `MKTEXPK` / `MKTEXMF` / `MKTEXTEX` / `MKTEXFMT` | `0` | ファイルが見つからないときに、kpathsea が生成 script を起動しないようにする。この起動は `-no-shell-escape` とは独立に行われ、生成物を TEXMFVAR に書き込む。そのため文書が使う font は Type1 で TeX tree に入っている必要があり、dev image と engine image は一般的な文書の font（`cm-super`・`lmodern`・`texlive-fonts-recommended`、#65）を入れている |
 | `LC_ALL` | `C` | メッセージと bibtex の挙動を locale に依存させない。`LC_ALL=C` でも、UTF-8 のファイル名は compile できた |
 
 - 渡さない変数（例）:
@@ -621,7 +621,7 @@ TeX engine を texrun 本体と別の isolation boundary で動かす backend �
 `docker/engine/Dockerfile`。dev image（`docker/dev`）とは別の、最小の runtime image である。
 
 - base は `debian:trixie-slim` を multi-arch index の digest で固定し、Dependabot が digest を更新する。
-- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（`mupdf-tools` / `poppler-utils`）も dev image と揃えて入れる（#46。AGPL / GPL の配布条件は [engine-image.md](engine-image.md#licenses)）。Rust toolchain やコンパイラは入れない。
+- TeX Live のパッケージ（`latexmk`、`texlive-latex-base`、`texlive-latex-recommended`、font の `texlive-fonts-recommended`・`cm-super`・`lmodern`）は dev image と揃え、#10 の fixture が両方の backend で同じ結果になるようにする。preview tool（`mupdf-tools` / `poppler-utils`）も dev image と揃えて入れる（#46。AGPL / GPL の配布条件は [engine-image.md](engine-image.md#licenses)）。Rust toolchain やコンパイラは入れない。
 - 既定の user は uid 10001 の非 root user で、`ENV` は `PATH` だけである。texrun は常に自分の `--user` を渡す。
 - texrun が image に期待するもの: `/usr/bin/latexmk`、`/usr/bin` の pdflatex / bibtex / makeindex、`/usr/bin/timeout` と `/usr/bin/sleep`（coreutils）、`/usr/bin/prlimit`（util-linux）、`/bin/sh`（POSIX shell。プロセス数の上限の報告）、`/usr/bin/mutool` または `/usr/bin/pdfinfo` + `/usr/bin/pdftoppm`（preview）。`/workspace` と `/texrun` には何も置かない。
 - CI の `sandbox` job が毎回 build する（layer は GitHub Actions の cache に置く）。既定の image は、その版の texrun のために公開した `ghcr.io/nishide-dev/texrun-engine:<version>`（`texrun_sandbox::DEFAULT_IMAGE`、`--container-image` で変えられる）。公開の仕組みは次の「engine image の公開」を参照。

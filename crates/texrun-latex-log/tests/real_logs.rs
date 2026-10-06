@@ -586,7 +586,7 @@ fn pdftex_error_for_a_missing_font() {
     assert_at(&d[0], Severity::Error, K::Other, (None, None));
     assert_eq!(
         d[0].message,
-        "pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not found"
+        "pdfTeX error: pdflatex (file cmntt10): Font cmntt10 at 600 not found"
     );
     let excerpt = d[0].raw_excerpt.as_deref().unwrap();
     assert!(excerpt.ends_with(" ==> Fatal error occurred, no output PDF file produced!"));
