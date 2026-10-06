@@ -18,7 +18,8 @@
 //! | `LaTeX Error: File `x.sty' not found.`, `I can't find file` | `MissingFile` | error |
 //! | `LaTeX Error: ...`, `Package x Error: ...`, `Class x Error: ...` | `LatexError` | error |
 //! | `Emergency stop.`, ` ==> Fatal error occurred` (if no stop was reported) | `EmergencyStop` | error; info after an error |
-//! | any other TeX error (`Missing $ inserted.`, ...) | `Other` | error |
+//! | `!pdfTeX error: ...` (pdfTeX cannot load a font, an image, ...) | `Other` | error |
+//! | any other TeX error (`Missing $ inserted.`, `TeX capacity exceeded`, `I can't write on file`, `Interruption.`, `pdfTeX error (ext4): ...`, ...) | `Other` | error |
 //! | `Overfull \hbox` / `\vbox` | `OverfullBox` | warning |
 //! | `Underfull \hbox` / `\vbox` | `UnderfullBox` | warning |
 //! | `Reference `x' ... undefined` | `UndefinedReference` | warning |
@@ -39,6 +40,18 @@
 //! own, so it is reported with [`Severity::Info`]: the number of errors is
 //! the number of problems to fix. A stop without an earlier error (e.g. a
 //! job aborted for another reason) stays an error.
+//!
+//! pdfTeX reports some fatal errors itself (`!pdfTeX error: ...`, without a
+//! space after `!` and without a `file:line:` prefix even with
+//! `-file-line-error`), e.g. a font or an image it cannot load; the job ends
+//! right after it with an unprefixed ` ==> Fatal error occurred` line, which
+//! is reported like the stop after a TeX error.
+//!
+//! A log may still end a failed compile without any recognized error (an
+//! engine message in an unknown form, a log cut short, no log at all).
+//! Callers that know the compile failed can add [`unexplained_failure`],
+//! which excerpts the end of the log, so that a failure always comes with
+//! an error.
 //!
 //! # Locations
 //!
@@ -76,6 +89,9 @@
 //!   they are inside the root given to [`LogParser::with_workspace_root`];
 //!   everything else (e.g. installed packages under `texmf-dist`) yields
 //!   `file = None`.
+//! - `!pdfTeX error: ...` has neither `file` nor `line`: pdfTeX prints no
+//!   position, and it often fails while writing the PDF, after the input
+//!   was read, so the file stack says nothing about the cause.
 //!
 //! # Volume
 //!
@@ -125,6 +141,7 @@
 //! ```
 
 mod blg;
+mod failure;
 mod lines;
 mod parser;
 mod patterns;
@@ -132,6 +149,7 @@ mod request;
 mod stack;
 
 pub use blg::{BibFiles, BlgParser, ParsedBlg, parse_blg};
+pub use failure::unexplained_failure;
 pub use parser::ParsedLog;
 pub use texrun_core::{Diagnostic, DiagnosticKind, Severity};
 use texrun_core::{WorkspacePath, WorkspaceRoot};

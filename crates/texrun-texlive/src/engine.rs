@@ -362,7 +362,8 @@ impl LatexmkEngine {
             finished.status.success(),
             pdf_ok,
         );
-        diagnostics.extend(plan.parse_log());
+        let main_log = plan.parse_log();
+        diagnostics.extend(main_log.diagnostics);
         // When latexmk started, for telling this compile's BibTeX logs from
         // stale ones.
         let started = SystemTime::now()
@@ -373,6 +374,13 @@ impl LatexmkEngine {
             &finished.stdout.bytes,
             &finished.stderr.bytes,
         ));
+        // A failed compile always comes with an error, even when the log
+        // has none in a known form (docs/cli.md).
+        if outcome == CompileOutcome::Failed
+            && !diagnostics.iter().any(|d| d.severity == Severity::Error)
+        {
+            diagnostics.push(main_log.unexplained_failure);
+        }
 
         let mut result = CompileResult::new(outcome, self.info(), finished.elapsed);
         result.exit = Some(ProcessExit::from(finished.status));
@@ -916,12 +924,17 @@ impl Plan {
     }
 
     /// Parses the main log into diagnostics with workspace-relative files.
-    fn parse_log(&self) -> Vec<Diagnostic> {
+    fn parse_log(&self) -> MainLog {
         let mut buf = Vec::new();
         let path = self.output_dir.join(format!("{}.log", self.stem));
         let Ok(truncated) = read_log(&path, &mut buf) else {
-            return Vec::new();
+            return MainLog::new(Vec::new(), &[]);
         };
+        let diagnostics = self.parse_log_bytes(&buf, truncated);
+        MainLog::new(diagnostics, &buf)
+    }
+
+    fn parse_log_bytes(&self, buf: &[u8], truncated: bool) -> Vec<Diagnostic> {
         // TeX ran in the entrypoint's directory, so the log names files
         // relative to it; the parser wants TeX's working directory as root,
         // as TeX saw it (absolute paths in the log are guest paths in a
@@ -935,7 +948,7 @@ impl Plan {
         let parsed = LogParser::new()
             .with_workspace_root(&tex_cwd)
             .with_max_print_line(MAX_PRINT_LINE)
-            .parse_with_sources(&buf, &sources);
+            .parse_with_sources(buf, &sources);
         let mut diagnostics: Vec<Diagnostic> = parsed
             .diagnostics
             .into_iter()
@@ -981,6 +994,23 @@ impl Plan {
             stdout,
             stderr,
         )
+    }
+}
+
+/// What the main log says.
+struct MainLog {
+    diagnostics: Vec<Diagnostic>,
+    /// The error to report if the compile failed without one (see
+    /// [`texrun_latex_log::unexplained_failure`]).
+    unexplained_failure: Diagnostic,
+}
+
+impl MainLog {
+    fn new(diagnostics: Vec<Diagnostic>, log: &[u8]) -> Self {
+        Self {
+            diagnostics,
+            unexplained_failure: texrun_latex_log::unexplained_failure(log),
+        }
     }
 }
 
@@ -1134,7 +1164,7 @@ mod tests {
             "(./main.tex (./chapters/intro.tex\n./chapters/intro.tex:3: Undefined control sequence.\nl.3 \\foo\n",
         )
         .unwrap();
-        let diagnostics = plan.parse_log();
+        let diagnostics = plan.parse_log().diagnostics;
         let d = &diagnostics[0];
         assert_eq!(d.kind, DiagnosticKind::UndefinedControlSequence);
         assert_eq!(d.file.as_ref().unwrap().as_str(), "src/chapters/intro.tex");
@@ -1151,7 +1181,7 @@ mod tests {
             "(./main.tex\n./main.tex:4: Undefined control sequence.\nl.4 \\foo\n",
         )
         .unwrap();
-        let diagnostics = plan.parse_log();
+        let diagnostics = plan.parse_log().diagnostics;
         assert_eq!(diagnostics[0].file.as_ref().unwrap().as_str(), "main.tex");
     }
 
@@ -1166,7 +1196,7 @@ mod tests {
                    Enter file name: \n./main.tex:3: Emergency stop.\n<read *> \n         \n\
                    l.3 \\begin\n          {document}^^M\n";
         fs::write(plan.output_dir.join("main.log"), log).unwrap();
-        let diagnostics = plan.parse_log();
+        let diagnostics = plan.parse_log().diagnostics;
         let d = &diagnostics[0];
         assert_eq!(d.kind, DiagnosticKind::MissingFile);
         assert_eq!(d.file.as_ref().unwrap().as_str(), "src/main.tex");
@@ -1544,6 +1574,67 @@ mod tests {
         assert_eq!(cwd.trim_end(), root.path().join("src").to_str().unwrap());
         // Source directories were mirrored into the output directory.
         assert!(root.path().join(".texrun/out/chapters").is_dir());
+    }
+
+    /// Runs a stand-in for latexmk that writes `log` as the main log and
+    /// exits with 12, like latexmk after a TeX error.
+    fn run_failing_with_log(log: &str) -> CompileResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root) = workspace_with(&["main.tex"]);
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("latexmk");
+        fs::write(bin.path().join("main.log"), log).unwrap();
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nread -r line\nfor a in \"$@\"; do case \"$a\" in -outdir=*) \
+                 cp '{}' \"${{a#-outdir=}}/main.log\";; esac; done\nexit 12\n",
+                bin.path().join("main.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let engine = LatexmkEngine::new(LatexmkConfig::default().with_latexmk(&fake));
+        let run = engine
+            .run(&CompileContext::new(&root), &request("main.tex"))
+            .unwrap();
+        assert_eq!(run.result.outcome, CompileOutcome::Failed);
+        run.result
+    }
+
+    #[test]
+    fn a_failed_compile_always_has_an_error() {
+        // pdfTeX's own error is recognized: no extra error.
+        let result = run_failing_with_log(
+            "(./main.tex\n\n!pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not \
+             found\n ==> Fatal error occurred, no output PDF file produced!\n",
+        );
+        let errors: Vec<_> = result.errors().collect();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].message.contains("Font ecrm1000 at 600 not found"));
+        assert_eq!((&errors[0].file, errors[0].line), (&None, None));
+
+        // An error in an unknown form: the end of the log explains it.
+        let result =
+            run_failing_with_log("(./main.tex)\n!XeTeX error: odd\n\nNo pages of output.\n");
+        let errors: Vec<_> = result.errors().collect();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(errors[0].kind, DiagnosticKind::Other);
+        assert_eq!(errors[0].message, "the compile failed: XeTeX error: odd");
+        assert!(
+            errors[0]
+                .raw_excerpt
+                .as_deref()
+                .unwrap()
+                .ends_with("No pages of output.")
+        );
+
+        // No log at all.
+        let result = run_failing_with_log("");
+        let errors: Vec<_> = result.errors().collect();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].message.contains("no log"), "{}", errors[0].message);
     }
 
     #[test]

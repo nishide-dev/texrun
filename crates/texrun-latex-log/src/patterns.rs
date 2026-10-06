@@ -15,8 +15,16 @@ pub(crate) struct ErrorHeader<'a> {
     pub text: &'a str,
 }
 
-/// Recognizes `! <text>` and `<file>:<line>: <text>`.
+/// Recognizes `! <text>`, `<file>:<line>: <text>` and pdfTeX's own
+/// `!pdfTeX error: <text>` (see [`pdftex_fail`]).
 pub(crate) fn error_header(line: &str) -> Option<ErrorHeader<'_>> {
+    if let Some(text) = pdftex_fail(line) {
+        return Some(ErrorHeader {
+            file: None,
+            line: None,
+            text,
+        });
+    }
     if let Some(rest) = line.strip_prefix('!') {
         let text = rest.trim();
         return (rest.starts_with(' ') && !text.is_empty()).then_some(ErrorHeader {
@@ -26,6 +34,33 @@ pub(crate) fn error_header(line: &str) -> Option<ErrorHeader<'_>> {
         });
     }
     file_line_header(line)
+}
+
+/// A fatal error pdfTeX reports itself rather than through TeX's error
+/// routine (`pdftex_fail`), e.g. a font or an image it cannot load:
+///
+/// ```text
+/// !pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not found
+///  ==> Fatal error occurred, no output PDF file produced!
+/// ```
+///
+/// There is no space after `!`, no `file:line:` prefix even with
+/// `-file-line-error` and no `l.<n>` context: the job ends right after it.
+/// Returns the text after `!` (`pdfTeX error: ...`). `pdfTeX error (ext4):
+/// ...` and the like are ordinary TeX errors (`! pdfTeX error (...)`).
+pub(crate) fn pdftex_fail(line: &str) -> Option<&str> {
+    let text = line.strip_prefix('!')?;
+    let body = text.strip_prefix("pdfTeX error:")?;
+    (!body.trim().is_empty()).then(|| text.trim_end())
+}
+
+/// The ` ==> Fatal error occurred, ...` line that follows a [`pdftex_fail`]
+/// error. Unlike the summary of a TeX error, it has no `!` / `file:line:`
+/// prefix.
+pub(crate) fn pdftex_fatal_summary(line: &str) -> Option<&str> {
+    let text = line.strip_prefix(' ')?;
+    text.starts_with("==> Fatal error occurred")
+        .then(|| text.trim_start_matches("==>").trim())
 }
 
 fn file_line_header(line: &str) -> Option<ErrorHeader<'_>> {

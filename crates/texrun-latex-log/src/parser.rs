@@ -143,6 +143,9 @@ impl<'a> Parser<'a> {
     /// Handles a TeX error whose header is line `i` and whose excerpt starts
     /// at `excerpt_start`; returns the index of the first line after it.
     fn error(&mut self, i: usize, excerpt_start: usize) -> Option<usize> {
+        if let Some(text) = patterns::pdftex_fail(self.text(i)) {
+            return Some(self.pdftex_fail(text, i, excerpt_start));
+        }
         let header = patterns::error_header(self.text(i))?;
         let class = patterns::classify_error(header.text);
 
@@ -234,6 +237,46 @@ impl<'a> Parser<'a> {
             excerpt_start..excerpt_end,
         );
         Some(end)
+    }
+
+    /// Handles pdfTeX's own fatal error `text` at line `i` (see
+    /// [`patterns::pdftex_fail`]) and the ` ==> Fatal error occurred` line
+    /// that follows it; returns the index of the first line after them.
+    ///
+    /// pdfTeX prints neither a file nor a context line, and it often fails
+    /// while writing the PDF after the input has been read (a font is only
+    /// loaded at the end), so the file being read says nothing about the
+    /// cause: no file and no line are reported. The message names the font
+    /// or image.
+    fn pdftex_fail(&mut self, text: &'a str, i: usize, excerpt_start: usize) -> usize {
+        let summary = (i + 1 < self.lines.len())
+            .then(|| patterns::pdftex_fatal_summary(self.text(i + 1)))
+            .flatten();
+        let end = if summary.is_some() { i + 2 } else { i + 1 };
+        self.push(
+            Severity::Error,
+            DiagnosticKind::Other,
+            text,
+            None,
+            None,
+            excerpt_start..end,
+        );
+        // Like the summary after a TeX error: a consequence, not a second
+        // problem (see `error`).
+        if let Some(summary) = summary
+            && !self.stopped
+        {
+            self.stopped = true;
+            self.push(
+                Severity::Info,
+                DiagnosticKind::EmergencyStop,
+                summary,
+                None,
+                None,
+                i + 1..end,
+            );
+        }
+        end
     }
 
     /// The line of the `\usepackage` / `\documentclass` / ... that requested
