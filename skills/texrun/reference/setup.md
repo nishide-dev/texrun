@@ -14,6 +14,15 @@ texrun --version
 Use the newest release tag from https://github.com/nishide-dev/texrun/releases
 in place of `v0.1.0`.
 
+Keep this skill at the same version as texrun. In Claude Code, add the
+plugin marketplace at the tag of the installed texrun (releases from v0.1.1
+contain the plugin):
+
+```text
+/plugin marketplace add nishide-dev/texrun@v<version>
+/plugin install texrun@texrun
+```
+
 Then one of the backends:
 
 - **Container backend (recommended, required for untrusted documents):**

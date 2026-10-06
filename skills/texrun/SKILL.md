@@ -14,7 +14,10 @@ directly.
 
 1. Run `texrun --version`. If the command is missing, do not fall back to
    latexmk; tell the user how to install texrun (see
-   [reference/setup.md](reference/setup.md)) and stop.
+   [reference/setup.md](reference/setup.md)) and stop. The installed texrun
+   may be older or newer than this skill: if texrun rejects an option or
+   prints fields this skill does not mention, `texrun compile --help` and
+   the actual JSON are authoritative.
 2. Pick the backend:
    - **Untrusted document** (downloaded, sent by someone else, or generated
      from untrusted input): always add `--backend container`. TeX then runs
@@ -40,11 +43,12 @@ Copy this checklist and track progress:
 **1. Compile.** Pass the main `.tex` file (the one with `\documentclass`):
 
 ```bash
-texrun compile --json --backend container paper/main.tex | python3 scripts/texrun_summary.py
+texrun compile --json --backend container paper/main.tex | python3 "${CLAUDE_SKILL_DIR}/scripts/texrun_summary.py"
 ```
 
-`scripts/texrun_summary.py` (in this skill's directory; Python 3 standard
-library only) prints the outcome, the error diagnostics as absolute
+`${CLAUDE_SKILL_DIR}` is this skill's directory in Claude Code; elsewhere,
+use the path of `scripts/texrun_summary.py` in this skill's directory. The
+script (Python 3 standard library only) prints the outcome, the error diagnostics as absolute
 `path:line: kind: message`, the first warnings (`--all` for every one), the
 PDF and the preview image paths. To read the
 JSON yourself, drop the pipe; stdout is always exactly one JSON document,
@@ -80,6 +84,9 @@ document may be fine. See the error kinds in
   `./file.tex:N:`.
 - Fix the cause; do not silence an error (for example by defining an unknown
   macro as empty) unless that is clearly what the author meant.
+- Tell the user about every change that guesses the author's intent
+  (a removed or replaced macro, a renamed citation key or label, resized
+  content), so they can check it.
 - Fixes by `kind`: [reference/errors.md](reference/errors.md).
 
 Recompile after each fix. If the same error stays at the same place after

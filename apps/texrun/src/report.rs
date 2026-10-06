@@ -91,6 +91,16 @@ pub mod kind {
     pub const UNSUPPORTED: &str = "unsupported";
 }
 
+/// Kinds of [`Note`]. Listed in docs/cli.md and the Agent Skill.
+pub mod note {
+    /// A file above the entrypoint's directory was not found.
+    pub const PARENT_DIRECTORY_INPUT: &str = "parent_directory_input";
+    /// An explicit `--root` is `$HOME` or a temporary directory.
+    pub const BROAD_PROJECT_ROOT: &str = "broad_project_root";
+    /// The output directory contains the entrypoint.
+    pub const OUTPUT_CONTAINS_ENTRYPOINT: &str = "output_contains_entrypoint";
+}
+
 /// The payload of the `--json` document (wrapped in `Versioned`).
 #[derive(Debug, Default, Serialize)]
 pub struct CompileReport {
@@ -433,9 +443,9 @@ mod tests {
             kind::UNSAFE_OUTPUT_PATH,
             kind::IO,
             kind::SIGNAL_SETUP,
-            "parent_directory_input",
-            "broad_project_root",
-            "output_contains_entrypoint",
+            note::PARENT_DIRECTORY_INPUT,
+            note::BROAD_PROJECT_ROOT,
+            note::OUTPUT_CONTAINS_ENTRYPOINT,
         ] {
             assert!(
                 docs.contains(&format!("`{code}`")),

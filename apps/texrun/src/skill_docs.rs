@@ -13,7 +13,10 @@
 //!   the tables of `reference/json.md`, the JSON examples and the fields the
 //!   script reads with `.get("...")` exist in the JSON document;
 //! - kinds: the kind tables of `reference/errors.md` list exactly the
-//!   diagnostic, error, note and preview notice kinds;
+//!   diagnostic, error, note and preview notice kinds (read from the enums
+//!   and the `kind` / `note` constants);
+//! - words: every single `snake_case` word in a code span is a JSON field,
+//!   a kind, an enum or option value, or one of [`OTHER_WORDS`];
 //! - exit codes: the table in `SKILL.md` lists exactly texrun's codes;
 //! - links: every relative link points to an existing file.
 
@@ -32,7 +35,7 @@ use texrun_workspace::WorkspaceErrorKind;
 
 use crate::cli::Cli;
 use crate::report::{
-    Category, CompileReport, ErrorInfo, Note, ProjectInfo, Stage, WorkspaceInfo, exit, kind,
+    Category, CompileReport, ErrorInfo, Note, ProjectInfo, Stage, WorkspaceInfo, exit, kind, note,
 };
 
 /// Options of other programs that appear in the skill (`cargo install`, the
@@ -202,7 +205,7 @@ fn full_document() -> Value {
     let result: CompileResult = serde_json::from_value(json!({
         "outcome": "failed",
         "engine": { "name": "texlive", "version": "latexmk 4.86" },
-        "exit": { "code": 12 },
+        "exit": { "code": 12, "signal": 9 },
         "elapsed_ms": 5,
         "diagnostics": [{
             "severity": "error", "kind": "undefined_control_sequence", "message": "m",
@@ -243,7 +246,7 @@ fn full_document() -> Value {
         artifacts_not_copied: not_copied,
         notes: vec![Note {
             severity: Severity::Info,
-            kind: "parent_directory_input",
+            kind: note::PARENT_DIRECTORY_INPUT,
             message: "m".to_owned(),
             printed: false,
         }],
@@ -481,20 +484,39 @@ fn json_fields_exist() {
     }
 }
 
-#[test]
-fn kind_tables_list_every_kind() {
-    let errors_md = read(&skill_dir().join("reference/errors.md"));
+/// The string values of the `pub const NAME: &str = "value";` items in
+/// `pub mod <module> { ... }` of Rust source.
+fn module_consts(source: &str, module: &str) -> BTreeSet<String> {
+    let start = source
+        .find(&format!("pub mod {module} {{"))
+        .unwrap_or_else(|| panic!("no mod {module}"));
+    let body = &source[start..];
+    let body = &body[..body.find("\n}").unwrap()];
+    let values: BTreeSet<String> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub const "))
+        .filter_map(|rest| rest.split('"').nth(1))
+        .map(str::to_owned)
+        .collect();
+    assert!(!values.is_empty(), "no constants in mod {module}");
+    values
+}
 
-    let diagnostic = enum_variants(
+/// `diagnostics[].kind` values.
+fn diagnostic_kinds() -> BTreeSet<String> {
+    let kinds = enum_variants(
         &source("crates/texrun-core/src/diagnostic.rs"),
         "DiagnosticKind",
     );
-    for name in &diagnostic {
+    for name in &kinds {
         let kind: DiagnosticKind = serde_json::from_value(json!(name)).unwrap();
         assert!(name == "other" || kind != DiagnosticKind::Other, "{name}");
     }
-    assert_eq!(table_keys(&errors_md, "## Diagnostic kinds"), diagnostic);
+    kinds
+}
 
+/// `error.kind` values: the CLI's own, the engine's and the workspace's.
+fn error_kinds() -> BTreeSet<String> {
     let engine = enum_variants(
         &source("crates/texrun-core/src/engine.rs"),
         "EngineErrorKind",
@@ -509,39 +531,131 @@ fn kind_tables_list_every_kind() {
     for name in &workspace {
         serde_json::from_value::<WorkspaceErrorKind>(json!(name)).unwrap();
     }
-    let mut error_kinds: BTreeSet<String> = [
-        kind::USAGE,
-        kind::INVALID_PREVIEW_OPTIONS,
-        kind::NON_UTF8_PATH,
-        kind::UNSAFE_ROOT,
-        kind::UNSAFE_OUTPUT_PATH,
-        kind::IO,
-        kind::SIGNAL_SETUP,
-        kind::UNSUPPORTED,
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    error_kinds.extend(engine);
-    error_kinds.extend(workspace);
-    assert_eq!(table_keys(&errors_md, "## Error kinds"), error_kinds);
+    let cli = module_consts(&source("apps/texrun/src/report.rs"), "kind");
+    // The parser reads the source; make sure it saw the real constants.
+    assert!(cli.contains(kind::USAGE) && cli.contains(kind::UNSUPPORTED));
+    let mut kinds = cli;
+    kinds.extend(engine);
+    kinds.extend(workspace);
+    kinds
+}
 
-    let notes: BTreeSet<String> = [
-        "parent_directory_input",
-        "broad_project_root",
-        "output_contains_entrypoint",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    assert_eq!(table_keys(&errors_md, "## Note kinds"), notes);
+/// `notes[].kind` values.
+fn note_kinds() -> BTreeSet<String> {
+    let kinds = module_consts(&source("apps/texrun/src/report.rs"), "note");
+    assert!(kinds.contains(note::PARENT_DIRECTORY_INPUT));
+    kinds
+}
 
-    let notices = enum_variants(&source("crates/texrun-preview/src/report.rs"), "NoticeKind");
-    for name in &notices {
+/// `preview.notices[].kind` values.
+fn notice_kinds() -> BTreeSet<String> {
+    let kinds = enum_variants(&source("crates/texrun-preview/src/report.rs"), "NoticeKind");
+    for name in &kinds {
         let kind: NoticeKind = serde_json::from_value(json!(name)).unwrap();
         assert!(name == "other" || kind != NoticeKind::Other, "{name}");
     }
-    assert_eq!(table_keys(&errors_md, "## Preview notice kinds"), notices);
+    kinds
+}
+
+/// Every value of a `snake_case` enum or option that can appear in the JSON
+/// document or on the command line.
+fn enum_values() -> BTreeSet<String> {
+    let mut values = BTreeSet::new();
+    for (path, name) in [
+        ("crates/texrun-core/src/diagnostic.rs", "Severity"),
+        ("crates/texrun-core/src/result.rs", "CompileOutcome"),
+        ("crates/texrun-core/src/artifact.rs", "ArtifactKind"),
+        ("crates/texrun-preview/src/report.rs", "PreviewStatus"),
+        ("crates/texrun-preview/src/report.rs", "BackendKind"),
+        ("crates/texrun-preview/src/report.rs", "ImageFormat"),
+        ("apps/texrun/src/report.rs", "Stage"),
+        ("apps/texrun/src/report.rs", "Category"),
+    ] {
+        values.extend(enum_variants(&source(path), name));
+    }
+    // `workspace.excluded[].reason`.
+    let report = source("apps/texrun/src/report.rs");
+    let reasons = &report[report.find("pub fn exclusion_reason").unwrap()..];
+    let reasons = &reasons[..reasons.find("\n}").unwrap()];
+    values.extend(
+        reasons
+            .lines()
+            .filter_map(|line| line.split("=> \"").nth(1))
+            .map(|rest| rest.trim_end_matches(['"', ',']).to_owned()),
+    );
+    // Values of the options (`host`, `container`, `docker`, ...).
+    let command = Cli::command();
+    let compile = command.find_subcommand("compile").unwrap();
+    for arg in compile.get_arguments() {
+        for value in arg.get_possible_values() {
+            values.insert(value.get_name().to_owned());
+        }
+    }
+    values
+}
+
+#[test]
+fn kind_tables_list_every_kind() {
+    let errors_md = read(&skill_dir().join("reference/errors.md"));
+    assert_eq!(
+        table_keys(&errors_md, "## Diagnostic kinds"),
+        diagnostic_kinds()
+    );
+    assert_eq!(table_keys(&errors_md, "## Error kinds"), error_kinds());
+    assert_eq!(table_keys(&errors_md, "## Note kinds"), note_kinds());
+    assert_eq!(
+        table_keys(&errors_md, "## Preview notice kinds"),
+        notice_kinds()
+    );
+}
+
+/// Single `snake_case` words in code spans that are not texrun's: programs,
+/// files and TeX names the skill mentions.
+const OTHER_WORDS: &[&str] = &[
+    "latexmk",
+    "latexmkrc",
+    "minted",
+    "mutool",
+    "pdfinfo",
+    "pdftoppm",
+    "texlive",
+    "texrun",
+];
+
+#[test]
+fn single_word_names_exist() {
+    let mut known: BTreeSet<String> = field_paths(&full_document())
+        .iter()
+        .map(|p| {
+            p.rsplit('.')
+                .next()
+                .unwrap()
+                .trim_end_matches("[]")
+                .to_owned()
+        })
+        .collect();
+    known.extend(diagnostic_kinds());
+    known.extend(error_kinds());
+    known.extend(note_kinds());
+    known.extend(notice_kinds());
+    known.extend(enum_values());
+    known.extend(OTHER_WORDS.iter().map(|w| (*w).to_owned()));
+
+    for (file, text) in skill_files("md") {
+        for code in code_snippets(&text) {
+            let is_word = code.starts_with(|c: char| c.is_ascii_lowercase())
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if is_word {
+                assert!(
+                    known.contains(&code),
+                    "{file}: `{code}` is not a JSON field, kind or value of texrun \
+                     (add it to OTHER_WORDS if it names something else)"
+                );
+            }
+        }
+    }
 }
 
 #[test]

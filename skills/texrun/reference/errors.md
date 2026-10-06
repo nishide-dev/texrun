@@ -37,7 +37,7 @@
 | `usage` | Invalid command line. Check the options with `texrun compile --help` |
 | `invalid_preview_options` | Bad `--pages`, `--preview-dpi` or `--preview-backend` value |
 | `non_utf8_path` | A path argument is not valid UTF-8; rename or move the project |
-| `unsafe_root` | The project root would be `/`, `$HOME` or a temporary directory. Put the document in its own directory |
+| `unsafe_root` | The project root would be `/`, or the entrypoint's directory (the implicit root, without `--root`) is `$HOME` or a temporary directory. Move the document into its own directory |
 | `unsafe_output_path` | The output directory goes through a symlink or a non-directory is in the way. Choose another `--output` |
 | `io` | Reading the project or writing the output failed; check permissions and disk space |
 | `signal_setup` | texrun could not install its signal handlers; retry |
@@ -65,7 +65,7 @@
 | Kind | Meaning |
 | --- | --- |
 | `parent_directory_input` | A file above the entrypoint's directory was not found (`\input{../x}`). TeX cannot read there and `--root` does not help: move the main file to the project root or copy the file into the project |
-| `broad_project_root` | `--root` is `$HOME` or a temporary directory; everything under it is copied. Use a narrower root |
+| `broad_project_root` | An explicit `--root` is `$HOME` or a temporary directory (allowed because it was asked for); everything under it is copied. Use a narrower root |
 | `output_contains_entrypoint` | The output directory contains the main file, so earlier outputs are copied with the project. Use a separate `--output` |
 
 ## Preview notice kinds

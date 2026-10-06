@@ -221,9 +221,11 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 `.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。`v<version>` の tag を push するだけで、検証 → engine image の公開 → release notes 付きの GitHub release の作成までが行われる。release の手順:
 
-1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.0' -- README.md docs/` で確かめられる（`0.1.0` は現在の版）。
+1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.0' -- README.md docs/ skills/` で確かめられる（`0.1.0` は現在の版）。
    - `README.md`: 冒頭の note、Installation の `cargo install ... --tag v<version>` と `docker pull ghcr.io/nishide-dev/texrun-engine:<version>`
    - `docs/engine-image.md`: `cargo install`・`docker pull`・`docker build` の例、`engine.version` の例、`gh attestation verify` の例
+   - `skills/texrun/reference/setup.md`（Agent Skill）: `cargo install ... --tag v<version>` と `docker pull` の例、`v<version>` の言及
+   - Agent Skill の plugin marketplace は利用者が texrun と同じ tag で追加する（`nishide-dev/texrun@v<version>`、[agent-skills.md](agent-skills.md)）。README・`docs/agent-skills.md`・`setup.md` ではこれを `v<version>` と書いており、版の更新は不要。tag の commit の `skills/texrun/` がその版の CLI と一致していること（`cargo test` の `skill_docs`）を確かめてから tag を push する
 2. その commit に `v<version>` の tag を push する（`git tag v<version> <commit>` と `git push origin v<version>`）。workflow が、版の一致と tag が main の祖先であることを確かめ、両 platform の image を test してから、`ghcr.io/nishide-dev/texrun-engine:<version>` を push する。続く `release` job が tag の GitHub release を作り、release notes（下記）を書き、image の Debian source package を `texrun-engine-<version>-sources.tar` として付ける。版に `-` を含む（`v0.2.0-rc.1` など）場合は prerelease になる。
 3. 最初の公開の後に一度だけ、GHCR の package（`texrun-engine`）の設定で visibility を public にし、repository との連携（`org.opencontainers.image.source` の label で自動的に付く）を確かめる。GHCR の package は private で作られるため、public にするまで利用者は pull できない。
 4. release notes（または workflow の summary）に出る digest で `docker pull`・`gh attestation verify` を確かめる。
