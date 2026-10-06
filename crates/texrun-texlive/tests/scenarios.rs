@@ -54,7 +54,8 @@ fn minimal() {
 /// the PSNFSS fonts (Times, Helvetica, Courier, Palatino). texrun sets `MKTEXPK=0`, so every font must be in the
 /// TeX tree (dev image, engine image) as Type1: a missing one fails the
 /// compile (`Font tcrm1000 at 600 not found`) instead of being generated
-/// as a bitmap.
+/// as a bitmap. Also beamer with TikZ, siunitx and the other packages
+/// common in papers that the images take from TeX Live (#69).
 #[test]
 fn common_packages() {
     require_texlive!();
@@ -64,6 +65,9 @@ fn common_packages() {
         "lmodern.tex",
         "psnfss.tex",
         "palatino.tex",
+        "beamer.tex",
+        "siunitx.tex",
+        "algorithm2e.tex",
     ] {
         let (run, ws) = Compile::fixture("common-packages", main).run();
         assert_eq!(
@@ -80,6 +84,87 @@ fn common_packages() {
         );
         let pdf = assert_pdf(&run, &ws, &main.replace(".tex", ".pdf"));
         assert_page_count(&pdf, 1);
+    }
+}
+
+/// The ACL template (acl-org/acl-style-files, #71) compiles as it is, with
+/// each option of `acl.sty`: `review` (the template's own: line numbers,
+/// anonymous), `final` and `preprint`. BibTeX with `acl_natbib.bst`
+/// (natbib), hyperref and the page previews must all work, without errors
+/// or unresolved references. The template is not bundled (no license that
+/// allows it): see [`common::acl_style_files`].
+#[test]
+fn acl_template() {
+    require_texlive!();
+    let Some(template) = common::acl_style_files() else {
+        return;
+    };
+    let previewer = common::previewer();
+    for option in ["review", "final", "preprint"] {
+        let root = common::plain_tempdir();
+        common::copy_tree(&template, root.path());
+        if option != "review" {
+            // What the template tells authors to change, and nothing else.
+            let main = root.path().join("acl_latex.tex");
+            let source = fs::read_to_string(&main).unwrap();
+            let changed = source.replacen(
+                r"\usepackage[review]{acl}",
+                &format!(r"\usepackage[{option}]{{acl}}"),
+                1,
+            );
+            assert_ne!(changed, source, "no \\usepackage[review]{{acl}} line");
+            fs::write(&main, changed).unwrap();
+        }
+        let (mut run, ws) = Compile::new(root.path(), "acl_latex.tex")
+            .timeout(Duration::from_secs(180))
+            .run();
+        assert_eq!(
+            run.result.outcome,
+            CompileOutcome::Succeeded,
+            "{option}: {}",
+            describe(&run)
+        );
+        assert_eq!(
+            run.result.errors().count(),
+            0,
+            "{option}: {}",
+            describe(&run)
+        );
+        for kind in [
+            DiagnosticKind::UndefinedReference,
+            DiagnosticKind::UndefinedCitation,
+            DiagnosticKind::RerunRequired,
+        ] {
+            assert!(!has(&run, kind), "{option}: {kind:?}: {}", describe(&run));
+        }
+        let pdf = assert_pdf(&run, &ws, "acl_latex.pdf");
+
+        // BibTeX ran with the template's style and database.
+        let bbl = fs::read_to_string(ws.output_dir().join("acl_latex.bbl")).unwrap();
+        assert!(bbl.contains("Gusfield"), "{option}: {bbl}");
+        // natbib and hyperref (acl.sty loads both), and the line numbers of
+        // the review version only.
+        let log = fs::read_to_string(ws.output_dir().join("acl_latex.log")).unwrap();
+        for package in ["natbib.sty", "hyperref.sty", "inconsolata.sty"] {
+            assert!(log.contains(package), "{option}: {package} not loaded");
+        }
+        assert_eq!(
+            log.contains("lineno.sty"),
+            option == "review",
+            "{option}: lineno"
+        );
+
+        if let Some(previewer) = &previewer {
+            let report = previewer
+                .render(&pdf, &ws.output_dir(), &PreviewOptions::default())
+                .unwrap();
+            assert_eq!(report.status, PreviewStatus::Rendered, "{option}: {report:#?}");
+            let pages = report.pdf.as_ref().unwrap().page_count;
+            assert!(pages >= 3, "{option}: {pages} pages");
+            report.attach_to(&mut run.result);
+            let previews = run.result.artifacts_of(ArtifactKind::Preview).count();
+            assert_eq!(previews, pages as usize, "{option}: {previews} previews");
+        }
     }
 }
 

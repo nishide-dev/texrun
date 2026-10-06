@@ -31,10 +31,14 @@
 # (see docs/engine-image.md for what distributing this image means).
 
 # TeX Live packages that Debian only has in texlive-latex-extra /
-# texlive-fonts-extra (#71: the ACL template, acl-org/acl-style-files):
-# - inconsolata (\usepackage{inconsolata}: Type1 fonts and their map) and
-#   upquote, which it loads;
-# - mwe (the example-image-* files that templates include).
+# texlive-fonts-extra / texlive-science (texlive-archives.sha256):
+# - for the ACL template (acl-org/acl-style-files, #71): inconsolata
+#   (\usepackage{inconsolata}: Type1 fonts and their map) and upquote,
+#   which it loads; mwe (the example-image-* files that templates include);
+# - common in papers (#69): siunitx, multirow, makecell, threeparttable,
+#   enumitem, cleveref, algorithms (algorithm / algorithmic), algorithmicx
+#   (algpseudocode), algorithm2e (with ifoddpage and relsize, which it
+#   loads), wrapfig, placeins, units (nicefrac), xurl, soul, comment.
 # Those Debian packages come from the texlive-extra source package, whose
 # 2.8 GB .orig.tar.xz alone is over the 2 GiB limit of the sources release
 # asset (and texlive-fonts-extra is 1.7 GB installed). The packages are
@@ -82,6 +86,11 @@ RUN printf '%s\n' \
 # - texlive-fonts-recommended: the PSNFSS fonts (Times, Helvetica, Courier,
 #   Palatino, ... for mathptmx, helvet, mathpazo); it comes from the same
 #   source package as texlive-base, so it adds nothing to the sources.
+# Graphics (#69): texlive-pictures is pgf / TikZ (which beamer, from
+# texlive-latex-recommended, needs), pgfplots, tikz-cd and the like. It
+# also comes from texlive-base; its dependency python3 (for a few
+# scripts that TeX never runs: texrun disables shell escape) adds the
+# python3.13 sources.
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -89,6 +98,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          texlive-latex-base \
          texlive-latex-recommended \
          texlive-fonts-recommended \
+         texlive-pictures \
          cm-super \
          lmodern \
          mupdf-tools \

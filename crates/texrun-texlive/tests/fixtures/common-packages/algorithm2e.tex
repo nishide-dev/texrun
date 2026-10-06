@@ -1,0 +1,24 @@
+% algorithm2e (with ifoddpage and relsize) and the algorithms bundle's
+% algorithmic (from TeX Live in the images, #69). algorithm2e cannot be
+% combined with algorithm / algpseudocode (siunitx.tex), hence a document of
+% its own.
+\documentclass{article}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{algorithmic}
+\begin{document}
+\begin{algorithm}[h]
+  \caption{Sum}
+  \KwIn{$n$}
+  \KwOut{$s$}
+  $s \leftarrow 0$\;
+  \For{$i \leftarrow 1$ \KwTo $n$}{
+    $s \leftarrow s + i$\;
+  }
+\end{algorithm}
+\begin{algorithmic}
+  \STATE $s \gets 0$
+  \FOR{$i = 1$ to $n$}
+    \STATE $s \gets s + i$
+  \ENDFOR
+\end{algorithmic}
+\end{document}

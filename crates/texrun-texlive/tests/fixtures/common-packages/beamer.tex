@@ -1,0 +1,18 @@
+% beamer (texlive-latex-recommended) with pgf / TikZ (texlive-pictures, #69).
+\documentclass{beamer}
+\usetheme{Madrid}
+\usepackage{tikz}
+\title{texrun}
+\author{Author}
+\begin{document}
+\begin{frame}{A frame}
+  \begin{itemize}
+    \item<1-> One \alert{point}
+    \item Two
+  \end{itemize}
+  \begin{tikzpicture}
+    \draw[->] (0,0) -- (1,1) node[right] {$x^2$};
+    \fill[blue] (2,0) circle (0.2);
+  \end{tikzpicture}
+\end{frame}
+\end{document}
