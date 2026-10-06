@@ -7,9 +7,10 @@ name: Release notes
 # (docs/development.md, "release notes").
 #
 # Triggers:
-# - pull_request (the notes configuration changed): the notes of the
-#   latest tag and a preview of the next version (the commits since that
-#   tag, including the PR), in the job summary and the `release-notes`
+# - pull_request (the notes configuration changed): the fixture test
+#   (.github/scripts/release-notes-test.sh), then the notes of the latest
+#   tag and a preview of the next version (the commits since that tag,
+#   including the PR's), in the job summary and the `release-notes`
 #   artifact.
 # - workflow_dispatch with `tag`: the notes of that tag, the same way. With
 #   `update` on, they also replace the notes of the GitHub release of the
@@ -21,6 +22,8 @@ on:
     paths:
       - cliff.toml
       - .github/scripts/release-notes.sh
+      - .github/scripts/release-notes-test.sh
+      - .github/scripts/release-notes-test.expected.md
       - .github/workflows/release-notes.yml
   workflow_dispatch:
     inputs:
@@ -55,10 +58,18 @@ jobs:
           persist-credentials: false
           # The history and tags the notes are made from.
           fetch-depth: 0
+          # On a PR, the head commit rather than the merge ref, so that the
+          # preview has no "Merge ... into ..." commit (as after the squash
+          # merge).
+          ref: ${{ github.event.pull_request.head.sha || '' }}
       # Keep the version in sync with engine-image.yml.
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: git-cliff@2.14.2
+      # Fixture commits shaped like the squash merges on main (PR bodies,
+      # Dependabot's bodies, a breaking change footer, a revert).
+      - name: Test
+        run: bash .github/scripts/release-notes-test.sh
       - name: Generate
         shell: bash
         env:

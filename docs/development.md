@@ -232,12 +232,12 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 release notes は `cliff.toml`（[git-cliff](https://git-cliff.org)）と `.github/scripts/release-notes.sh` が、main の commit から作る。手で書く必要はない（GitHub release を先に手で作っても、`release` job が notes を生成したものに置き換える）。
 
-- **What's changed**: 前の版の tag から今回の tag までの commit を、Conventional Commits の type で分ける（`feat` → Features、`fix` → Bug fixes、`perf` → Performance、`docs` → Documentation、`refactor` / `test` / `build` / `chore` → Other changes）。`chore(deps)`（Dependabot）は Dependencies に件数と PR 番号の 1 行にまとめる。`!` または `BREAKING CHANGE:` footer の commit は Breaking changes にも載る。各行は commit のタイトル（= squash merge した PR のタイトル）で、PR へのリンクが付く。
+- **What's changed**: 前の版の tag から今回の tag までの commit を、Conventional Commits の type で分ける（`feat` → Features、`fix` → Bug fixes、`perf` → Performance、`docs` → Documentation、`refactor` / `test` / `build` / `chore` → Other changes）。`chore(deps)`（Dependabot）は Dependencies に件数と PR 番号の 1 行にまとめる（PR 番号の無いものは件数にだけ数える）。`!` または `BREAKING CHANGE:` footer の commit は Breaking changes にも載る。各行は commit のタイトル（1 行目 = squash merge した PR のタイトル）だけで作り、commit 本文（PR 本文）や `BREAKING CHANGE:` footer の文面は載せない。PR へのリンクが付き、`@name` は mention にならないよう code にする。
   - 安定版（`-` を含まない版）は前の安定版からの差分で、間の prerelease の分も含む。prerelease は直前の tag（prerelease を含む）からの差分。最初の版（`v0.1.0`）は全履歴。
   - したがって notes の文面は PR タイトル（type・scope・description）で決まる。PR タイトルは利用者が読む 1 行として書く（[CONTRIBUTING.md](../CONTRIBUTING.md#pr-title)）。merge 後に commit のタイトルは直せないので、公開後に気付いた誤りは GitHub の release を手で編集して直す（下記の作り直しや `release` の再実行をすると、手の編集は消える）。分類の規則を変える場合は `cliff.toml` を変える。
 - **Install / Engine image / Source of the engine image**: `cargo install --locked --git ... --tag v<version> texrun`、image の tag と `publish` が push した digest での `docker pull` と `--container-image` の指定、`gh attestation verify`、source tar の説明。固定の文面で、`release-notes.sh` にある。
 
-ローカルで確かめる（git-cliff 2.14.2 を `cargo install --locked git-cliff@2.14.2` などで入れる。CI と同じ版）:
+ローカルで確かめる（git-cliff 2.14.2 を `cargo install --locked git-cliff@2.14.2` などで入れる。CI と同じ版。`jq` も要る）:
 
 ```bash
 # 公開済みの版の notes（digest は省略すると placeholder）
@@ -246,12 +246,14 @@ release notes は `cliff.toml`（[git-cliff](https://git-cliff.org)）と `.gith
 .github/scripts/release-notes.sh v0.2.0
 # 全履歴の changelog（CHANGELOG.md は repository に置かない。GitHub release が changelog）
 git cliff
+# fixture の test（cliff.toml を変えたら。意図した変更なら --update で期待値を書き換える）
+.github/scripts/release-notes-test.sh
 ```
 
 notes の生成だけを行う workflow が `.github/workflows/release-notes.yml` にある。image の公開や release の作成はしない。
 
-- PR（`cliff.toml`・`release-notes.sh`・この workflow を変えたとき）: 最後の tag の notes と、次の版（最後の tag の patch + 1）として最後の tag 以降の commit の notes を生成し、job summary と artifact `release-notes` に出す。
-- 既存の release の notes を作り直す: `gh workflow run release-notes.yml --ref main -f tag=v<version> -f update=true`。notes を生成し（digest は GHCR にあるその版の image のもの）、`gh release edit` で置き換える。`update=false`（既定）なら生成して summary に出すだけ（dry run）。`update=true` は main か tag の上でのみ実行でき、image が公開されていない版では失敗する。
+- PR（`cliff.toml`・`.github/scripts/release-notes*`・この workflow を変えたとき）: `.github/scripts/release-notes-test.sh` で、main の squash merge と同じ形の fixture の commit（PR 本文付き、Dependabot の本文付き、日本語の `BREAKING CHANGE:` footer、revert など）の notes を `release-notes-test.expected.md` と比べる。続いて PR の head commit で、最後の tag の notes と、次の版（最後の tag の patch + 1）として最後の tag 以降の commit の notes を生成し、job summary と artifact `release-notes` に出す。
+- 既存の release の notes を作り直す: `gh workflow run release-notes.yml --ref main -f tag=v<version> -f update=true`。notes を生成し（digest は GHCR にあるその版の image のもの）、`gh release edit` で置き換える。`update=false`（既定）なら生成して summary に出すだけ（dry run）。`update=true` は main か tag の上でのみ実行でき、image が公開されていない版では失敗する。通常は `--ref main` で実行する（この workflow より前の tag、たとえば `v0.1.0` の上には workflow も script も無いので、その tag の上では実行できない）。
 
 公開した版の tag は上書きしない（workflow も拒否する）。失敗した場合:
 

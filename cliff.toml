@@ -20,23 +20,28 @@ body = """
 {%- else -%}
 ## Unreleased
 {%- endif %}
+{#- Every line is the title (first line) of a commit, i.e. the PR title.
+    `message` is only the description for a Conventional Commit, but the
+    whole message (with the PR body) for any other; a breaking change footer
+    is free text (often Japanese) running to the end of the PR body. #}
 {%- set breaking = commits | filter(attribute="breaking", value=true) %}
 {%- if breaking | length > 0 %}
 
 ### Breaking changes
 {% for commit in breaking %}
-- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.breaking_description | default(value=commit.message) | upper_first }}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | split(pat="\n") | first | trim | upper_first }}
 {%- endfor %}
 {%- endif %}
 {%- for group, commits in commits | group_by(attribute="group") %}
 
 ### {{ group | striptags | trim }}
 {% if group is ending_with("Dependencies") %}
-- {{ commits | length }} dependency update{% if commits | length > 1 %}s{% endif %} (Dependabot):
-  {%- for commit in commits %}{% for link in commit.links %} [{{ link.text }}]({{ link.href }}){% endfor %}{% if not loop.last %},{% endif %}{% endfor %}
+{%- set_global refs = [] %}
+{%- for commit in commits %}{% for link in commit.links %}{% set_global refs = refs | concat(with="[" ~ link.text ~ "](" ~ link.href ~ ")") %}{% endfor %}{% endfor %}
+- {{ commits | length }} dependency update{% if commits | length > 1 %}s{% endif %}{% if refs | length > 0 %}: {{ refs | join(sep=", ") }}{% endif %}
 {%- else %}
 {%- for commit in commits %}
-- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | split(pat="\n") | first | trim | upper_first }}
 {%- endfor %}
 {%- endif %}
 {%- endfor %}
@@ -64,11 +69,14 @@ sort_commits = "oldest"
 commit_preprocessors = [
   # The PR number squash merge appends, as a link.
   { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/nishide-dev/texrun/pull/${1}))" },
+  # `@name` as code, not a mention: a release would notify the user.
+  { pattern = '(?m)(^|[\s(\[])@([A-Za-z0-9][A-Za-z0-9-]*)', replace = '${1}`@${2}`' },
 ]
-# The PR number of a commit (from the link above), for the one line that
-# lists the dependency updates.
+# The PR number of a commit (the link above at the end of its title, not
+# anywhere in the PR body that squash merge makes the commit body), for the
+# one line that lists the dependency updates.
 link_parsers = [
-  { pattern = '\[#([0-9]+)\]\(https://github\.com/nishide-dev/texrun/pull/[0-9]+\)\)$', href = "https://github.com/nishide-dev/texrun/pull/$1", text = "#$1" },
+  { pattern = '\A[^\n]*\(\[#([0-9]+)\]\(https://github\.com/nishide-dev/texrun/pull/[0-9]+\)\)(?m:$)', href = "https://github.com/nishide-dev/texrun/pull/$1", text = "#$1" },
 ]
 # The first matching parser decides the section; the HTML comments only
 # order the sections and are stripped from the headings.

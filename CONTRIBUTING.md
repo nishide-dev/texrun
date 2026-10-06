@@ -155,6 +155,8 @@ PR タイトルは、そのまま **release notes** の 1 行になります。r
 
 - type は変更の性質どおりに選んでください（利用者に見える新機能は `feat`、不具合の修正は `fix`。CI や開発環境だけの変更を `feat` / `fix` にしない）。
 - description は、利用者がこの 1 行だけを読んで何が変わったか分かるように書いてください。scope は太字で前に付きます（例: **cli**: Add compile command）。
+- 載るのはタイトルだけです。PR 本文や `BREAKING CHANGE:` footer の説明は載らないので、breaking change も何が変わったかがタイトルで分かるようにしてください。
+- タイトルに GitHub の user 名（`@name`）を書かないでください（notes では code として表示しますが、mention を意図した書き方は避けます）。
 
 仕組みと notes の作り直し方は [docs/development.md](docs/development.md#release-notes) を参照してください。
 
