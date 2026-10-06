@@ -23,14 +23,38 @@
 #   keeps the preview container alive while texrun runs the tools in it
 #   (#46).
 #
-# The TeX Live and preview packages are the same as in the dev image, so
+# The TeX Live and preview packages (and the TeX Live packages of the first
+# stage, from texlive-archives.sha256) are the same as in the dev image, so
 # the #10 fixtures and the preview tests behave the same with both
 # backends. MuPDF is AGPL-licensed and Poppler GPL-licensed: they are
 # installed from Debian as separate programs, and texrun only starts them
 # (see docs/engine-image.md for what distributing this image means).
 
-# Pinned by digest (multi-arch index); Dependabot (docker ecosystem)
-# updates it.
+# TeX Live packages that Debian only has in texlive-latex-extra /
+# texlive-fonts-extra (#71: the ACL template, acl-org/acl-style-files):
+# - inconsolata (\usepackage{inconsolata}: Type1 fonts and their map) and
+#   upquote, which it loads;
+# - mwe (the example-image-* files that templates include).
+# Those Debian packages come from the texlive-extra source package, whose
+# 2.8 GB .orig.tar.xz alone is over the 2 GiB limit of the sources release
+# asset (and texlive-fonts-extra is 1.7 GB installed). The packages are
+# taken from the frozen TeX Live 2024 repository instead (the TeX Live of
+# trixie) and checked against texlive-archives.sha256; see
+# texlive-archives.sh. Only the unpacked files are copied into the image:
+# curl and xz stay in this stage.
+#
+# Both stages are pinned by digest (multi-arch index) to the same image;
+# Dependabot (docker ecosystem) updates them. The sources job of
+# .github/workflows/engine-image.yml takes the first FROM as the base of
+# the image.
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS texlive-archives
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
+COPY texlive-archives.sha256 texlive-archives.sh /tmp/
+RUN sh /tmp/texlive-archives.sh fetch /tmp/texlive-archives.sha256 /tmp/archives \
+    && sh /tmp/texlive-archives.sh install /tmp/archives /texmf
+
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 # Keep documentation, man pages and non-English locales out of the image.
@@ -71,6 +95,16 @@ RUN export DEBIAN_FRONTEND=noninteractive \
          poppler-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/log/apt/* /var/log/dpkg.log
+
+# The TeX Live packages of the first stage, in TEXMFLOCAL. kpathsea finds
+# them through the ls-R database (TeX cannot regenerate it at run time:
+# read-only filesystem, MKTEX*=0), and pdfTeX finds their fonts in the font
+# maps, which updmap-sys regenerates with the maps of the packages added.
+COPY --from=texlive-archives /texmf /usr/local/share/texmf
+RUN mktexlsr /usr/local/share/texmf \
+    && updmap-sys --quiet \
+    && grep -q '^t1-zi4r-0 ' /var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map \
+    && rm -f /var/lib/texmf/web2c/updmap.log
 
 # The user when texrun does not pass one, and the one texrun passes when it
 # runs as root itself (otherwise it passes the host user's uid and gid):
