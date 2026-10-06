@@ -1577,8 +1577,8 @@ mod tests {
     }
 
     /// Runs a stand-in for latexmk that writes `log` as the main log and
-    /// exits with 12, like latexmk after a TeX error.
-    fn run_failing_with_log(log: &str) -> CompileResult {
+    /// then runs `then` (e.g. `exit 12`, like latexmk after a TeX error).
+    fn run_with_log(log: &str, then: &str, timeout: Option<Duration>) -> CompileResult {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, root) = workspace_with(&["main.tex"]);
@@ -1589,18 +1589,42 @@ mod tests {
             &fake,
             format!(
                 "#!/bin/sh\nread -r line\nfor a in \"$@\"; do case \"$a\" in -outdir=*) \
-                 cp '{}' \"${{a#-outdir=}}/main.log\";; esac; done\nexit 12\n",
+                 cp '{}' \"${{a#-outdir=}}/main.log\";; esac; done\n{then}\n",
                 bin.path().join("main.log").display()
             ),
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         let engine = LatexmkEngine::new(LatexmkConfig::default().with_latexmk(&fake));
+        let mut options = texrun_core::CompileOptions::default();
+        if let Some(timeout) = timeout {
+            options = options.with_timeout(timeout);
+        }
         let run = engine
-            .run(&CompileContext::new(&root), &request("main.tex"))
+            .run(
+                &CompileContext::new(&root),
+                &request("main.tex").with_options(options),
+            )
             .unwrap();
-        assert_eq!(run.result.outcome, CompileOutcome::Failed);
         run.result
+    }
+
+    fn run_failing_with_log(log: &str) -> CompileResult {
+        let result = run_with_log(log, "exit 12", None);
+        assert_eq!(result.outcome, CompileOutcome::Failed);
+        result
+    }
+
+    /// Only a failed compile gets the error: a timeout says why by itself.
+    #[test]
+    fn a_timeout_without_errors_gets_no_unexplained_failure() {
+        let result = run_with_log(
+            "(./main.tex\nstill working\n",
+            "sleep 30",
+            Some(Duration::from_millis(500)),
+        );
+        assert_eq!(result.outcome, CompileOutcome::TimedOut);
+        assert_eq!(result.errors().count(), 0, "{:#?}", result.diagnostics);
     }
 
     #[test]

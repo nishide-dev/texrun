@@ -159,9 +159,10 @@ errors at the position TeX reports.
 
 A failed compile (`outcome: failed`) always has at least one `error`
 diagnostic. When neither the log nor texrun found one (e.g. an engine
-message in an unknown form, or no log at all), an `other` error says so:
-its message quotes the last `!` line of the log, if any, and its
-`raw_excerpt` holds the last lines of the log. Read the log in that case.
+message in an unknown form, or no log at all), an `other` error without
+`file` and `line` says so. Its `raw_excerpt` holds the last non-blank lines
+of the log (at most 12, from its last 16 KiB), and its message quotes the
+last line starting with `!` among them, if any. Read the log in that case.
 
 BibTeX problems are reported from its `.blg` logs and latexmk's output:
 

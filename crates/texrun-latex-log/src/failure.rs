@@ -60,8 +60,8 @@ pub fn unexplained_failure(log: &[u8]) -> Diagnostic {
         .filter(|t| !t.is_empty());
     let message = match bang {
         Some(text) => format!("the compile failed: {text}"),
-        None => "the compile failed, but no error was recognized in the log; its last lines \
-                 are in the excerpt (see the full log)"
+        None => "the compile failed, but no error was recognized in the log; read the end of \
+                 the log"
             .to_owned(),
     };
     let mut excerpt = String::new();
