@@ -72,8 +72,8 @@ licenses:
 | Packages | License |
 | --- | --- |
 | TeX Live macro packages (`texlive-base`, `texlive-latex-base`, `texlive-latex-recommended`, their dependencies) | free software licenses, mostly the LaTeX Project Public License |
-| TeX Live fonts (`texlive-fonts-recommended`: the PSNFSS fonts, Times, Helvetica, Courier, Palatino, ...) | free software licenses (the TeX Live fonts' own, see its `copyright` file) |
-| `cm-super` (Type1 EC / TC fonts, T1 and TS1 encodings) | GPL-2.0-or-later with a font exception |
+| TeX Live fonts (`texlive-fonts-recommended`: the PSNFSS fonts, Times, Helvetica, Courier, Palatino, ...) | mostly GPL with a font exception (the URW Type1 fonts that PSNFSS embeds, `fonts/type1/urw/`), and other free software font licenses |
+| `cm-super` / `cm-super-minimal` (Type1 EC / TC fonts, T1 and TS1 encodings) | GPL-2.0-or-later with a font exception |
 | `lmodern` / `fonts-lmodern` (Latin Modern) | GUST Font License (an LPPL variant) |
 | `pfb2t1c2pfb`, `xfonts-utils`, `xfonts-encodings`, `libfontenc` (dependencies of `cm-super` / `lmodern`) | GPL (`pfb2t1c2pfb`), MIT / X11 |
 | TeX Live programs (`texlive-binaries`: pdfTeX, BibTeX, makeindex, kpathsea, ...) | GPL and other free software licenses |
@@ -89,8 +89,9 @@ licenses:
   MuPDF is shipped unmodified, so the AGPL's network clause (for modified
   versions) does not add anything beyond its source requirement.
 - pdfTeX embeds subsets of these fonts in the PDFs it writes. The font
-  exception of cm-super and the GUST Font License allow that without
-  putting the documents under their licenses.
+  exceptions of cm-super and of the URW fonts, and the GUST Font License
+  (Latin Modern), allow that without putting the documents under their
+  licenses.
 - If you redistribute the image (for example, mirror it to another
   registry), the GPL / AGPL obligations for the binaries in it apply to you
   as well.
