@@ -78,10 +78,13 @@ document may be fine. See the error kinds in
   reading.
 - A diagnostic without `file` comes from an installed package or class; the
   cause is usually the document's own use of it just before.
-- If `failed` comes with no `error` diagnostic, texrun did not recognize the
-  problem: read the log (`output_dir` + `/` + the path of the `artifacts[]`
-  entry of kind `log`) and look for the first line starting with `!` or
-  `./file.tex:N:`.
+- An `other` error without `file` and `line` may be pdfTeX failing to load
+  a font or an image (`pdfTeX error: ... not found`; the message names it),
+  or texrun not recognizing the problem (`the compile failed...`; its
+  `raw_excerpt` holds the end of the log). In the second case, or if
+  `failed` comes with no `error` diagnostic at all (older texrun), read the
+  log (`output_dir` + `/` + the path of the `artifacts[]` entry of kind
+  `log`) and look for the first line starting with `!` or `./file.tex:N:`.
 - Fix the cause; do not silence an error (for example by defining an unknown
   macro as empty) unless that is clearly what the author meant.
 - Tell the user about every change that guesses the author's intent

@@ -119,6 +119,29 @@ fn missing_class_in_classic_format() {
     assert_eq!(severities, [Severity::Error, Severity::Info]);
 }
 
+/// pdfTeX's own error (#66) never takes a position from the file stack or
+/// from a later `l.<n>` line (pdfTeX prints none; this one is document
+/// output), and the summary line is optional.
+#[test]
+fn pdftex_fail_has_no_position() {
+    let d = parse(concat!(
+        "(./main.tex (./chapter.tex\n",
+        "!pdfTeX error: pdflatex: cannot find image file a.png\n",
+        "l.3 \\fake\n",
+    ));
+    assert_eq!(at(&d[0]), (K::Other, None, None));
+    assert_eq!(d[0].severity, Severity::Error);
+    assert_eq!(
+        d[0].message,
+        "pdfTeX error: pdflatex: cannot find image file a.png"
+    );
+    assert_eq!(d.len(), 1, "{d:#?}");
+    assert_eq!(
+        d[0].raw_excerpt.as_deref(),
+        Some("!pdfTeX error: pdflatex: cannot find image file a.png")
+    );
+}
+
 #[test]
 fn tex_primitive_errors_are_other_errors() {
     let d = parse(

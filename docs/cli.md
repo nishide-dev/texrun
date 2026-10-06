@@ -150,6 +150,20 @@ follows it is `info`, so the errors are the problems to fix; the human output
 does not show it. A missing package or class has the line of its
 `\usepackage` / `\documentclass` only when it can be told for certain.
 
+Errors pdfTeX reports itself, e.g. a font or an image it cannot load
+(`!pdfTeX error: pdflatex (file ecrm1000): Font ecrm1000 at 600 not found`),
+are `other` errors without `file` and `line`: pdfTeX does not say where, and
+it often fails while writing the PDF. Other fatal engine errors (`TeX
+capacity exceeded`, `I can't write on file`, `Interruption`) are `other`
+errors at the position TeX reports.
+
+A failed compile (`outcome: failed`) always has at least one `error`
+diagnostic. When neither the log nor texrun found one (e.g. an engine
+message in an unknown form, or no log at all), an `other` error without
+`file` and `line` says so. Its `raw_excerpt` holds the last non-blank lines
+of the log (at most 12, from its last 16 KiB), and its message quotes the
+last line starting with `!` among them, if any. Read the log in that case.
+
 BibTeX problems are reported from its `.blg` logs and latexmk's output:
 
 - A syntax error or repeated entry in a `.bib` file is `bibtex_error` with the
