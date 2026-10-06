@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/nishide-dev/texrun"
@@ -20,13 +20,13 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 # Internal crates
-texrun-core = { path = "crates/texrun-core", version = "0.1.0" }
-texrun-latex-log = { path = "crates/texrun-latex-log", version = "0.1.0" }
-texrun-process = { path = "crates/texrun-process", version = "0.1.0" }
-texrun-texlive = { path = "crates/texrun-texlive", version = "0.1.0" }
-texrun-preview = { path = "crates/texrun-preview", version = "0.1.0" }
-texrun-sandbox = { path = "crates/texrun-sandbox", version = "0.1.0" }
-texrun-workspace = { path = "crates/texrun-workspace", version = "0.1.0" }
+texrun-core = { path = "crates/texrun-core", version = "0.1.1" }
+texrun-latex-log = { path = "crates/texrun-latex-log", version = "0.1.1" }
+texrun-process = { path = "crates/texrun-process", version = "0.1.1" }
+texrun-texlive = { path = "crates/texrun-texlive", version = "0.1.1" }
+texrun-preview = { path = "crates/texrun-preview", version = "0.1.1" }
+texrun-sandbox = { path = "crates/texrun-sandbox", version = "0.1.1" }
+texrun-workspace = { path = "crates/texrun-workspace", version = "0.1.1" }
 
 # External crates (add only when an issue actually needs them)
 clap = { version = "4.6", features = ["derive"] }

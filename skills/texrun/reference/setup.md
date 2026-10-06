@@ -7,12 +7,12 @@ texrun runs on Linux and macOS (not Windows) and is built with Rust 1.98 or
 newer:
 
 ```bash
-cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.0 texrun
+cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.1 texrun
 texrun --version
 ```
 
 Use the newest release tag from https://github.com/nishide-dev/texrun/releases
-in place of `v0.1.0`.
+in place of `v0.1.1`.
 
 Keep this skill at the same version as texrun. In Claude Code, add the
 plugin marketplace at the tag of the installed texrun (releases from v0.1.1
@@ -31,7 +31,7 @@ Then one of the backends:
   `texrun --version`. texrun never pulls images; pull it once:
 
   ```bash
-  docker pull ghcr.io/nishide-dev/texrun-engine:0.1.0
+  docker pull ghcr.io/nishide-dev/texrun-engine:0.1.1
   ```
 
   The image contains TeX Live, latexmk and the preview tools. Rootless
