@@ -25,7 +25,7 @@
 | `bibtex_error` | A syntax error or repeated entry in a `.bib` file, at the `file` and `line` BibTeX reports (an unclosed entry may be reported later than where it starts) |
 | `bibtex_failed` | BibTeX failed, so the bibliography is incomplete. Fix the `bibtex_error`/`missing_file` diagnostics next to it |
 | `resource_limit` | texrun stopped the compile at a limit on output size, CPU time, memory or processes. Look for runaway loops or huge generated output; the limits are not options |
-| `other` | Not classified. Read `message` and `raw_excerpt` |
+| `other` | Not classified. Read `message` and `raw_excerpt`. Without `file` and `line`: either pdfTeX could not load a font or an image (`pdfTeX error: ... Font ecrm1000 at 600 not found`: the font is not installed as Type 1, so use another font or encoding and tell the user; `cannot find image file`: check the path), or texrun recognized no error in a failed compile (`the compile failed...`: `raw_excerpt` is the end of the log; read the full log). `TeX capacity exceeded` usually means endless recursion; `I can't write on file` means writing outside the project, which is refused |
 
 ## Error kinds
 
