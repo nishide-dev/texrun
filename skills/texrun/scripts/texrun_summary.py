@@ -72,6 +72,11 @@ def summarize(report, show_all):
         print(f"errors ({len(errors)}), fix the first one and compile again:")
         for diag in errors:
             print_diagnostic(diag, root, with_excerpt=True)
+    elif outcome == "failed":
+        print(
+            "errors: none recognized; read the log below and look for the first "
+            "line starting with `!` or `./file.tex:N:`"
+        )
 
     warnings = by_severity["warning"]
     if warnings:
@@ -92,7 +97,7 @@ def summarize(report, show_all):
 
     for artifact in report.get("artifacts", []):
         if artifact.get("kind") in ("pdf", "log"):
-            print(f"{artifact.get('kind')}:{out(artifact.get('path', ''))}")
+            print(f"{artifact.get('kind')}: {out(artifact.get('path', ''))}")
 
     preview = report.get("preview")
     if preview:

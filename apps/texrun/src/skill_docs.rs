@@ -68,7 +68,11 @@ fn skill_files(extension: &str) -> Vec<(String, String)> {
             if path.is_dir() {
                 walk(&path, base, extension, out);
             } else if path.extension().is_some_and(|e| e == extension) {
-                let name = path.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                let name = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 out.push((name, read(&path)));
             }
         }
@@ -125,7 +129,7 @@ fn code_snippets(markdown: &str) -> Vec<String> {
     snippets
 }
 
-/// The fenced ```json blocks of a Markdown file.
+/// The fenced JSON code blocks of a Markdown file.
 fn json_blocks(markdown: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Option<String> = None;
@@ -303,11 +307,10 @@ fn frontmatter_follows_the_agent_skills_rules() {
     let text = read(&skill_dir().join("SKILL.md"));
     let (fields, body) = frontmatter(&text);
     let get = |key: &str| {
-        fields
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-            .unwrap_or_else(|| panic!("no `{key}` in the frontmatter"))
+        fields.iter().find(|(k, _)| k == key).map_or_else(
+            || panic!("no `{key}` in the frontmatter"),
+            |(_, v)| v.as_str(),
+        )
     };
     let name = get("name");
     assert!(name.len() <= 64, "name is longer than 64 characters");
@@ -410,7 +413,10 @@ fn commands_and_options_exist() {
             }
         }
     }
-    assert!(texrun_commands >= 5, "found only {texrun_commands} commands");
+    assert!(
+        texrun_commands >= 5,
+        "found only {texrun_commands} commands"
+    );
 }
 
 #[test]
@@ -489,7 +495,10 @@ fn kind_tables_list_every_kind() {
     }
     assert_eq!(table_keys(&errors_md, "## Diagnostic kinds"), diagnostic);
 
-    let engine = enum_variants(&source("crates/texrun-core/src/engine.rs"), "EngineErrorKind");
+    let engine = enum_variants(
+        &source("crates/texrun-core/src/engine.rs"),
+        "EngineErrorKind",
+    );
     let workspace = enum_variants(
         &source("crates/texrun-workspace/src/error.rs"),
         "WorkspaceErrorKind",
@@ -538,7 +547,10 @@ fn kind_tables_list_every_kind() {
 #[test]
 fn outcomes_and_exit_codes_match() {
     let skill = read(&skill_dir().join("SKILL.md"));
-    for outcome in enum_variants(&source("crates/texrun-core/src/result.rs"), "CompileOutcome") {
+    for outcome in enum_variants(
+        &source("crates/texrun-core/src/result.rs"),
+        "CompileOutcome",
+    ) {
         serde_json::from_value::<CompileOutcome>(json!(outcome)).unwrap();
         assert!(
             skill.contains(&format!("- `{outcome}`:")),
@@ -546,7 +558,9 @@ fn outcomes_and_exit_codes_match() {
         );
     }
 
-    let start = skill.find("\n## Exit codes\n").expect("an Exit codes section");
+    let start = skill
+        .find("\n## Exit codes\n")
+        .expect("an Exit codes section");
     let codes: BTreeSet<u8> = skill[start..]
         .lines()
         .skip(2)

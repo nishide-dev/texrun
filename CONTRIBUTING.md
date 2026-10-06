@@ -99,6 +99,7 @@ scope は変更対象の crate・モジュール・領域を表します。迷�
 | `preview`     | PDF のページ preview・メタデータ取得                   |
 | `ci`          | GitHub Actions などの CI 設定                          |
 | `docker`      | Docker ベースの開発環境                                |
+| `skills`      | AI エージェント向けの Agent Skill（`skills/`、`.claude-plugin/`） |
 | `deps`        | 依存 crate の更新（`chore(deps)` として使用）          |
 
 - 複数領域にまたがる場合は、主な変更対象の scope を 1 つ選ぶか、scope を省略してください。
@@ -173,6 +174,8 @@ PR 本文は **自然な日本語** で記述します。[PR template](.github/p
 ### レビュー前のチェック
 
 PR を作成・更新する前に、ローカルで品質ゲートを通してください（次節）。
+
+CLI の option、JSON のフィールド、error / diagnostic / note の kind、exit code を変える場合は、`docs/cli.md` に加えて Agent Skill（`skills/texrun/`）も同じ PR で更新してください。食い違いは `cargo test` の `skill_docs` テストで検出されます（[docs/agent-skills.md](docs/agent-skills.md)）。
 
 ## ローカル品質ゲート
 

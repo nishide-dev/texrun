@@ -74,6 +74,10 @@ document may be fine. See the error kinds in
   reading.
 - A diagnostic without `file` comes from an installed package or class; the
   cause is usually the document's own use of it just before.
+- If `failed` comes with no `error` diagnostic, texrun did not recognize the
+  problem: read the log (`output_dir` + `/` + the path of the `artifacts[]`
+  entry of kind `log`) and look for the first line starting with `!` or
+  `./file.tex:N:`.
 - Fix the cause; do not silence an error (for example by defining an unknown
   macro as empty) unless that is clearly what the author meant.
 - Fixes by `kind`: [reference/errors.md](reference/errors.md).
