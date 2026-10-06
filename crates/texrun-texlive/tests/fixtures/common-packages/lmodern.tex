@@ -1,0 +1,22 @@
+% The usual preamble of T1 documents: fontenc T1 with Latin Modern (#65).
+\documentclass{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{microtype}
+\usepackage{hyperref}
+\begin{document}
+\section{Latin Modern \textbullet}
+\begin{itemize}
+  \item Caf\'e \textbullet{} \texteuro{} \textdegree{}
+  \item \textbf{bold} \textit{italic} \textsf{sans} \texttt{mono} \textsc{Small Caps}
+\end{itemize}
+\begin{enumerate}
+  \item $\mathbb{R}$, $\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$
+\end{enumerate}
+\begin{tabular}{ll}\toprule a & b \\ \midrule c & d \\ \bottomrule\end{tabular}
+\includegraphics[width=1cm]{figure.png}
+\end{document}

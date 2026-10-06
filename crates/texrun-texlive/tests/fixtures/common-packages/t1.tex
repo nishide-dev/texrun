@@ -1,0 +1,17 @@
+% T1 fonts without lmodern: the EC fonts (cm-super) at several sizes (#65).
+\documentclass[12pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{hyperref}
+\begin{document}
+\section{Caf\'e na\"ive \textbullet}
+\begin{itemize}
+  \item \"Uber \textbullet{} \texteuro{} \guillemotleft{}quoted\guillemotright{}
+  \item \textbf{bold} \textit{italic} \textsf{sans} \texttt{mono} \textsc{Small Caps}
+  \item {\footnotesize small \textbullet} {\LARGE large \textbullet}
+\end{itemize}
+\begin{enumerate}
+  \item $x^2$
+\end{enumerate}
+\end{document}

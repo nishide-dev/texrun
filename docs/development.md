@@ -17,7 +17,8 @@ image に含まれるもの:
 
 - Rust 1.98.1（`rust:1.98.1-slim-trixie` ベース）+ `rustfmt` / `clippy`
   - `rust-toolchain.toml`（channel = "1.98.1"、components = rustfmt / clippy）と一致させており、コンテナ内で toolchain の再ダウンロードは発生しない
-- TeX Live（Debian パッケージ）: `latexmk`, `texlive-latex-base`, `texlive-latex-recommended`
+- TeX Live（Debian パッケージ）: `latexmk`, `texlive-latex-base`, `texlive-latex-recommended`, `texlive-fonts-recommended`, `cm-super`, `lmodern`
+  - font は engine image と揃えている。texrun は `MKTEXPK=0`（[security.md](security.md) §3.4）で bitmap font を生成させないので、文書が使う font は Type1 で入っている必要がある（#65）。`cm-super` は T1 / TS1（itemize の `\textbullet` や textcomp の記号）の EC / TC font、`lmodern` は `\usepackage{lmodern}`、`texlive-fonts-recommended` は Times / Helvetica / Palatino などの PSNFSS
   - `pdflatex` と `bibtex` が利用できる。`biber` は含まない
   - image サイズを抑えるため `--no-install-recommends` とし、ドキュメント類（`/usr/share/doc`、TeX Live の `doc/` など）は入れていない
 - PDF preview tool（#8）: MuPDF `mutool`（`mupdf-tools`）、Poppler `pdftoppm` / `pdfinfo`（`poppler-utils`）
@@ -286,6 +287,6 @@ PR と、`publish` が off の手動実行は、push と release の作成以外
 - image tag `texrun-dev:latest` は全 checkout で共有している。`Dockerfile` を変更した checkout で build すると、ほかの checkout が使う image も置き換わる。変更前の image に戻すときは、元の checkout で `docker compose build dev` をやり直す
 - base image は digest で固定しているが、apt パッケージは version を固定していない（image を build した時点の Debian の版が入る）。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）。CI の `integration` job は `Tool versions` step で実際の version を表示する
   - `texlive-binaries` 2024.20240313.70630+ds-6（pdfTeX 1.40.26）
-  - `texlive-latex-base` / `texlive-latex-recommended` 2024.20250309-1
+  - `texlive-latex-base` / `texlive-latex-recommended` / `texlive-fonts-recommended` 2024.20250309-1、`cm-super` 0.3.4-17、`lmodern` 2.005-1
   - `latexmk` 4.86、`mupdf-tools` 1.25.1、`poppler-utils` 25.03.0
 - この image は開発・テスト用であり、本番の sandbox worker としての container 実行（#9 の post-MVP 範囲）は対象外

@@ -49,6 +49,29 @@ fn minimal() {
     assert_eq!(common::names_in(dest.path()), ["main.log", "main.pdf"]);
 }
 
+/// Documents with the usual packages and fonts compile (#65): itemize and
+/// textcomp symbols (TS1), fontenc T1 at several sizes, Latin Modern and
+/// the PSNFSS fonts. texrun sets `MKTEXPK=0`, so every font must be in the
+/// TeX tree (dev image, engine image) as Type1: a missing one fails the
+/// compile (`Font tcrm1000 at 600 not found`) instead of being generated
+/// as a bitmap.
+#[test]
+fn common_packages() {
+    require_texlive!();
+    for main in ["main.tex", "t1.tex", "lmodern.tex", "psnfss.tex"] {
+        let (run, ws) = Compile::fixture("common-packages", main).run();
+        assert_outcome(&run, CompileOutcome::Succeeded);
+        assert_eq!(run.result.errors().count(), 0, "{}", describe(&run));
+        assert!(
+            !has(&run, DiagnosticKind::UndefinedReference),
+            "{}",
+            describe(&run)
+        );
+        let pdf = assert_pdf(&run, &ws, &main.replace(".tex", ".pdf"));
+        assert_page_count(&pdf, 1);
+    }
+}
+
 #[test]
 fn syntax_error() {
     require_texlive!();
