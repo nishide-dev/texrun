@@ -50,7 +50,7 @@ pub fn unexplained_failure(log: &[u8]) -> Diagnostic {
         return Diagnostic::new(
             Severity::Error,
             DiagnosticKind::Other,
-            "the compile failed, and TeX wrote no log to explain why; see latexmk's output",
+            "the compile failed, but TeX wrote no log to explain why",
         );
     }
 
