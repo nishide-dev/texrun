@@ -12,6 +12,8 @@ mod human;
 mod output;
 mod report;
 mod signals;
+#[cfg(test)]
+mod skill_docs;
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};

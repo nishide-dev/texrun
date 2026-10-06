@@ -1,0 +1,15 @@
+{
+  "name": "texrun",
+  "description": "Agent Skills for compiling TeX documents with texrun",
+  "owner": {
+    "name": "nishide-dev",
+    "url": "https://github.com/nishide-dev"
+  },
+  "plugins": [
+    {
+      "name": "texrun",
+      "source": "./",
+      "description": "Compile LaTeX documents with texrun, fix errors from its JSON diagnostics and check the page previews"
+    }
+  ]
+}
