@@ -151,6 +151,15 @@ feat(cli): add compile command
 fix(texlive): terminate timed-out latexmk process
 ```
 
+PR タイトルは、そのまま **release notes** の 1 行になります。release 時に、前の版からの `main` のコミットタイトルが type ごとに分類されて GitHub release に載ります（`feat` → Features、`fix` → Bug fixes、`perf` → Performance、`docs` → Documentation、それ以外 → Other changes、`chore(deps)` は Dependencies にまとめて 1 行。breaking change は Breaking changes にも載ります）。そのため:
+
+- type は変更の性質どおりに選んでください（利用者に見える新機能は `feat`、不具合の修正は `fix`。CI や開発環境だけの変更を `feat` / `fix` にしない）。
+- description は、利用者がこの 1 行だけを読んで何が変わったか分かるように書いてください。scope は太字で前に付きます（例: **cli**: Add compile command）。
+- 載るのはタイトルだけです。PR 本文や `BREAKING CHANGE:` footer の説明は載らないので、breaking change も何が変わったかがタイトルで分かるようにしてください。
+- タイトルに GitHub の user 名（`@name`）を書かないでください（notes では code として表示しますが、mention を意図した書き方は避けます）。
+
+仕組みと notes の作り直し方は [docs/development.md](docs/development.md#release-notes) を参照してください。
+
 ### PR body
 
 PR 本文は **自然な日本語** で記述します。[PR template](.github/pull_request_template.md) に沿って、最低限以下を含めてください。
@@ -232,6 +241,7 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 
 - merge 前に `ci-success` と `pr-title` が成功していることを確認してください（branch protection の required check として設定する想定です）。
 - squash merge では PR タイトルが最終コミットのタイトルになるため、自動検証の対象は PR タイトルです。feature branch 内の個々のコミットメッセージは自動検証しないので、レビュー時に目視で確認します。
+- release notes の設定（`cliff.toml`、`.github/scripts/release-notes.sh`、`.github/workflows/release-notes.yml`）を変える PR では、`notes` が最後の版と次の版の release notes を生成し、job summary に出します（[docs/development.md](docs/development.md#release-notes)）。
 - 新しい RustSec advisory を検出するため、`deny` は週次の schedule でも実行されます（schedule のときは `deny` 以外の job はスキップされます）。
 - 依存 crate・GitHub Actions・開発環境の base image（digest）の更新は、Dependabot が週次で `chore(deps): ...` の PR を作成します。
 - `integration` の image の layer と cargo の build 成果物は GitHub Actions の cache（buildx の `type=gha` と `actions/cache`）から再利用するので、`Dockerfile` を変えない限り build はほぼ cache で済みます。cache への保存は main への push のときだけで、PR は main の cache を読むだけです。
