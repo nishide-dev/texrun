@@ -18,8 +18,9 @@ name: texrun
 services:
   dev:
     build:
-      context: docker/dev
-      dockerfile: Dockerfile
+      # docker/, for the files the dev image shares with docker/engine.
+      context: docker
+      dockerfile: dev/Dockerfile
     # Shared by all checkouts: rebuilding from a checkout with a modified
     # Dockerfile replaces the image used by the other checkouts too.
     image: texrun-dev:latest

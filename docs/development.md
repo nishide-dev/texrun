@@ -17,9 +17,13 @@ image に含まれるもの:
 
 - Rust 1.98.1（`rust:1.98.1-slim-trixie` ベース）+ `rustfmt` / `clippy`
   - `rust-toolchain.toml`（channel = "1.98.1"、components = rustfmt / clippy）と一致させており、コンテナ内で toolchain の再ダウンロードは発生しない
-- TeX Live（Debian パッケージ）: `latexmk`, `texlive-latex-base`, `texlive-latex-recommended`, `texlive-fonts-recommended`, `cm-super`, `lmodern`
+- TeX Live（Debian パッケージ）: `latexmk`, `texlive-latex-base`, `texlive-latex-recommended`, `texlive-fonts-recommended`, `texlive-pictures`, `cm-super`, `lmodern`
+  - `texlive-pictures` は pgf / TikZ（beamer が必要とする）、pgfplots、tikz-cd など（#69）。依存で python3 が入る
   - font は engine image と揃えている。texrun は `MKTEXPK=0`（[security.md](security.md) §3.4）で bitmap font を生成させないので、文書が使う font は Type1 で入っている必要がある（#65）。`cm-super` は T1 / TS1（itemize の `\textbullet` や textcomp の記号）の EC / TC font、`lmodern` は `\usepackage{lmodern}`、`texlive-fonts-recommended` は Times / Helvetica / Palatino などの PSNFSS
   - `pdflatex` と `bibtex` が利用できる。`biber` は含まない
+- TeX Live（Debian の外から）: Debian では `texlive-latex-extra` / `texlive-fonts-extra` / `texlive-science` にしか無いパッケージのうち、ACL のテンプレート（#71）と論文でよく使うもの（#69）。inconsolata、upquote、mwe、siunitx、multirow、makecell、threeparttable、enumitem、cleveref、algorithms、algorithmicx、algorithm2e（と ifoddpage、relsize）、wrapfig、placeins、units（nicefrac）、xurl、soul、comment
+  - これらの Debian パッケージの source package（`texlive-extra`）は `.orig.tar.xz` だけで 2.8 GB あり、engine image の sources release asset の上限（2 GiB）を超える。そのため、凍結された TeX Live 2024 の repository（tlnet-final。trixie の TeX Live と同じ版）の archive を、`docker/engine/texlive-archives.sha256` の SHA-256 で照合して `/usr/local/share/texmf`（TEXMFLOCAL）に展開する（`docker/engine/texlive-archives.sh`）。engine image と同じ list・script を使うため、dev image の build context は `docker/` である（`compose.yaml`、CI の `integration` job）
+  - パッケージを足すときは、`texlive-archives.sha256` に `<pkg>.tar.xz` と、あれば `<pkg>.doc.tar.xz` / `<pkg>.source.tar.xz` の SHA-256 を加え、LaTeX 上の依存（`\RequirePackage`）が image にあることを fixture で確かめる。[engine-image.md](engine-image.md#licenses) の license 表も更新する
   - image サイズを抑えるため `--no-install-recommends` とし、ドキュメント類（`/usr/share/doc`、TeX Live の `doc/` など）は入れていない
 - PDF preview tool（#8）: MuPDF `mutool`（`mupdf-tools`）、Poppler `pdftoppm` / `pdfinfo`（`poppler-utils`）
 
@@ -156,12 +160,29 @@ docker compose run --rm -e TEXRUN_REQUIRE_TEXLIVE=1 -e TEXRUN_REQUIRE_PREVIEW_TO
 | `timeout` | 無限ループを短い timeout（2 秒）で `TimedOut` にし、プロセスを残さない |
 | `multi-file` | サブディレクトリの `\input` / `\include`: workspace へのコピー、子ファイルの `.aux`、ページ数、子ファイルに帰属する diagnostic、preview の生成 |
 | `unicode-names` | 日本語・空白・全角空白を含むファイル名 |
+| `common-packages` | よく使うパッケージと font（#65）、beamer + TikZ、siunitx などの論文向けパッケージ、algorithm2e（#69）。すべて成功し、error と未定義参照が無く、1 ページ |
+| （ACL のテンプレート） | `acl_template`: acl-org/acl-style-files を変更せずに（`final` / `preprint` は `acl.sty` の option だけを変えて）compile し、BibTeX（natbib）、hyperref、preview まで成功すること（#71）。下の「ACL のテンプレート」 |
 | `security/*` | shell escape、workspace 外の読み書き、rc ファイル、先頭行の format 指定、補助ツールの起動。`security/sandbox` は container backend で workspace 外のファイルが PDF に埋め込めないこと（`container.rs`） |
 
 - 検証は構造化された結果（outcome、diagnostic の kind / file / line、artifact の有無と size、PDF のページ数）に対して行い、ログ全文の snapshot には依存しない。TeX Live の minor な差で壊れにくくするためである。
 - PDF のページ数は `texrun-preview`（`mutool` または `pdfinfo`）で読む。
 - fixture を追加・変更したときは、コンテナ内で上のコマンドを実行して確認する。
 - CPU 時間・memory・プロセス数の上限（[docs/security.md](security.md) §3.10）は `limits.rs` で確認する。fixture は既存のもの（`timeout` の無限ループ、`minimal`）を小さい上限で compile し、長い文書は test の中で生成する。
+
+### ACL のテンプレート
+
+`scenarios.rs` の `acl_template` は、ACL の公式テンプレート（https://github.com/acl-org/acl-style-files）を compile する（#71）。repository に license ファイルが無く、`acl.sty` / `acl_latex.tex` にも license の記載が無いので、fixture として同梱せず、固定した commit を test の前に取得する。
+
+```bash
+sh .github/scripts/fetch-acl-style-files.sh /tmp/acl-style-files
+TEXRUN_ACL_STYLE_FILES=/tmp/acl-style-files TEXRUN_REQUIRE_TEXLIVE=1 \
+  cargo test -p texrun-texlive --test scenarios acl_template
+```
+
+- `TEXRUN_ACL_STYLE_FILES` が無いと、この test は `SKIPPED` を出して何もしない。設定されていて、そこにテンプレートが無ければ失敗する
+- dev コンテナでは、取得したディレクトリを mount して渡す（例: `docker compose run --rm -v /tmp/acl-style-files:/acl-style-files:ro -e TEXRUN_ACL_STYLE_FILES=/acl-style-files -e TEXRUN_REQUIRE_TEXLIVE=1 dev cargo test -p texrun-texlive --test scenarios acl_template`）
+- CI は、network を使う取得を test とは別の step で行い、`integration`（host backend、dev image）、`sandbox` / `sandbox (podman)`（container backend）、engine-image workflow の `verify` で実行する
+- テンプレートを新しくするときは、script の `COMMIT` を master の commit に変え、両方の backend で test が通ることを確かめる
 
 ### cgroup test
 
@@ -287,6 +308,6 @@ PR と、`publish` が off の手動実行は、push と release の作成以外
 - image tag `texrun-dev:latest` は全 checkout で共有している。`Dockerfile` を変更した checkout で build すると、ほかの checkout が使う image も置き換わる。変更前の image に戻すときは、元の checkout で `docker compose build dev` をやり直す
 - base image は digest で固定しているが、apt パッケージは version を固定していない（image を build した時点の Debian の版が入る）。fixture（#10）の揺れを調べるときの参考として、現時点の主な version を記録しておく（Debian 13.7 trixie, arm64）。CI の `integration` job は `Tool versions` step で実際の version を表示する
   - `texlive-binaries` 2024.20240313.70630+ds-6（pdfTeX 1.40.26）
-  - `texlive-latex-base` / `texlive-latex-recommended` / `texlive-fonts-recommended` 2024.20250309-1、`cm-super` 0.3.4-17、`lmodern` 2.005-1
+  - `texlive-latex-base` / `texlive-latex-recommended` / `texlive-fonts-recommended` / `texlive-pictures` 2024.20250309-1、`cm-super` 0.3.4-17、`lmodern` 2.005-1
   - `latexmk` 4.86、`mupdf-tools` 1.25.1、`poppler-utils` 25.03.0
 - この image は開発・テスト用であり、本番の sandbox worker としての container 実行（#9 の post-MVP 範囲）は対象外

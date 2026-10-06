@@ -24,7 +24,8 @@ name: Engine image
 #   with SBOM and provenance, written to an archive instead of a registry.
 # - sources: downloads the Debian source packages of the image at the
 #   installed versions (the corresponding source of its GPL / AGPL
-#   programs).
+#   programs), and the TeX Live archives of the packages that are not from
+#   Debian (docker/engine/texlive-archives.sha256).
 # - publish (after verify and sources): pushes the multi-arch image by
 #   digest, checks that each platform has exactly the layers verify tested,
 #   then attests and tags it.
@@ -45,6 +46,7 @@ on:
       - docker/engine/**
       - .github/workflows/engine-image.yml
       - .github/scripts/fetch-engine-sources.sh
+      - .github/scripts/fetch-acl-style-files.sh
   workflow_dispatch:
     inputs:
       publish:
@@ -190,6 +192,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: false
+      # The ACL template (#71) for the acl_template test, as in ci.yml.
+      - name: Fetch the ACL template
+        run: |
+          sh .github/scripts/fetch-acl-style-files.sh "${RUNNER_TEMP}/acl-style-files"
+          echo "TEXRUN_ACL_STYLE_FILES=${RUNNER_TEMP}/acl-style-files" >> "${GITHUB_ENV}"
       # The same tests as ci.yml's `sandbox` job.
       - name: Run container backend tests
         shell: bash
@@ -472,9 +479,15 @@ jobs:
             -v "${work}:/work" \
             -v "${GITHUB_WORKSPACE}/.github/scripts/fetch-engine-sources.sh:/fetch-engine-sources.sh:ro" \
             "${base}" /bin/sh /fetch-engine-sources.sh "/work/${name}/packages.txt" "/work/${name}"
+          # The TeX Live packages that are not from Debian (#69, #71): their
+          # archives as TeX Live distributes them (run files, documentation,
+          # sources), checked against the list the image was built from.
+          sh docker/engine/texlive-archives.sh fetch docker/engine/texlive-archives.sha256 "${work}/${name}/texlive"
+          cp docker/engine/texlive-archives.sha256 "${work}/${name}/texlive/SHA256SUMS"
           tar -cf "${work}/${name}.tar" -C "${work}" "${name}"
           ls -l "${work}/${name}.tar"
           size="$(stat -c %s "${work}/${name}.tar")"
+          echo "$(( (2147483648 - size) / 1048576 )) MiB below the 2 GiB limit" | tee -a "${GITHUB_STEP_SUMMARY}"
           # GitHub release assets are limited to 2 GiB each.
           if [ "${size}" -ge 2147483648 ]; then
             echo "::error::${name}.tar is ${size} bytes, over the 2 GiB limit of a release asset"

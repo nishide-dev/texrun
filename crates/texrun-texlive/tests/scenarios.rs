@@ -54,7 +54,7 @@ fn minimal() {
 /// the PSNFSS fonts (Times, Helvetica, Courier, Palatino). texrun sets `MKTEXPK=0`, so every font must be in the
 /// TeX tree (dev image, engine image) as Type1: a missing one fails the
 /// compile (`Font tcrm1000 at 600 not found`) instead of being generated
-/// as a bitmap. Also beamer with TikZ, siunitx and the other packages
+/// as a bitmap. Also beamer with pgf / `TikZ`, siunitx and the other packages
 /// common in papers that the images take from TeX Live (#69).
 #[test]
 fn common_packages() {
@@ -158,7 +158,11 @@ fn acl_template() {
             let report = previewer
                 .render(&pdf, &ws.output_dir(), &PreviewOptions::default())
                 .unwrap();
-            assert_eq!(report.status, PreviewStatus::Rendered, "{option}: {report:#?}");
+            assert_eq!(
+                report.status,
+                PreviewStatus::Rendered,
+                "{option}: {report:#?}"
+            );
             let pages = report.pdf.as_ref().unwrap().page_count;
             assert!(pages >= 3, "{option}: {pages} pages");
             report.attach_to(&mut run.result);
