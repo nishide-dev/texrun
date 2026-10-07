@@ -7,7 +7,7 @@ PDF, and PNG previews of its pages, either as readable text or as a single
 JSON document.
 
 > [!NOTE]
-> texrun is in early development (version 0.1.1). It works on Linux and
+> texrun is in early development (version 0.1.2). It works on Linux and
 > macOS, but the CLI and the JSON output may still change.
 
 ## Why texrun
@@ -34,7 +34,7 @@ texrun runs on Linux and macOS; Windows is not supported. It needs Rust 1.98
 or newer to build. Install it with Cargo:
 
 ```bash
-cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.1 texrun
+cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.2 texrun
 ```
 
 Then install the tools for the backend you plan to use:
@@ -50,7 +50,7 @@ Then install the tools for the backend you plan to use:
   so pull it once:
 
   ```bash
-  docker pull ghcr.io/nishide-dev/texrun-engine:0.1.1
+  docker pull ghcr.io/nishide-dev/texrun-engine:0.1.2
   ```
 
   The image includes TeX Live, latexmk and the preview tools, so nothing else

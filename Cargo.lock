@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "texrun"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "rustix",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-latex-log"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "serde_json",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-preview"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "serde",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-process"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "tempfile",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-sandbox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "serde_json",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-texlive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "tempfile",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "texrun-workspace"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustix",
  "serde",

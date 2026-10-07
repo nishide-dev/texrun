@@ -16,8 +16,8 @@ default of `--container-image`, so the container backend works without
 cloning this repository:
 
 ```bash
-cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.1 texrun
-docker pull ghcr.io/nishide-dev/texrun-engine:0.1.1
+cargo install --locked --git https://github.com/nishide-dev/texrun --tag v0.1.2 texrun
+docker pull ghcr.io/nishide-dev/texrun-engine:0.1.2
 texrun compile --backend container main.tex
 ```
 
@@ -28,7 +28,7 @@ and a hint.
 To build the image yourself instead, from a checkout of the same version:
 
 ```bash
-docker build -t ghcr.io/nishide-dev/texrun-engine:0.1.1 docker/engine
+docker build -t ghcr.io/nishide-dev/texrun-engine:0.1.2 docker/engine
 ```
 
 Any other name works too, with `--container-image`.
@@ -48,7 +48,7 @@ texrun compile --backend container \
 label, for example:
 
 ```text
-latexmk 4.86 (docker 29.4.0, image ghcr.io/nishide-dev/texrun-engine:0.1.1 3681cf4e3444, image version 0.1.1)
+latexmk 4.86 (docker 29.4.0, image ghcr.io/nishide-dev/texrun-engine:0.1.2 3681cf4e3444, image version 0.1.2)
 ```
 
 It says `image version X, not Y of texrun` when the image belongs to another
@@ -60,7 +60,7 @@ The image carries an SBOM and SLSA provenance (buildx attestations) and a
 signed GitHub artifact attestation:
 
 ```bash
-gh attestation verify oci://ghcr.io/nishide-dev/texrun-engine:0.1.1 -R nishide-dev/texrun
+gh attestation verify oci://ghcr.io/nishide-dev/texrun-engine:0.1.2 -R nishide-dev/texrun
 ```
 
 ## Licenses
