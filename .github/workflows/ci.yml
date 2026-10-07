@@ -126,7 +126,8 @@ jobs:
       - name: Build dev image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: docker/dev
+          # docker/: the dev image shares files with docker/engine.
+          context: docker
           file: docker/dev/Dockerfile
           tags: ${{ env.IMAGE }}
           load: true
@@ -141,8 +142,12 @@ jobs:
           path: |
             target/docker
             ${{ runner.temp }}/cargo-registry
-          key: integration-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'docker/dev/Dockerfile') }}
+          key: integration-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'docker/dev/Dockerfile', 'docker/engine/texlive-archives.*') }}
           restore-keys: integration-
+      # The ACL template (#71) for the acl_template test, which compiles it
+      # unmodified; it is not bundled (no license that allows it).
+      - name: Fetch the ACL template
+        run: sh .github/scripts/fetch-acl-style-files.sh "${RUNNER_TEMP}/acl-style-files"
       - name: Tool versions
         run: |
           docker run --rm "${IMAGE}" sh -c \
@@ -163,6 +168,8 @@ jobs:
             -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL -e RUST_BACKTRACE \
             -e TEXRUN_REQUIRE_TEXLIVE=1 \
             -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+            -v "${RUNNER_TEMP}/acl-style-files:/acl-style-files:ro" \
+            -e TEXRUN_ACL_STYLE_FILES=/acl-style-files \
             "${IMAGE}" \
             cargo test --workspace --all-features --locked 2>&1 | tee "${RUNNER_TEMP}/integration.log"
           if grep -E 'test result: .* [1-9][0-9]* ignored' "${RUNNER_TEMP}/integration.log"; then
@@ -191,6 +198,8 @@ jobs:
             -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL -e RUST_BACKTRACE \
             -e TEXRUN_REQUIRE_TEXLIVE=1 \
             -e TEXRUN_REQUIRE_PREVIEW_TOOLS=1 \
+            -v "${RUNNER_TEMP}/acl-style-files:/acl-style-files:ro" \
+            -e TEXRUN_ACL_STYLE_FILES=/acl-style-files \
             "${IMAGE}" \
             docker/dev/with-cgroup.sh \
             cargo test --workspace --all-features --locked
@@ -238,6 +247,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Fetch the ACL template
+        run: |
+          sh .github/scripts/fetch-acl-style-files.sh "${RUNNER_TEMP}/acl-style-files"
+          echo "TEXRUN_ACL_STYLE_FILES=${RUNNER_TEMP}/acl-style-files" >> "${GITHUB_ENV}"
       - name: Tool versions
         run: |
           docker version --format 'docker {{.Server.Version}} ({{.Server.Os}}/{{.Server.Arch}})'
@@ -326,6 +339,10 @@ jobs:
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
       - name: Build engine image
         run: podman build --tag "${TEXRUN_SANDBOX_IMAGE}" docker/engine
+      - name: Fetch the ACL template
+        run: |
+          sh .github/scripts/fetch-acl-style-files.sh "${RUNNER_TEMP}/acl-style-files"
+          echo "TEXRUN_ACL_STYLE_FILES=${RUNNER_TEMP}/acl-style-files" >> "${GITHUB_ENV}"
       - name: Install Rust toolchain
         run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

@@ -52,7 +52,8 @@ use texrun_core::{
     CancelToken, CompileContext, CompileOptions, CompileOutcome, CompileRequest, Diagnostic,
     DiagnosticKind, EngineError, EngineInfo, TypesetEngine, WorkspacePath,
 };
-use texrun_preview::{PreviewOptions, Previewer};
+use texrun_preview::{PreviewContainer, PreviewOptions, Previewer};
+use texrun_sandbox::Runtime;
 use texrun_texlive::{ContainerConfig, ContainerEngine, LatexmkEngine, LatexmkRun};
 use texrun_workspace::{ProjectInput, Workspace, WorkspaceConfig};
 
@@ -80,6 +81,39 @@ pub const LOCAL_SANDBOX_IMAGE: &str = "texrun-engine:latest";
 /// Set to `1` to fail (instead of skip) tests that need the container
 /// backend (a runtime and the engine image).
 pub const REQUIRE_SANDBOX_ENV: &str = "TEXRUN_REQUIRE_SANDBOX";
+
+/// A checkout of the ACL template (acl-org/acl-style-files at the commit
+/// pinned in `.github/scripts/fetch-acl-style-files.sh`, #71). Its files
+/// have no license that allows bundling them as a fixture, so the test that
+/// compiles it ([`acl_style_files`]) is skipped unless this is set.
+pub const ACL_STYLE_FILES_ENV: &str = "TEXRUN_ACL_STYLE_FILES";
+
+/// The directory of [`ACL_STYLE_FILES_ENV`], or `None` (with a `SKIPPED`
+/// note) when it is not set. Panics if it is set but is not a checkout of
+/// the template.
+pub fn acl_style_files() -> Option<PathBuf> {
+    match std::env::var_os(ACL_STYLE_FILES_ENV) {
+        Some(dir) if !dir.is_empty() => {
+            let dir = PathBuf::from(dir);
+            assert!(
+                dir.join("acl_latex.tex").is_file() && dir.join("acl.sty").is_file(),
+                "{ACL_STYLE_FILES_ENV}={} is not a checkout of acl-org/acl-style-files",
+                dir.display()
+            );
+            Some(dir)
+        }
+        _ => {
+            report_skip_with(
+                "the ACL template test: no checkout of acl-org/acl-style-files",
+                &format!(
+                    "set {ACL_STYLE_FILES_ENV} to the directory of \
+                     .github/scripts/fetch-acl-style-files.sh"
+                ),
+            );
+            None
+        }
+    }
+}
 
 /// Whether the default engine of the tests is the container backend.
 pub fn container_backend() -> bool {
@@ -442,10 +476,15 @@ pub fn assert_pdf(run: &LatexmkRun, ws: &Workspace, expected: &str) -> PathBuf {
     path
 }
 
-/// A previewer if a preview backend (`mutool` or Poppler) is installed.
-/// `None` (with a `SKIPPED` note) otherwise, unless
-/// [`REQUIRE_PREVIEW_TOOLS_ENV`] is `1`.
+/// A previewer: with the container backend, one that runs the tools in a
+/// container of the tests' image (as `texrun compile --backend container`
+/// does); otherwise one for the preview backends (`mutool` or Poppler)
+/// installed on the host, or `None` (with a `SKIPPED` note) if there is
+/// none, unless [`REQUIRE_PREVIEW_TOOLS_ENV`] is `1`.
 pub fn previewer() -> Option<Previewer> {
+    if container_backend() {
+        return Some(Previewer::in_container(preview_container()));
+    }
     let previewer = Previewer::detect();
     if previewer.toolset().available().is_empty() {
         assert!(
@@ -460,6 +499,24 @@ pub fn previewer() -> Option<Previewer> {
         return None;
     }
     Some(previewer)
+}
+
+/// The container of the container backend's previews: the tests' image
+/// ([`SANDBOX_IMAGE_ENV`]) with the detected runtime. Only called once the
+/// container backend was found usable ([`texlive_available`]).
+fn preview_container() -> PreviewContainer {
+    static CONTAINER: OnceLock<PreviewContainer> = OnceLock::new();
+    CONTAINER
+        .get_or_init(|| {
+            let image = match std::env::var(SANDBOX_IMAGE_ENV) {
+                Ok(image) if !image.is_empty() => image,
+                _ => LOCAL_SANDBOX_IMAGE.to_owned(),
+            };
+            let runtime = Runtime::detect(None).expect("container runtime");
+            let id = runtime.image_id(&image).expect("engine image");
+            PreviewContainer::new(runtime, id)
+        })
+        .clone()
 }
 
 /// Number of pages of `pdf`, read with `texrun-preview`, or `None` without

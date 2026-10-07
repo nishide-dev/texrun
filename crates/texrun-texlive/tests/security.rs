@@ -46,6 +46,23 @@ fn shell_escape_write18_is_not_executed() {
     assert!(log.contains("disabled"), "{log}");
 }
 
+/// Not even the commands that TeX Live's restricted shell escape allows
+/// (`shell_escape_commands`; with texlive-pictures it also lists
+/// `memoize-extract.py`, which starts Python) run: shell escape is
+/// disabled, not restricted.
+#[test]
+fn restricted_shell_escape_commands_are_not_executed() {
+    require_texlive!();
+    let (run, ws) = Compile::fixture("security/shell-escape", "restricted.tex").run();
+    assert_outcome(&run, CompileOutcome::Succeeded);
+    assert_no_file(ws.path(), MARKER);
+    let log = fs::read_to_string(ws.output_dir().join("restricted.log")).unwrap();
+    assert!(log.contains("runsystem(kpsewhich"), "{log}");
+    assert!(log.contains("runsystem(makeindex"), "{log}");
+    assert!(log.contains("disabled"), "{log}");
+    assert!(!log.contains("executed"), "{log}");
+}
+
 #[test]
 fn shell_escape_pipe_input_is_not_executed() {
     require_texlive!();

@@ -222,6 +222,7 @@ and the TeX Live integration tests (both in Japanese).
 texrun is licensed under the [MIT License](LICENSE).
 
 The engine image contains no texrun code; it consists of unmodified Debian
-packages under their own licenses, including GPL and AGPL software, whose
-source is attached to each GitHub release. See
+packages and a few unmodified TeX Live packages under their own licenses,
+including GPL and AGPL software, whose source is attached to each GitHub
+release. See
 [docs/engine-image.md](docs/engine-image.md#licenses) for details.
