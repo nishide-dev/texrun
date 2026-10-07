@@ -465,12 +465,18 @@ jobs:
           pattern: verify-*
           merge-multiple: true
           path: ${{ runner.temp }}/verify
-      # In a container of the image's base (the digest of its FROM line).
+      # In a container of the image's base (the digest of its FROM lines:
+      # the builder stage and the image use the same one).
       - name: Fetch the source packages
         shell: bash
         run: |
           set -euo pipefail
-          base="$(awk '/^FROM /{ print $2; exit }' docker/engine/Dockerfile)"
+          bases="$(awk '/^FROM /{ print $2 }' docker/engine/Dockerfile | sort -u)"
+          if [ "$(wc -l <<< "${bases}")" != 1 ]; then
+            echo "::error::the stages of docker/engine/Dockerfile have different bases: ${bases//$'\n'/, }"
+            exit 1
+          fi
+          base="${bases}"
           work="${RUNNER_TEMP}/sources"
           name="texrun-engine-${VERSION}-sources"
           mkdir -p "${work}/${name}"

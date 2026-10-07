@@ -1,0 +1,10 @@
+% Commands of TeX Live's restricted shell escape list (shell_escape_commands
+% in texmf.cnf: kpsewhich, makeindex, ...). With restricted shell escape
+% (TeX Live's default) they run; texrun disables shell escape entirely, so
+% they must not. makeindex would write shell-escape-marker.ind.
+\documentclass{article}
+\begin{document}
+\immediate\write18{kpsewhich -version}
+\immediate\write18{makeindex -q -o shell-escape-marker.ind entries.idx}
+Text.
+\end{document}

@@ -22,7 +22,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
 COPY engine/texlive-archives.sha256 engine/texlive-archives.sh /tmp/
 RUN sh /tmp/texlive-archives.sh fetch /tmp/texlive-archives.sha256 /tmp/archives \
-    && sh /tmp/texlive-archives.sh install /tmp/archives /texmf
+    && sh /tmp/texlive-archives.sh install /tmp/texlive-archives.sha256 /tmp/archives /texmf
 
 FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7
 

@@ -57,7 +57,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
 COPY texlive-archives.sha256 texlive-archives.sh /tmp/
 RUN sh /tmp/texlive-archives.sh fetch /tmp/texlive-archives.sha256 /tmp/archives \
-    && sh /tmp/texlive-archives.sh install /tmp/archives /texmf
+    && sh /tmp/texlive-archives.sh install /tmp/texlive-archives.sha256 /tmp/archives /texmf
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 

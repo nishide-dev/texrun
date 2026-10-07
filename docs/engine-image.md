@@ -81,7 +81,7 @@ TeX Live packages, under their own licenses:
 | TeX Live programs (`texlive-binaries`: pdfTeX, BibTeX, makeindex, kpathsea, ...) | GPL and other free software licenses |
 | `latexmk` | GPL-2.0-or-later |
 | TeX Live packages that Debian only has in `texlive-latex-extra` / `texlive-fonts-extra` / `texlive-science`, from the frozen TeX Live 2024 repository (in `/usr/local/share/texmf`, see below): `siunitx`, `multirow`, `makecell`, `cleveref`, `algorithmicx`, `algorithm2e`, `ifoddpage`, `wrapfig`, `xurl`, `soul`, `mwe`, `upquote` | LaTeX Project Public License |
-| ... from the same repository: `inconsolata` (the Inconsolata Type1 / OpenType fonts and their LaTeX support) | SIL Open Font License 1.1 (fonts; `doc/fonts/inconsolata/OFL.txt` in the tree), Apache-2.0 / LPPL / permissive (the other files) |
+| ... from the same repository: `inconsolata` (the Inconsolata Type1 / OpenType fonts and their LaTeX support) | SIL Open Font License 1.1 (fonts; `doc/fonts/inconsolata/OFL.txt` in the tree), Apache-2.0 / LPPL 1.3 (the other files) |
 | ... from the same repository: `algorithms` (algorithm / algorithmic) | LGPL-2.1 |
 | ... from the same repository: `units` (nicefrac), `comment` | GPL / GPL-2.0 |
 | ... from the same repository: `enumitem`, `threeparttable`, `placeins`, `relsize` | MIT (`enumitem`), other permissive licenses, public domain |
@@ -96,7 +96,9 @@ TeX Live packages, under their own licenses:
   `/usr/local/share/texmf` (TEXMFLOCAL) exactly as TeX Live distributes
   them: the archives of the frozen TeX Live 2024 repository (`tlnet-final`,
   the TeX Live version of Debian trixie), checked against the SHA-256 in
-  `docker/engine/texlive-archives.sha256`. Their Debian packages come from
+  `docker/engine/texlive-archives.sha256`, which is made from and checked
+  against the TeX Live database signed by the TeX Live key
+  (`texlive-archives.sh make-list` / `verify-tlpdb`). Their Debian packages come from
   the `texlive-extra` source package, whose 2.8 GB `.orig.tar.xz` alone
   would be over the 2 GiB limit of the sources release asset below. Each
   package's license is in its `tlpkg/tlpobj/<package>.tlpobj`

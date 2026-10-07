@@ -26,7 +26,16 @@ if [ -e "${dir}" ]; then
 fi
 mkdir -p "${dir}"
 git -C "${dir}" init -q
-git -C "${dir}" fetch -q --depth 1 "${REPOSITORY}" "${COMMIT}"
+# Retried: a passing GitHub outage should not fail CI.
+attempt=1
+until git -C "${dir}" fetch -q --depth 1 "${REPOSITORY}" "${COMMIT}"; do
+    if [ "${attempt}" -ge 3 ]; then
+        echo "error: cannot fetch ${COMMIT} of ${REPOSITORY}" >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 10
+done
 git -C "${dir}" -c advice.detachedHead=false checkout -q FETCH_HEAD
 head="$(git -C "${dir}" rev-parse HEAD)"
 if [ "${head}" != "${COMMIT}" ]; then
