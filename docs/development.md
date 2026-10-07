@@ -252,7 +252,7 @@ TEXRUN_REQUIRE_SANDBOX=1 cargo test -p texrun --test container
 
 `.github/workflows/engine-image.yml`（[docs/security.md](security.md) §4「engine image の公開」）。`v<version>` の tag を push するだけで、検証 → engine image の公開 → release notes 付きの GitHub release の作成までが行われる。release の手順:
 
-1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.1' -- README.md docs/ skills/` で確かめられる（`0.1.1` は現在の版）。
+1. `Cargo.toml` の `workspace.package.version`（と内部 crate の `version`）を release の版にし、文書に書いた版も同じにした commit を main に入れる。版を書いているのは次の箇所で、`git grep -n '0\.1\.2' -- README.md docs/ skills/` で確かめられる（`0.1.2` は現在の版）。
    - `README.md`: 冒頭の note、Installation の `cargo install ... --tag v<version>` と `docker pull ghcr.io/nishide-dev/texrun-engine:<version>`
    - `docs/engine-image.md`: `cargo install`・`docker pull`・`docker build` の例、`engine.version` の例、`gh attestation verify` の例
    - `skills/texrun/reference/setup.md`（Agent Skill）: `cargo install ... --tag v<version>` と `docker pull` の例、`v<version>` の言及
