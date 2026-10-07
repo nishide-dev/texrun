@@ -29,10 +29,10 @@
 # Making and checking the list (when it changes; not at build time), with
 # the TeX Live database signed by the TeX Live key (docs/development.md):
 #
-#   sh texlive-archives.sh make-list <dir> <package>...  > texlive-archives.sha256
+#   sh texlive-archives.sh make-list <dir> <package>... > <tmp> && mv <tmp> texlive-archives.sha256
 #     Prints the list for <package>...: every container (run, doc, source)
 #     that the database has for each, after checking its SHA-512 against
-#     the database.
+#     the database. Prints nothing if any check fails.
 #   sh texlive-archives.sh verify-tlpdb <list> <dir>
 #     Checks that <list> has exactly the containers of its packages and
 #     that each archive's SHA-512 is the one of the database; prints the
@@ -183,12 +183,17 @@ tlpdb() {
     done
     [ "${ok}" = 1 ] || die "cannot fetch the TeX Live database"
     download "${TL_KEY_URL}" "${dir}/texlive.asc"
+    # A keyring of its own, removed however the script ends.
     gnupg="$(mktemp -d)"
+    trap 'rm -rf "${gnupg}"' EXIT
     GNUPGHOME="${gnupg}" gpg --batch --quiet --import "${dir}/texlive.asc" 2>/dev/null
     status="$(GNUPGHOME="${gnupg}" gpg --batch --status-fd 1 \
         --verify "${dir}/texlive.tlpdb.sha512.asc" "${dir}/texlive.tlpdb.sha512" 2>/dev/null || true)"
-    rm -rf "${gnupg}"
-    # VALIDSIG <signing key> ... <primary key>
+    # GOODSIG: a good signature by a key that is neither revoked nor
+    # expired (gpg says REVKEYSIG / EXPKEYSIG instead, but still VALIDSIG).
+    echo "${status}" | grep -q '^\[GNUPG:\] GOODSIG ' \
+        || die "the database has no good signature by a valid (not revoked or expired) key"
+    # VALIDSIG <signing key> ... <primary key>: by the TeX Live key.
     echo "${status}" | grep -q "^\[GNUPG:\] VALIDSIG .* ${TL_KEY_FINGERPRINT}\$" \
         || die "the database is not signed by the TeX Live key ${TL_KEY_FINGERPRINT}"
     (cd "${dir}" && sha512sum --check --quiet --strict texlive.tlpdb.sha512) \
@@ -218,13 +223,15 @@ check_sha512() {
         || die "$(basename "$1"): its SHA-512 is not the one of the signed database"
 }
 
+# Prints the list only once every archive is checked: nothing on failure.
 make_list() {
     dir="$1"
     shift
     tlpdb "${dir}"
+    out=
     for pkg in "$@"; do
         info="$(containers "${dir}/texlive.tlpdb" "${pkg}")"
-        echo "${info}" | while read -r file sum; do
+        while read -r file sum; do
             case "${file}" in depend | license) continue ;; esac
             ok=0
             for mirror in ${MIRRORS}; do
@@ -235,9 +242,13 @@ make_list() {
             done
             [ "${ok}" = 1 ] || die "cannot fetch ${file}"
             check_sha512 "${dir}/${file}" "${sum}"
-            echo "$(sha256sum "${dir}/${file}" | cut -d' ' -f1)  ${file}"
-        done
+            out="${out}$(sha256sum "${dir}/${file}" | cut -d' ' -f1)  ${file}
+"
+        done <<EOF
+${info}
+EOF
     done
+    printf '%s' "${out}"
 }
 
 verify_tlpdb() {
@@ -245,16 +256,20 @@ verify_tlpdb() {
     dir="$2"
     lines="$(read_list "${list}")"
     tlpdb "${dir}"
-    fetch "${list}" "${dir}" >/dev/null
     packages="$(echo "${lines}" | sed 's/^[^ ]* //; s/\.tar\.xz$//; s/\.doc$//; s/\.source$//' | sort -u)"
+    # The containers first, before anything is fetched (so that a listed
+    # archive the database does not have is reported as such), then the
+    # SHA-512 of each archive.
     expected=
+    sums=
     for pkg in ${packages}; do
         info="$(containers "${dir}/texlive.tlpdb" "${pkg}")"
         echo "${pkg}:$(echo "${info}" | sed -n 's/^license//p') depends on: $(echo "${info}" | sed -n 's/^depend //p' | tr '\n' ' ')"
         while read -r file sum; do
             case "${file}" in depend | license) continue ;; esac
-            check_sha512 "${dir}/${file}" "${sum}"
             expected="${expected}${file}
+"
+            sums="${sums}${file} ${sum}
 "
         done <<EOF
 ${info}
@@ -269,6 +284,12 @@ EOF
         echo "${expected}" >&2
         die "${list} does not have exactly the containers of its packages"
     fi
+    fetch "${list}" "${dir}" >/dev/null
+    while read -r file sum; do
+        check_sha512 "${dir}/${file}" "${sum}"
+    done <<EOF
+$(printf '%s' "${sums}")
+EOF
     echo "${list}: $(echo "${listed}" | wc -l) archives of $(echo "${packages}" | wc -w) packages match the signed TeX Live ${TL_YEAR} database"
 }
 
