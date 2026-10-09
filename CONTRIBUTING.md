@@ -240,7 +240,7 @@ main 向けの PR では、GitHub Actions で次の check が自動実行され�
 | `integration` | Docker 開発環境の image（`docker/dev/Dockerfile`）を build し、その中で `TEXRUN_REQUIRE_TEXLIVE=1` / `TEXRUN_REQUIRE_PREVIEW_TOOLS=1` を付けて `cargo test --workspace --all-features --locked` を実行する（TeX Live integration test、上記） |
 | `deny` | `cargo deny --locked check`（advisories / licenses / bans / sources、設定は `deny.toml`） |
 | `ci-success` | 上記すべての成功を確認する集約 check |
-| `pr-title` | PR タイトルが Conventional Commits 形式か（type は上記の type 一覧に限定、scope は任意、description は小文字始まり・末尾ピリオドなし） |
+| `pr-title` | PR タイトルが Conventional Commits 形式か（type は上記の type 一覧に限定、scope は任意、description は小文字始まり・末尾ピリオドなし。Dependabot の PR だけは大文字始まりも許可） |
 
 - merge 前に `ci-success` と `pr-title` が成功していることを確認してください（branch protection の required check として設定する想定です）。
 - squash merge では PR タイトルが最終コミットのタイトルになるため、自動検証の対象は PR タイトルです。feature branch 内の個々のコミットメッセージは自動検証しないので、レビュー時に目視で確認します。
