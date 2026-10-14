@@ -51,7 +51,7 @@
 # Dependabot (docker ecosystem) updates them. The sources job of
 # .github/workflows/engine-image.yml takes the first FROM as the base of
 # the image.
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS texlive-archives
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS texlive-archives
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils
@@ -59,7 +59,7 @@ COPY texlive-archives.sha256 texlive-archives.sh /tmp/
 RUN sh /tmp/texlive-archives.sh fetch /tmp/texlive-archives.sha256 /tmp/archives \
     && sh /tmp/texlive-archives.sh install /tmp/texlive-archives.sha256 /tmp/archives /texmf
 
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 
 # Keep documentation, man pages and non-English locales out of the image.
 RUN printf '%s\n' \
